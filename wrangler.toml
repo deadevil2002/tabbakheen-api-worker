@@ -1,0 +1,7 @@
+name = "tabbakheen-api"
+main = "worker.js"
+compatibility_date = "2026-06-01"
+
+routes = [
+  { pattern = "tabbakheen-api.tabbakheen.workers.dev/*", custom_domain = true }
+]
