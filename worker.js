@@ -890,6 +890,48 @@
     }
   }
   __name(handleVerifyCr, "handleVerifyCr");
+  async function handleSubmitFreelanceCert(request, env, accessToken) {
+    const idToken = getTokenFromRequest(request);
+    let uid = "";
+    try {
+      uid = await verifyFirebaseIdToken(idToken);
+    } catch (e) {
+      console.log("[Freelance] Firebase token verification failed");
+      return jsonResponse({ success: false, error: "Unauthorized" }, 401);
+    }
+    let body = {};
+    try {
+      body = await request.json();
+    } catch {
+      body = {};
+    }
+    const certificateNumber = String(body.certificateNumber || "").trim();
+    const fileUrl = String(body.fileUrl || "").trim();
+    if (!certificateNumber) {
+      return jsonResponse({ success: false, error: "certificateNumber is required" }, 400);
+    }
+    if (!fileUrl) {
+      return jsonResponse({ success: false, error: "fileUrl is required" }, 400);
+    }
+    const now = new Date().toISOString();
+    await updateFirestoreDocument("verifications", uid, {
+      freelanceCertificate: {
+        certificateNumber,
+        fileUrl,
+        submittedAt: now,
+        reviewStatus: "pending"
+      }
+    }, accessToken);
+    const udoc = await getFirestoreDoc("users", uid, accessToken);
+    const curStatus = udoc && udoc.verificationStatus ? udoc.verificationStatus : "";
+    const curSource = udoc && udoc.verificationSource ? udoc.verificationSource : "";
+    const alreadyWathqVerified = curStatus === "verified" && curSource === "wathq";
+    if (!alreadyWathqVerified) {
+      await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+    }
+    return jsonResponse({ success: true, verificationStatus: alreadyWathqVerified ? curStatus : "pending_review" });
+  }
+  __name(handleSubmitFreelanceCert, "handleSubmitFreelanceCert");
 
 function pdfEscape(str) {
     if (!str) return "";
@@ -1516,6 +1558,10 @@ html[dir="rtl"] .drill-close{float:left}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           <span id="nav-users"></span>
         </div>
+        <div class="nav-item" data-page="verification" onclick="navigate('verification')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+          <span id="nav-verification"></span>
+        </div>
         <div class="nav-item" data-page="invoices" onclick="navigate('invoices')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
           <span id="nav-invoices"></span>
@@ -1545,7 +1591,7 @@ html[dir="rtl"] .drill-close{float:left}
 <div id="toast" class="toast"></div>
 
 <script>
-var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices"}};
+var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",verification:"التوثيق",crVerifications:"توثيق السجل التجاري",freelanceRequests:"طلبات شهادة العمل الحر",certNumber:"رقم الشهادة",submittedAt:"تاريخ التقديم",reviewStatus:"حالة المراجعة",approve:"اعتماد",reject:"رفض",pendingReview:"قيد المراجعة",verifiedStatus:"موثّق",unverifiedStatus:"غير موثّق",notVerified:"غير موثّق",viewDocument:"تحقق من الوثيقة",viewImage:"عرض الصورة",rejectReason:"سبب الرفض (داخلي)",verificationApproved:"تم اعتماد التوثيق",verificationRejected:"تم رفض التوثيق",notifyCrVerification:"إشعار عند توثيق سجل تجاري جديد",notifyFreelanceRequest:"إشعار عند طلب شهادة عمل حر جديد",noVerificationData:"لا توجد بيانات توثيق",source:"المصدر",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",verification:"Verification",crVerifications:"CR Verification",freelanceRequests:"Freelance Certificate Requests",certNumber:"Certificate #",submittedAt:"Submitted At",reviewStatus:"Review Status",approve:"Approve",reject:"Reject",pendingReview:"Pending Review",verifiedStatus:"Verified",unverifiedStatus:"Unverified",notVerified:"Not Verified",viewDocument:"Verify Document",viewImage:"View Image",rejectReason:"Reject reason (internal)",verificationApproved:"Verification approved",verificationRejected:"Verification rejected",notifyCrVerification:"Notify on new CR verification",notifyFreelanceRequest:"Notify on new freelance request",noVerificationData:"No verification data",source:"Source",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices"}};
 var lang=localStorage.getItem("tbk_admin_lang")||"ar";
 function t(k){return(T[lang]&&T[lang][k])||T.en[k]||k;}
 function setLang(l){lang=l;localStorage.setItem("tbk_admin_lang",l);var d=l==="ar"?"rtl":"ltr";document.documentElement.dir=d;document.documentElement.lang=l;updateStaticLabels();renderPage();}
@@ -1557,6 +1603,7 @@ function updateStaticLabels(){
   document.getElementById("sidebar-subtitle").textContent=t("adminPanel");
   document.getElementById("nav-dashboard").textContent=t("dashboard");
   document.getElementById("nav-users").textContent=t("users");
+  var nvEl=document.getElementById("nav-verification");if(nvEl)nvEl.textContent=t("verification");
   document.getElementById("nav-invoices").textContent=t("invoices");
   document.getElementById("nav-settings").textContent=t("settings");
   document.getElementById("nav-logout").textContent=t("logout");
@@ -1651,6 +1698,62 @@ function subStatusLabel(u){
   return '<span class="sub-active">'+days+" "+t("daysRemaining")+"</span>";
 }
 
+function verifBadge(s){
+  var m={verified:"green",pending_review:"yellow",unverified:"red",none:"gray"};
+  var l={verified:t("verifiedStatus"),pending_review:t("pendingReview"),unverified:t("unverifiedStatus"),none:t("notVerified")};
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+(l[s]||s||t("na"))+'</span>';
+}
+function flReviewBadge(s){
+  var m={approved:"green",pending:"yellow",pending_review:"yellow",rejected:"red"};
+  var l={approved:t("verifiedStatus"),pending:t("pendingReview"),pending_review:t("pendingReview"),rejected:t("unverifiedStatus")};
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+(l[s]||s||t("na"))+'</span>';
+}
+async function renderVerification(c){
+  var data=await api("/verification");
+  if(!data)return;
+  var items=data.items||[];
+  var crRows=items.map(function(it){
+    var v=it.verification||{};
+    var d=v.submittedAt||it.verifiedAt;
+    var ds=d?new Date(d).toLocaleDateString():"-";
+    return '<tr><td>'+esc(it.displayName||t("noName"))+'<div style="font-size:12px;color:var(--text2)">'+esc(it.email||"")+'</div></td>'+
+      '<td>'+esc(v.crNumber||"-")+'</td>'+
+      '<td>'+verifBadge(it.verificationStatus)+'</td>'+
+      '<td>'+esc(it.verificationSource||"-")+'</td>'+
+      '<td style="font-size:12px;color:var(--text2)">'+ds+'</td></tr>';
+  }).join("");
+  var fl=items.filter(function(it){return it.verification&&it.verification.freelanceCertificate;});
+  var flRows=fl.map(function(it){
+    var fc=it.verification.freelanceCertificate||{};
+    var sub=fc.submittedAt?new Date(fc.submittedAt).toLocaleDateString():"-";
+    var img=fc.fileUrl||"";
+    var rs=fc.reviewStatus||"pending";
+    var imgBtn=img?'<a class="btn btn-sm btn-secondary" href="'+esc(img)+'" target="_blank" rel="noopener">'+t("viewImage")+'</a> ':"";
+    var act=(rs==="approved"||rs==="rejected")?"":'<button class="btn btn-sm btn-success" onclick="approveFreelance(\\''+esc(it.uid)+'\\')">'+t("approve")+'</button> <button class="btn btn-sm btn-warning" onclick="rejectFreelance(\\''+esc(it.uid)+'\\')">'+t("reject")+'</button>';
+    return '<tr><td>'+esc(it.displayName||t("noName"))+'<div style="font-size:12px;color:var(--text2)">'+esc(it.email||"")+'</div></td>'+
+      '<td>'+esc(fc.certificateNumber||"-")+'</td>'+
+      '<td>'+flReviewBadge(rs)+'</td>'+
+      '<td style="font-size:12px;color:var(--text2)">'+sub+'</td>'+
+      '<td style="white-space:nowrap">'+imgBtn+act+'</td></tr>';
+  }).join("");
+  c.innerHTML='<h1 class="page-title">'+t("verification")+'</h1>'+
+    '<div style="margin-bottom:16px"><a class="btn btn-orange" href="https://freelance.sa/certificate-validation" target="_blank" rel="noopener">'+t("viewDocument")+'</a></div>'+
+    '<div class="settings-section"><h3>'+t("crVerifications")+'</h3><div class="table-wrap"><table><thead><tr><th>'+t("user")+'</th><th>'+t("certNumber")+'</th><th>'+t("status")+'</th><th>'+t("source")+'</th><th>'+t("date")+'</th></tr></thead><tbody>'+(crRows||'<tr><td colspan="5" class="empty">'+t("noVerificationData")+'</td></tr>')+'</tbody></table></div></div>'+
+    '<div class="settings-section"><h3>'+t("freelanceRequests")+'</h3><div class="table-wrap"><table><thead><tr><th>'+t("user")+'</th><th>'+t("certNumber")+'</th><th>'+t("reviewStatus")+'</th><th>'+t("submittedAt")+'</th><th>'+t("actions")+'</th></tr></thead><tbody>'+(flRows||'<tr><td colspan="5" class="empty">'+t("noData")+'</td></tr>')+'</tbody></table></div></div>';
+}
+async function approveFreelance(uid){
+  var data=await api("/verification/freelance/"+uid+"/approve",{method:"POST",body:JSON.stringify({})});
+  if(data&&data.success){toast(t("verificationApproved"));renderPage();}else{toast((data&&data.error)||t("failedUpdate"),"error");}
+}
+function rejectFreelance(uid){
+  openModal('<h3>'+t("reject")+'</h3><div class="form-group"><label>'+t("rejectReason")+'</label><textarea id="rej-note" rows="3" style="width:100%"></textarea></div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-warning" onclick="confirmRejectFreelance(\\''+esc(uid)+'\\')">'+t("reject")+'</button></div>');
+}
+async function confirmRejectFreelance(uid){
+  var el=document.getElementById("rej-note");
+  var note=el?el.value:"";
+  var data=await api("/verification/freelance/"+uid+"/reject",{method:"POST",body:JSON.stringify({note:note})});
+  if(data&&data.success){toast(t("verificationRejected"));closeModal();renderPage();}else{toast((data&&data.error)||t("failedUpdate"),"error");}
+}
 async function renderPage(){
   if(isMobile()){forceSidebarClosed();}else{closeSidebar();}
   var c=document.getElementById("page-content");
@@ -1658,6 +1761,7 @@ async function renderPage(){
   try{
     if(currentPage==="dashboard")await renderDashboard(c);
     else if(currentPage==="users")await renderUsers(c);
+    else if(currentPage==="verification")await renderVerification(c);
     else if(currentPage==="invoices")await renderInvoices(c);
     else if(currentPage==="settings")await renderSettings(c);
   }catch(e){c.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
@@ -1998,6 +2102,8 @@ async function renderSettings(c){
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewUser"'+(appSettings.notifyOnNewUser?" checked":"")+'> '+t("notifyNewUser")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewProvider"'+(appSettings.notifyOnNewProvider?" checked":"")+'> '+t("notifyNewProvider")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewDriver"'+(appSettings.notifyOnNewDriver?" checked":"")+'> '+t("notifyNewDriver")+'</label></div>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyCrVerification"'+(appSettings.notifyOnCrVerification?" checked":"")+'> '+t("notifyCrVerification")+'</label></div>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyFreelanceRequest"'+(appSettings.notifyOnFreelanceRequest?" checked":"")+'> '+t("notifyFreelanceRequest")+'</label></div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
     '<div id="pw-msg" class="success-msg"></div>'+
@@ -2059,7 +2165,9 @@ async function saveSettings(){
     subscriptionWarningDays:parseInt(document.getElementById("s-warningDays")?document.getElementById("s-warningDays").value:"7")||7,
     notifyOnNewUser:document.getElementById("s-notifyNewUser")?document.getElementById("s-notifyNewUser").checked:false,
     notifyOnNewProvider:document.getElementById("s-notifyNewProvider")?document.getElementById("s-notifyNewProvider").checked:false,
-    notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false
+    notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
+    notifyOnCrVerification:document.getElementById("s-notifyCrVerification")?document.getElementById("s-notifyCrVerification").checked:false,
+    notifyOnFreelanceRequest:document.getElementById("s-notifyFreelanceRequest")?document.getElementById("s-notifyFreelanceRequest").checked:false
   };
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
@@ -2322,6 +2430,74 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           await updateFirestoreDocument("users", uid, fields, accessToken);
           return jsonResponse({ success: true, updated: Object.keys(fields) });
         }
+        if (path === "/admin/api/verification" && request.method === "GET") {
+          const users = await listAllUsers(accessToken);
+          const providers = users.filter((u) => u.role === "provider");
+          const items = [];
+          for (const u of providers) {
+            let verification = null;
+            try {
+              verification = await getFirestoreDoc("verifications", u._id, accessToken);
+            } catch (e) {
+              verification = null;
+            }
+            items.push({
+              uid: u._id,
+              displayName: u.displayName || "",
+              email: u.email || "",
+              phone: u.phone || "",
+              verificationStatus: u.verificationStatus || "none",
+              verificationSource: u.verificationSource || "",
+              verifiedAt: u.verifiedAt || "",
+              verification
+            });
+          }
+          return jsonResponse({ success: true, items });
+        }
+        const flApproveMatch = path.match(/^\/admin\/api\/verification\/freelance\/([^/]+)\/approve$/);
+        if (flApproveMatch && request.method === "POST") {
+          const uid = flApproveMatch[1];
+          const now = (/* @__PURE__ */ new Date()).toISOString();
+          const vdoc = await getFirestoreDoc("verifications", uid, accessToken);
+          const fc = vdoc && vdoc.freelanceCertificate ? vdoc.freelanceCertificate : {};
+          fc.reviewStatus = "approved";
+          fc.reviewedAt = now;
+          await updateFirestoreDocument("verifications", uid, { freelanceCertificate: fc }, accessToken);
+          await updateFirestoreDocument("users", uid, {
+            verificationStatus: "verified",
+            verificationSource: "freelance_certificate",
+            verifiedAt: now
+          }, accessToken);
+          return jsonResponse({ success: true });
+        }
+        const flRejectMatch = path.match(/^\/admin\/api\/verification\/freelance\/([^/]+)\/reject$/);
+        if (flRejectMatch && request.method === "POST") {
+          const uid = flRejectMatch[1];
+          const now = (/* @__PURE__ */ new Date()).toISOString();
+          let note = "";
+          try {
+            const body = await request.json();
+            note = String(body && body.note ? body.note : "").slice(0, 500);
+          } catch (e) {
+            note = "";
+          }
+          const vdoc = await getFirestoreDoc("verifications", uid, accessToken);
+          const fc = vdoc && vdoc.freelanceCertificate ? vdoc.freelanceCertificate : {};
+          fc.reviewStatus = "rejected";
+          fc.reviewedAt = now;
+          fc.internalReviewNote = note;
+          await updateFirestoreDocument("verifications", uid, { freelanceCertificate: fc }, accessToken);
+          const udoc = await getFirestoreDoc("users", uid, accessToken);
+          const curSource = udoc && udoc.verificationSource ? udoc.verificationSource : "";
+          const curStatus = udoc && udoc.verificationStatus ? udoc.verificationStatus : "";
+          if (curSource === "freelance_certificate" || curStatus === "pending_review") {
+            await updateFirestoreDocument("users", uid, {
+              verificationStatus: "unverified",
+              verificationSource: ""
+            }, accessToken);
+          }
+          return jsonResponse({ success: true });
+        }
         if (path === "/admin/api/settings" && request.method === "GET") {
           const settings = await getFirestoreDoc("app_settings", "main", accessToken);
           return jsonResponse({ success: true, settings: settings || {} });
@@ -2338,7 +2514,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             "subscriptionWarningDays",
             "notifyOnNewUser",
             "notifyOnNewProvider",
-            "notifyOnNewDriver"
+            "notifyOnNewDriver",
+            "notifyOnCrVerification",
+            "notifyOnFreelanceRequest"
           ];
           const fields = {};
           for (const key of allowedSettings) {
@@ -2512,6 +2690,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       } catch (e) {
         console.error("[Wathq] Verify CR error:", e && e.message ? e.message : e);
         return jsonResponse({ success: false, verificationStatus: "pending_review", error: "Internal error" }, 500);
+      }
+    }
+    if (path === "/submit-freelance-cert" && request.method === "POST") {
+      try {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        return await handleSubmitFreelanceCert(request, env, accessToken);
+      } catch (e) {
+        console.error("[Freelance] Submit cert error:", e && e.message ? e.message : e);
+        return jsonResponse({ success: false, error: "Internal error" }, 500);
       }
     }
     if (path === "/notify" && request.method === "POST") {
