@@ -342,6 +342,258 @@
     }
     __name(updateFirestoreDocument, "updateFirestoreDocument");
     __name2(updateFirestoreDocument, "updateFirestoreDocument");
+    async function getFirestoreSnapshot(collection, docId, accessToken) {
+      const url = FIRESTORE_BASE + "/" + collection + "/" + docId;
+      const response = await fetch(url, { headers: { "Authorization": "Bearer " + accessToken } });
+      if (!response.ok) {
+        if (response.status === 404) return null;
+        const text = await response.text();
+        throw new Error("Firestore snapshot read failed: " + response.status + " " + text);
+      }
+      const document = await response.json();
+      return { data: parseFirestoreDoc(document), updateTime: document.updateTime };
+    }
+    __name(getFirestoreSnapshot, "getFirestoreSnapshot");
+    __name2(getFirestoreSnapshot, "getFirestoreSnapshot");
+    async function compareAndSetFirestoreDocument(collection, docId, fields, updateTime, accessToken) {
+      const fieldPaths = Object.keys(fields);
+      const params = fieldPaths.map((field) => "updateMask.fieldPaths=" + encodeURIComponent(field));
+      params.push("currentDocument.updateTime=" + encodeURIComponent(updateTime));
+      const firestoreFields = {};
+      for (const [key, value] of Object.entries(fields)) firestoreFields[key] = toFirestoreValue(value);
+      const response = await fetch(FIRESTORE_BASE + "/" + collection + "/" + docId + "?" + params.join("&"), {
+        method: "PATCH",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: firestoreFields })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        let errorStatus = "";
+        try {
+          errorStatus = JSON.parse(text).error?.status || "";
+        } catch {}
+        if (response.status === 409 || response.status === 412 || errorStatus === "FAILED_PRECONDITION" || errorStatus === "ABORTED") {
+          return { ok: false, conflict: true };
+        }
+        throw new Error("Firestore compare-and-set failed: " + response.status + " " + text);
+      }
+      return { ok: true, document: await response.json() };
+    }
+    __name(compareAndSetFirestoreDocument, "compareAndSetFirestoreDocument");
+    __name2(compareAndSetFirestoreDocument, "compareAndSetFirestoreDocument");
+    function isDriverDeliveryMethod(method) {
+      return method === "driver" || method === "driver_delivery";
+    }
+    __name(isDriverDeliveryMethod, "isDriverDeliveryMethod");
+    __name2(isDriverDeliveryMethod, "isDriverDeliveryMethod");
+    function isFulfillmentEligible(order) {
+      return order && (order.status === "ready_for_pickup" || order.status === "searching_driver");
+    }
+    __name(isFulfillmentEligible, "isFulfillmentEligible");
+    __name2(isFulfillmentEligible, "isFulfillmentEligible");
+    function isDriverProgressEligible(order) {
+      return order && isDriverDeliveryMethod(order.deliveryMethod) && ["ready_for_pickup", "searching_driver", "assigned_to_driver", "picked_up"].includes(order.status);
+    }
+    __name(isDriverProgressEligible, "isDriverProgressEligible");
+    __name2(isDriverProgressEligible, "isDriverProgressEligible");
+    function isDriverAccountAllowed(user) {
+      if (!user || user.role !== "driver") return false;
+      if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return false;
+      if (user.activatedByAdmin === true) return true;
+      const now = Date.now();
+      if (user.subscriptionStatus === "active") {
+        const end = user.subscriptionEndsAt ? new Date(user.subscriptionEndsAt).getTime() : NaN;
+        return !Number.isFinite(end) || end > now;
+      }
+      if (user.trialEndsAt) return new Date(user.trialEndsAt).getTime() > now;
+      if (user.createdAt) return new Date(user.createdAt).getTime() + 30 * 864e5 > now;
+      return true;
+    }
+    __name(isDriverAccountAllowed, "isDriverAccountAllowed");
+    __name2(isDriverAccountAllowed, "isDriverAccountAllowed");
+    async function sendTransitionNotification(event, orderId, accessToken) {
+      try {
+        await handleEvent(event, orderId, accessToken);
+      } catch (error) {
+        console.error("[DeliveryTransition] Notification failed after committed state:", event, error && error.message ? error.message : error);
+      }
+    }
+    __name(sendTransitionNotification, "sendTransitionNotification");
+    __name2(sendTransitionNotification, "sendTransitionNotification");
+    async function handleDeliveryTransition(request, env, accessToken) {
+      let uid;
+      try {
+        uid = await verifyFirebaseIdToken(getTokenFromRequest(request));
+      } catch {
+        return jsonResponse({ success: false, code: "unauthorized", error: "Unauthorized" }, 401);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ success: false, code: "invalid_request", error: "Invalid request" }, 400);
+      }
+      const orderId = String(body.orderId || "").trim();
+      const action = String(body.action || "").trim();
+      const allowedActions = ["accept", "reject", "picked_up", "arrived", "delivered_pending_confirmation", "confirm_delivered", "complete_self_pickup", "cancel_driver_search"];
+      if (!orderId || !allowedActions.includes(action)) {
+        return jsonResponse({ success: false, code: "invalid_request", error: "Missing or invalid orderId/action" }, 400);
+      }
+      const [snapshot, actor] = await Promise.all([
+        getFirestoreSnapshot("orders", orderId, accessToken),
+        getFirestoreDoc("users", uid, accessToken)
+      ]);
+      if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
+      const order = snapshot.data;
+      const now = new Date().toISOString();
+      const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
+      let fields;
+      let notificationEvent = null;
+      if (action === "cancel_driver_search") {
+        if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
+          return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+        }
+        if (order.deliveryMethod === "self_pickup" && order.deliveryStatus === "self_pickup_selected" && !order.driverUid) {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
+        }
+        if (order.driverUid || order.deliveryStatus === "driver_assigned") {
+          return jsonResponse({ success: false, code: "driver_already_assigned", error: "A driver has already been assigned" }, 409);
+        }
+        if (!isDriverDeliveryMethod(order.deliveryMethod) || order.deliveryStatus !== "ready_for_driver" || !isFulfillmentEligible(order)) {
+          return jsonResponse({ success: false, code: "transition_not_allowed", error: "Driver search can no longer be cancelled" }, 409);
+        }
+        fields = {
+          deliveryMethod: "self_pickup",
+          deliveryStatus: "self_pickup_selected",
+          driverUid: null,
+          deliveryQuoteId: null,
+          deliveryPricingVersion: null,
+          deliveryFee: 0,
+          deliveryDistanceKm: 0,
+          totalAmount: order.priceSnapshot || 0,
+          deliveryPaymentMethod: null,
+          driverStatus: null,
+          driverAssignedAt: null,
+          driverSearchCancelledAt: now,
+          deliveryStateVersion: nextVersion,
+          updatedAt: now
+        };
+        notificationEvent = "self_pickup_selected";
+      } else if (action === "complete_self_pickup") {
+        const ownsAsCustomer = actor && actor.role === "customer" && order.customerUid === uid;
+        const ownsAsProvider = actor && actor.role === "provider" && order.providerUid === uid;
+        if (!ownsAsCustomer && !ownsAsProvider) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+        if (order.deliveryMethod === "self_pickup" && order.deliveryStatus === "delivered" && order.status === "delivered") {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
+        }
+        if (order.deliveryMethod !== "self_pickup" || order.deliveryStatus !== "self_pickup_selected" || order.driverUid || order.status !== "ready_for_pickup") {
+          return jsonResponse({ success: false, code: "transition_not_allowed", error: "Self-pickup cannot be completed from the current state" }, 409);
+        }
+        fields = {
+          deliveryStatus: "delivered",
+          status: "delivered",
+          completedAt: now,
+          deliveryStateVersion: nextVersion,
+          updatedAt: now
+        };
+        if (ownsAsCustomer) fields.customerConfirmedAt = now;
+        if (ownsAsProvider) fields.providerCompletedAt = now;
+        if (order.paymentMethod === "CASH" || order.paymentMethod === "cod") fields.paymentStatus = "PAID_CONFIRMED";
+        notificationEvent = "self_pickup_completed";
+      } else if (action === "confirm_delivered") {
+        if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
+          return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+        }
+        if (order.deliveryStatus === "delivered" && order.status === "delivered") {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: order.driverUid });
+        }
+        if (!isDriverProgressEligible(order) || !order.driverUid || !["arrived", "delivered_pending_confirmation"].includes(order.deliveryStatus)) {
+          return jsonResponse({ success: false, code: "transition_not_allowed", error: "Delivery is not awaiting customer confirmation" }, 409);
+        }
+        fields = {
+          deliveryStatus: "delivered",
+          status: "delivered",
+          customerConfirmedAt: now,
+          completedAt: now,
+          deliveryStateVersion: nextVersion,
+          updatedAt: now
+        };
+        if (order.paymentMethod === "CASH" || order.paymentMethod === "cod") fields.paymentStatus = "PAID_CONFIRMED";
+        notificationEvent = "delivered";
+      } else {
+        if (!actor || actor.role !== "driver") return jsonResponse({ success: false, code: "forbidden", error: "Driver role required" }, 403);
+        if (!isDriverAccountAllowed(actor)) return jsonResponse({ success: false, code: "account_not_allowed", error: "Driver account is not active" }, 403);
+        if (action === "accept") {
+          if (order.driverUid === uid && order.deliveryStatus === "driver_assigned") {
+            return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: uid });
+          }
+          if (!isDriverDeliveryMethod(order.deliveryMethod) || order.deliveryStatus !== "ready_for_driver" || order.driverUid || !isFulfillmentEligible(order)) {
+            return jsonResponse({ success: false, code: "already_assigned", error: "Delivery is no longer available" }, 409);
+          }
+          fields = { driverUid: uid, deliveryStatus: "driver_assigned", driverAssignedAt: now, deliveryStateVersion: nextVersion, updatedAt: now };
+          notificationEvent = "driver_assigned";
+        } else if (action === "reject") {
+          if (order.deliveryStatus === "ready_for_driver" && !order.driverUid && order.lastRejectedDriverUid === uid) {
+            return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
+          }
+          if (order.driverUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Driver is not assigned to this order" }, 403);
+          if (!isDriverProgressEligible(order) || order.deliveryStatus !== "driver_assigned") {
+            return jsonResponse({ success: false, code: "transition_not_allowed", error: "Delivery can no longer be rejected" }, 409);
+          }
+          fields = {
+            driverUid: null,
+            deliveryStatus: "ready_for_driver",
+            lastRejectedDriverUid: uid,
+            driverRejectedAt: now,
+            driverRejectionCount: (Number(order.driverRejectionCount) || 0) + 1,
+            driverAssignedAt: null,
+            deliveryStateVersion: nextVersion,
+            updatedAt: now
+          };
+          notificationEvent = "driver_rejected";
+        } else {
+          if (order.driverUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Driver is not assigned to this order" }, 403);
+          if (!isDriverProgressEligible(order)) return jsonResponse({ success: false, code: "transition_not_allowed", error: "Order is not eligible for driver progress" }, 409);
+          const expectedByAction = { picked_up: "driver_assigned", arrived: "picked_up", delivered_pending_confirmation: "arrived" };
+          const expected = expectedByAction[action];
+          if (order.deliveryStatus === action) {
+            return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: uid });
+          }
+          if (order.deliveryStatus !== expected) {
+            return jsonResponse({ success: false, code: "transition_not_allowed", error: "Stale or illegal delivery transition" }, 409);
+          }
+          fields = { deliveryStatus: action, deliveryStateVersion: nextVersion, updatedAt: now };
+          if (action === "picked_up") fields.pickedUpAt = now;
+          if (action === "arrived") fields.driverArrivedAt = now;
+          if (action === "delivered_pending_confirmation") fields.deliveredPendingAt = now;
+          notificationEvent = action === "delivered_pending_confirmation" ? "delivery_pending_confirmation" : action;
+        }
+      }
+      const committed = await compareAndSetFirestoreDocument("orders", orderId, fields, snapshot.updateTime, accessToken);
+      if (!committed.ok) {
+        const latest = await getFirestoreDoc("orders", orderId, accessToken);
+        if (action === "accept" && latest && latest.driverUid === uid && latest.deliveryStatus === "driver_assigned") {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: latest.deliveryMethod, deliveryStatus: latest.deliveryStatus, driverUid: uid });
+        }
+        if (action === "reject" && latest && latest.deliveryStatus === "ready_for_driver" && !latest.driverUid && latest.lastRejectedDriverUid === uid) {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: latest.deliveryMethod, deliveryStatus: latest.deliveryStatus, driverUid: null });
+        }
+        if (action === "cancel_driver_search" && latest && latest.deliveryMethod === "self_pickup" && latest.deliveryStatus === "self_pickup_selected") {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: latest.deliveryMethod, deliveryStatus: latest.deliveryStatus, driverUid: null });
+        }
+        if (action === "confirm_delivered" && latest && latest.deliveryStatus === "delivered" && latest.status === "delivered") {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: latest.deliveryMethod, deliveryStatus: latest.deliveryStatus, driverUid: latest.driverUid });
+        }
+        if (action === "complete_self_pickup" && latest && latest.deliveryMethod === "self_pickup" && latest.deliveryStatus === "delivered" && latest.status === "delivered") {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: latest.deliveryMethod, deliveryStatus: latest.deliveryStatus, driverUid: null });
+        }
+        return jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
+      }
+      await sendTransitionNotification(notificationEvent, orderId, accessToken);
+      return jsonResponse({ success: true, deliveryMethod: fields.deliveryMethod || order.deliveryMethod, deliveryStatus: fields.deliveryStatus, driverUid: Object.prototype.hasOwnProperty.call(fields, "driverUid") ? fields.driverUid : order.driverUid });
+    }
+    __name(handleDeliveryTransition, "handleDeliveryTransition");
+    __name2(handleDeliveryTransition, "handleDeliveryTransition");
     async function createFirestoreDocument(collectionPath, docId, fields, accessToken) {
       const url = docId ? `${FIRESTORE_BASE}/${collectionPath}/${docId}` : `${FIRESTORE_BASE}/${collectionPath}`;
       const firestoreFields = {};
@@ -3690,6 +3942,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: false, error: "Internal error" }, 500);
         }
       }
+      if (path === "/delivery-transition" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleDeliveryTransition(request, env, accessToken);
+        } catch (error) {
+          console.error("[DeliveryTransition] Error:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Internal error" }, 500);
+        }
+      }
       if (path === "/notify" && request.method === "POST") {
         try {
           const body = await request.json();
@@ -3772,97 +4033,103 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       }
       if (path === "/finalize-delivery" && request.method === "POST") {
         try {
+          let uid;
+          try {
+            uid = await verifyFirebaseIdToken(getTokenFromRequest(request));
+          } catch {
+            return jsonResponse({ success: false, code: "unauthorized", error: "Unauthorized" }, 401);
+          }
           const body = await request.json();
           const { orderId, method } = body;
           if (!orderId || !method || !["self_pickup", "driver"].includes(method)) {
-            return Response.json({ success: false, error: "Missing or invalid orderId/method" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
+            return jsonResponse({ success: false, code: "invalid_request", error: "Missing or invalid orderId/method" }, 400);
           }
-          console.log("[Worker] Finalize delivery: orderId=" + orderId + " method=" + method);
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          const order = await getFirestoreDoc("orders", orderId, accessToken);
-          if (!order) {
-            return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
+          const snapshot = await getFirestoreSnapshot("orders", orderId, accessToken);
+          if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
+          const order = snapshot.data;
+          if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+          const expectedStatus = method === "self_pickup" ? "self_pickup_selected" : "ready_for_driver";
+          if (order.deliveryMethod === method && order.deliveryStatus === expectedStatus && !order.driverUid) {
+            return jsonResponse({
+              success: true,
+              idempotent: true,
+              deliveryFee: order.deliveryFee || 0,
+              totalAmount: order.totalAmount || order.priceSnapshot || 0,
+              deliveryDistanceKm: order.deliveryDistanceKm || 0,
+              deliveryQuoteId: order.deliveryQuoteId || void 0
+            });
           }
+          if (order.driverUid || order.deliveryMethod || order.deliveryStatus || order.status !== "ready_for_pickup") {
+            return jsonResponse({ success: false, code: "transition_not_allowed", error: "Delivery method can no longer be changed" }, 409);
+          }
+          const now = new Date().toISOString();
+          const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
+          let fields;
+          let responseData;
+          let notificationEvent;
           if (method === "self_pickup") {
-            const fields2 = {
+            fields = {
               deliveryMethod: "self_pickup",
               deliveryStatus: "self_pickup_selected",
+              driverUid: null,
               deliveryFee: 0,
               totalAmount: order.priceSnapshot || 0,
               deliveryDistanceKm: 0,
-              deliveryPricingVersion: "v1"
+              deliveryQuoteId: null,
+              deliveryPricingVersion: null,
+              deliveryStateVersion: nextVersion,
+              updatedAt: now
             };
-            await updateFirestoreDocument("orders", orderId, fields2, accessToken);
-            console.log("[Worker] Self pickup finalized for order:", orderId);
-            await handleEvent("self_pickup_selected", orderId, accessToken);
-            return Response.json({ success: true, deliveryFee: 0, totalAmount: fields2.totalAmount, deliveryDistanceKm: 0 }, {
-              headers: { "Access-Control-Allow-Origin": "*" }
-            });
-          }
-          const providerLat = order.providerLat;
-          const providerLng = order.providerLng;
-          const customerLat = order.customerLat;
-          const customerLng = order.customerLng;
-          let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
-          try {
-            const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-            if (settings && settings.deliveryPricing) {
-              pricing = { ...pricing, ...settings.deliveryPricing };
+            responseData = { deliveryFee: 0, totalAmount: fields.totalAmount, deliveryDistanceKm: 0 };
+            notificationEvent = "self_pickup_selected";
+          } else {
+            const providerLat = order.providerLat;
+            const providerLng = order.providerLng;
+            const customerLat = order.customerLat;
+            const customerLng = order.customerLng;
+            let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
+            try {
+              const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+              if (settings && settings.deliveryPricing) pricing = { ...pricing, ...settings.deliveryPricing };
+            } catch (error) {
+              console.log("[Worker] Could not load delivery pricing, using defaults:", error.message);
             }
-          } catch (e) {
-            console.log("[Worker] Could not load delivery pricing, using defaults:", e.message);
-          }
-          let distanceKm = 0;
-          let deliveryFee = pricing.baseFee || 5;
-          if (providerLat && providerLng && customerLat && customerLng) {
-            const R = 6371;
-            const dLat = (customerLat - providerLat) * Math.PI / 180;
-            const dLng = (customerLng - providerLng) * Math.PI / 180;
-            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-            distanceKm = R * c;
-            distanceKm = Math.round(distanceKm * 10) / 10;
-            const perKm = pricing.perKmInsideCity || 2;
-            deliveryFee = (pricing.baseFee || 5) + distanceKm * perKm;
-            deliveryFee = Math.round(deliveryFee);
-            if (pricing.minFee && deliveryFee < pricing.minFee) {
-              deliveryFee = pricing.minFee;
+            let distanceKm = 0;
+            let deliveryFee = pricing.baseFee || 5;
+            if (providerLat && providerLng && customerLat && customerLng) {
+              const R = 6371;
+              const dLat = (customerLat - providerLat) * Math.PI / 180;
+              const dLng = (customerLng - providerLng) * Math.PI / 180;
+              const a = Math.sin(dLat / 2) ** 2 + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+              distanceKm = Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 10) / 10;
+              deliveryFee = Math.round((pricing.baseFee || 5) + distanceKm * (pricing.perKmInsideCity || 2));
+              if (pricing.minFee && deliveryFee < pricing.minFee) deliveryFee = pricing.minFee;
+              if (pricing.maxFee && deliveryFee > pricing.maxFee) deliveryFee = pricing.maxFee;
             }
-            if (pricing.maxFee && deliveryFee > pricing.maxFee) {
-              deliveryFee = pricing.maxFee;
-            }
+            const quoteId = "dq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+            fields = {
+              deliveryMethod: "driver",
+              deliveryStatus: "ready_for_driver",
+              driverUid: null,
+              deliveryFee,
+              totalAmount: (order.priceSnapshot || 0) + deliveryFee,
+              deliveryDistanceKm: distanceKm,
+              deliveryQuoteId: quoteId,
+              deliveryPricingVersion: "v1",
+              deliveryStateVersion: nextVersion,
+              updatedAt: now
+            };
+            responseData = { deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: distanceKm, deliveryQuoteId: quoteId };
+            notificationEvent = "driver_delivery_requested";
           }
-          console.log("[Worker] Pricing: baseFee=" + pricing.baseFee + " perKm=" + pricing.perKmInsideCity + " minFee=" + pricing.minFee + " maxFee=" + pricing.maxFee + " dist=" + distanceKm + " fee=" + deliveryFee);
-          const priceSnapshot = order.priceSnapshot || 0;
-          const totalAmount = priceSnapshot + deliveryFee;
-          const quoteId = "dq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
-          const fields = {
-            deliveryMethod: "driver",
-            deliveryStatus: "ready_for_driver",
-            deliveryFee,
-            totalAmount,
-            deliveryDistanceKm: distanceKm,
-            deliveryQuoteId: quoteId,
-            deliveryPricingVersion: "v1"
-          };
-          await updateFirestoreDocument("orders", orderId, fields, accessToken);
-          console.log("[Worker] Driver delivery finalized: orderId=" + orderId + " fee=" + deliveryFee + " dist=" + distanceKm + "km total=" + totalAmount);
-          await handleEvent("driver_delivery_requested", orderId, accessToken);
-          return Response.json({
-            success: true,
-            deliveryFee,
-            totalAmount,
-            deliveryDistanceKm: distanceKm,
-            deliveryQuoteId: quoteId
-          }, {
-            headers: { "Access-Control-Allow-Origin": "*" }
-          });
-        } catch (e) {
-          console.error("[Worker] Finalize delivery error:", e);
-          return Response.json({ success: false, error: e.message || "Internal error" }, {
-            status: 500,
-            headers: { "Access-Control-Allow-Origin": "*" }
-          });
+          const committed = await compareAndSetFirestoreDocument("orders", orderId, fields, snapshot.updateTime, accessToken);
+          if (!committed.ok) return jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
+          await sendTransitionNotification(notificationEvent, orderId, accessToken);
+          return jsonResponse({ success: true, ...responseData });
+        } catch (error) {
+          console.error("[Worker] Finalize delivery error:", error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Internal error" }, 500);
         }
       }
       if (path === "/delivery-quote" && request.method === "POST") {
@@ -3872,11 +4139,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!orderId) {
             return Response.json({ success: false, error: "Missing orderId" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
           }
+          let uid;
+          try {
+            uid = await verifyFirebaseIdToken(getTokenFromRequest(request));
+          } catch {
+            return jsonResponse({ success: false, code: "unauthorized", error: "Unauthorized" }, 401);
+          }
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           const order = await getFirestoreDoc("orders", orderId, accessToken);
           if (!order) {
-            return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
+            return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           }
+          if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
           let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
           try {
             const settings = await getFirestoreDoc("app_settings", "main", accessToken);
