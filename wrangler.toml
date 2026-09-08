@@ -9,3 +9,6 @@ workers_dev = true
 # secrets when keep_vars is on (keepSecrets: keepVars || !!secretsFile) — without this
 # line a deploy wipes every one of them.
 keep_vars = true
+
+[triggers]
+crons = ["* * * * *"]

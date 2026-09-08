@@ -411,9 +411,151 @@
     }
     __name(isDriverAccountAllowed, "isDriverAccountAllowed");
     __name2(isDriverAccountAllowed, "isDriverAccountAllowed");
-    async function sendTransitionNotification(event, orderId, accessToken) {
+    function isProviderAccountAllowed(user) {
+      if (!user || user.role !== "provider") return false;
+      if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return false;
+      // Provider subscription fields have historically not been mirrored on
+      // every user document. Ownership plus an account that is not disabled is
+      // the established transition convention; do not create a new gate here.
+      return true;
+    }
+    __name(isProviderAccountAllowed, "isProviderAccountAllowed");
+    __name2(isProviderAccountAllowed, "isProviderAccountAllowed");
+    function isDeliveryNotificationEvent(event) {
+      return ["self_pickup_selected", "self_pickup_completed", "driver_delivery_requested", "driver_assigned", "driver_rejected", "picked_up", "arrived", "delivery_pending_confirmation", "delivered", "driver_assigned_by_provider"].includes(event);
+    }
+    __name(isDeliveryNotificationEvent, "isDeliveryNotificationEvent");
+    __name2(isDeliveryNotificationEvent, "isDeliveryNotificationEvent");
+    function notificationStateVersion(order, event) {
+      const value = isDeliveryNotificationEvent(event) ? order.deliveryStateVersion : order.stateVersion;
+      return Number.isFinite(value) ? value : 1;
+    }
+    __name(notificationStateVersion, "notificationStateVersion");
+    __name2(notificationStateVersion, "notificationStateVersion");
+    function notificationEventId(orderId, event, stateVersion) {
+      return encodeURIComponent(orderId) + "_" + encodeURIComponent(event) + "_" + String(stateVersion);
+    }
+    __name(notificationEventId, "notificationEventId");
+    __name2(notificationEventId, "notificationEventId");
+    async function getEventRecipientUids(event, order, accessToken) {
+      let values = [];
+      if (["order_accepted", "order_rejected", "order_preparing", "order_ready", "picked_up", "arrived", "delivery_pending_confirmation", "self_pickup_completed"].includes(event)) values.push(order.customerUid);
+      if (["customer_cancelled", "order_cancelled", "self_pickup_selected", "driver_delivery_requested", "driver_assigned", "driver_rejected", "delivered"].includes(event)) values.push(order.providerUid);
+      if (["order_cancelled", "driver_assigned", "driver_rejected", "delivered"].includes(event)) values.push(order.customerUid);
+      if (event === "order_created") values.push(order.providerUid);
+      if (event === "driver_assigned_by_provider") values.push(order.driverUid, order.customerUid);
+      if (event === "driver_delivery_requested") {
+        const drivers = await queryFirestore("users", "role", "EQUAL", "driver", accessToken);
+        values.push(...drivers.filter(isDriverAccountAllowed).map((driver) => driver._id));
+      }
+      return [...new Set(values.filter((value) => typeof value === "string" && value))];
+    }
+    __name(getEventRecipientUids, "getEventRecipientUids");
+    __name2(getEventRecipientUids, "getEventRecipientUids");
+    async function claimNotificationEvent(orderId, transition, stateVersion, accessToken) {
+      const eventId = notificationEventId(orderId, transition, stateVersion);
+      const order = await getFirestoreDoc("orders", orderId, accessToken);
+      if (!order) return null;
+      const recipientUids = await getEventRecipientUids(transition, order, accessToken);
+      const recipients = recipientUids.map((uid) => ({ uid, status: "pending", attempts: 0, receiptAttempts: 0 }));
+      const url = FIRESTORE_BASE + "/order_transition_events/" + eventId + "?currentDocument.exists=false";
+      let response = await fetch(url, {
+        method: "PATCH",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: {
+          orderId: toFirestoreValue(orderId),
+          transition: toFirestoreValue(transition),
+          stateVersion: toFirestoreValue(stateVersion),
+          status: toFirestoreValue("pending"),
+          createdAt: toFirestoreValue(new Date().toISOString())
+        } })
+      });
+      if (response.ok) await response.json();
+      let snapshot = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
+      if (!snapshot || snapshot.data.status === "sent" || snapshot.data.status === "terminal") return null;
+      let current = snapshot.data.recipients || recipients;
+      const now = Date.now();
+      const owner = crypto.randomUUID();
+      const candidates = current.filter((recipient) => (recipient.status === "pending" || recipient.status === "failed") && (!recipient.leaseUntil || new Date(recipient.leaseUntil).getTime() <= now)).slice(0, 10);
+      if (!candidates.length) return null;
+      const selected = new Set(candidates.map((recipient) => recipient.uid));
+      const leaseUntil = new Date(now + 3e4).toISOString();
+      current = current.map((recipient) => selected.has(recipient.uid) ? { ...recipient, leaseOwner: owner, leaseUntil } : recipient);
+      const claimed = await compareAndSetFirestoreDocument("order_transition_events", eventId, { status: "pending", recipients: current, lastAttemptAt: new Date().toISOString() }, snapshot.updateTime, accessToken);
+      if (!claimed.ok) return null;
+      // Fence immediately before transport; an expired/replaced owner cannot send.
+      snapshot = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
+      if (!snapshot) return null;
+      const owned = (snapshot.data.recipients || []).filter((recipient) => recipient.leaseOwner === owner && new Date(recipient.leaseUntil).getTime() > Date.now());
+      return owned.length ? { eventId, updateTime: snapshot.updateTime, data: snapshot.data, owner, recipientUids: owned.map((recipient) => recipient.uid) } : null;
+    }
+    __name(claimNotificationEvent, "claimNotificationEvent");
+    __name2(claimNotificationEvent, "claimNotificationEvent");
+    async function renewRecipientLeases(claim, accessToken) {
+      const snapshot = await getFirestoreSnapshot("order_transition_events", claim.eventId, accessToken);
+      if (!snapshot) return null;
+      const now = Date.now();
+      const owned = (snapshot.data.recipients || []).filter((recipient) => recipient.leaseOwner === claim.owner && new Date(recipient.leaseUntil).getTime() > now);
+      if (!owned.length) return null;
+      const ownedUids = new Set(owned.map((recipient) => recipient.uid));
+      const leaseUntil = new Date(now + 3e4).toISOString();
+      const recipients = (snapshot.data.recipients || []).map((recipient) => ownedUids.has(recipient.uid) ? { ...recipient, leaseUntil } : recipient);
+      const renewed = await compareAndSetFirestoreDocument("order_transition_events", claim.eventId, { recipients }, snapshot.updateTime, accessToken);
+      return renewed.ok ? { updateTime: renewed.document.updateTime, recipientUids: [...ownedUids] } : null;
+    }
+    __name(renewRecipientLeases, "renewRecipientLeases");
+    __name2(renewRecipientLeases, "renewRecipientLeases");
+    async function mergeRecipientDeliveryResults(eventId, owner, result, skippedRecipientUids, accessToken) {
+      const accepted = new Set(result?.acceptedRecipientUids || []);
+      const failed = new Set(result?.failedRecipientUids || []);
+      const skipped = new Set(skippedRecipientUids || []);
+      const ticketByRecipient = result?.ticketByRecipient || {};
+      const tokenHashByRecipient = result?.tokenHashByRecipient || {};
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const latest = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
+        if (!latest) return false;
+        let changed = false;
+        const recipients = (latest.data.recipients || []).map((recipient) => {
+          // This is the fencing token: an expired/released/re-leased recipient
+          // can never be overwritten by a stale execution's transport result.
+          if (recipient.leaseOwner !== owner) return recipient;
+          changed = true;
+          if (accepted.has(recipient.uid)) return { ...recipient, status: "accepted", ticketId: ticketByRecipient[recipient.uid], submittedTokenHash: tokenHashByRecipient[recipient.uid], receiptAttempts: 0, leaseOwner: null, leaseUntil: null };
+          if (skipped.has(recipient.uid)) return { ...recipient, status: "terminal", terminalReason: "notifications_disabled_or_invalid_token", leaseOwner: null, leaseUntil: null };
+          if (failed.has(recipient.uid)) {
+            const attempts = (Number(recipient.attempts) || 0) + 1;
+            return { ...recipient, attempts, status: attempts < 5 ? "failed" : "terminal", leaseOwner: null, leaseUntil: null };
+          }
+          // No explicit outcome means transport never ran for this recipient
+          // (for example, lease renewal lost a CAS race). Release only our own
+          // fence and leave it schedulable without consuming an attempt.
+          return { ...recipient, status: "pending", leaseOwner: null, leaseUntil: null };
+        });
+        if (!changed) return false;
+        const unfinished = recipients.some((recipient) => recipient.status === "pending" || recipient.status === "failed");
+        const receiptPending = recipients.some((recipient) => recipient.status === "accepted");
+        const fields = { recipients, status: unfinished ? "failed" : receiptPending ? "sent" : "terminal" };
+        if (!unfinished) fields.sentAt = latest.data.sentAt || new Date().toISOString();
+        const merged = await compareAndSetFirestoreDocument("order_transition_events", eventId, fields, latest.updateTime, accessToken);
+        if (merged.ok) return true;
+        await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+      }
+      return false;
+    }
+    __name(mergeRecipientDeliveryResults, "mergeRecipientDeliveryResults");
+    __name2(mergeRecipientDeliveryResults, "mergeRecipientDeliveryResults");
+    async function sendTransitionNotification(event, orderId, accessToken, stateVersion) {
       try {
-        await handleEvent(event, orderId, accessToken);
+        const claim = stateVersion !== void 0 ? await claimNotificationEvent(orderId, event, stateVersion, accessToken) : null;
+        if (stateVersion !== void 0 && !claim) return;
+        const recipients = claim?.data?.recipients || [];
+        const retryableUids = claim?.recipientUids || recipients.filter((recipient) => recipient.status === "pending" || recipient.status === "failed").map((recipient) => recipient.uid);
+        const result = await handleEvent(event, orderId, accessToken, retryableUids, claim);
+        if (claim) {
+          // Transport is never repeated when persistence races. Merge against
+          // the newest event snapshot and retry only the Firestore CAS.
+          await mergeRecipientDeliveryResults(claim.eventId, claim.owner, result.pushResult, result.skippedRecipientUids, accessToken);
+        }
       } catch (error) {
         console.error("[DeliveryTransition] Notification failed after committed state:", event, error && error.message ? error.message : error);
       }
@@ -569,7 +711,7 @@
           notificationEvent = action === "delivered_pending_confirmation" ? "delivery_pending_confirmation" : action;
         }
       }
-      const committed = await compareAndSetFirestoreDocument("orders", orderId, fields, snapshot.updateTime, accessToken);
+      const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
       if (!committed.ok) {
         const latest = await getFirestoreDoc("orders", orderId, accessToken);
         if (action === "accept" && latest && latest.driverUid === uid && latest.deliveryStatus === "driver_assigned") {
@@ -589,11 +731,122 @@
         }
         return jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
       }
-      await sendTransitionNotification(notificationEvent, orderId, accessToken);
+      await sendTransitionNotification(notificationEvent, orderId, accessToken, nextVersion);
       return jsonResponse({ success: true, deliveryMethod: fields.deliveryMethod || order.deliveryMethod, deliveryStatus: fields.deliveryStatus, driverUid: Object.prototype.hasOwnProperty.call(fields, "driverUid") ? fields.driverUid : order.driverUid });
     }
     __name(handleDeliveryTransition, "handleDeliveryTransition");
     __name2(handleDeliveryTransition, "handleDeliveryTransition");
+    async function commitOrderAndOutbox(orderId, fields, serverTimestampFields, updateTime, event, stateVersion, accessToken) {
+      const document = FIRESTORE_BASE + "/orders/" + orderId;
+      const firestoreFields = {};
+      for (const [key, value] of Object.entries(fields)) firestoreFields[key] = toFirestoreValue(value);
+      const eventId = notificationEventId(orderId, event, stateVersion);
+      const eventFields = {
+        orderId: toFirestoreValue(orderId),
+        transition: toFirestoreValue(event),
+        stateVersion: toFirestoreValue(stateVersion),
+        status: toFirestoreValue("pending"),
+        createdAt: toFirestoreValue(new Date().toISOString())
+      };
+      const response = await fetch(FIRESTORE_BASE + ":commit", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ writes: [{
+          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + orderId, fields: firestoreFields },
+          updateMask: { fieldPaths: Object.keys(fields) },
+          currentDocument: { updateTime },
+          updateTransforms: serverTimestampFields.map((fieldPath) => ({ fieldPath, setToServerValue: "REQUEST_TIME" }))
+        }, {
+          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
+          currentDocument: { exists: false }
+        }] })
+      });
+      if (response.ok) return { ok: true };
+      const text = await response.text();
+      let status = "";
+      try {
+        status = JSON.parse(text).error?.status || "";
+      } catch {}
+      if (response.status === 409 || response.status === 412 || status === "ABORTED" || status === "FAILED_PRECONDITION" || status === "ALREADY_EXISTS") return { ok: false, conflict: true };
+      throw new Error("Firestore order transition commit failed: " + response.status);
+    }
+    __name(commitOrderAndOutbox, "commitOrderAndOutbox");
+    __name2(commitOrderAndOutbox, "commitOrderAndOutbox");
+    async function handleOrderTransition(request, env, accessToken) {
+      let uid;
+      try {
+        uid = await verifyFirebaseIdToken(getTokenFromRequest(request));
+      } catch {
+        return jsonResponse({ success: false, code: "unauthorized", error: "Unauthorized" }, 401);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ success: false, code: "invalid_request", error: "Invalid request" }, 400);
+      }
+      const orderId = String(body.orderId || "").trim();
+      const action = String(body.action || "").trim();
+      if (!orderId || !["cancel_customer_order", "provider_accept", "provider_reject", "provider_preparing", "provider_ready"].includes(action)) {
+        return jsonResponse({ success: false, code: "invalid_request", error: "Missing or invalid orderId/action" }, 400);
+      }
+      const [snapshot, actor] = await Promise.all([getFirestoreSnapshot("orders", orderId, accessToken), getFirestoreDoc("users", uid, accessToken)]);
+      if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
+      const order = snapshot.data;
+      const nextVersion = (Number.isFinite(order.stateVersion) ? order.stateVersion : 0) + 1;
+      let fields;
+      let timestamps = ["updatedAt"];
+      let event;
+      if (action === "cancel_customer_order") {
+        if (!actor || actor.role !== "customer" || order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+        if (order.status === "cancelled" && order.cancelledBy === "customer") {
+          await sendTransitionNotification("customer_cancelled", orderId, accessToken, notificationStateVersion(order, "customer_cancelled"));
+          return jsonResponse({ success: true, idempotent: true, status: order.status });
+        }
+        if (order.status !== "pending" || order.paymentStatus !== "PENDING") return jsonResponse({ success: false, code: "transition_not_allowed", error: "Order cannot be cancelled from its current state" }, 409);
+        fields = { status: "cancelled", cancelledBy: "customer", cancelReasonCode: String(body.reason || "placed_by_mistake").trim().slice(0, 120) || "placed_by_mistake", stateVersion: nextVersion };
+        timestamps.push("cancelledAt");
+        event = "customer_cancelled";
+      } else {
+        if (!actor || actor.role !== "provider" || order.providerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Provider ownership required" }, 403);
+        if (!isProviderAccountAllowed(actor)) return jsonResponse({ success: false, code: "account_not_allowed", error: "Provider account is not active" }, 403);
+        const spec = {
+          provider_accept: ["pending", "accepted", "order_accepted"],
+          provider_reject: ["pending", "rejected", "order_rejected"],
+          provider_preparing: ["accepted", "preparing", "order_preparing"],
+          provider_ready: ["preparing", "ready_for_pickup"]
+        }[action];
+        const target = { provider_accept: "accepted", provider_reject: "rejected", provider_preparing: "preparing", provider_ready: "ready_for_pickup" }[action];
+        if (order.status === target) {
+          const retryEvent = { provider_accept: "order_accepted", provider_reject: "order_rejected", provider_preparing: "order_preparing", provider_ready: "order_ready" }[action];
+          await sendTransitionNotification(retryEvent, orderId, accessToken, notificationStateVersion(order, retryEvent));
+          return jsonResponse({ success: true, idempotent: true, status: order.status });
+        }
+        if (order.status !== spec[0]) return jsonResponse({ success: false, code: "transition_not_allowed", error: "Illegal order transition" }, 409);
+        fields = { status: target, stateVersion: nextVersion };
+        if (action === "provider_reject" && body.reason != null) {
+          const comment = String(body.reason).trim().slice(0, 500);
+          if (comment) {
+            fields.providerComment = comment;
+            fields.statusReason = comment;
+          }
+        }
+        event = { provider_accept: "order_accepted", provider_reject: "order_rejected", provider_preparing: "order_preparing", provider_ready: "order_ready" }[action];
+      }
+      const committed = await commitOrderAndOutbox(orderId, fields, timestamps, snapshot.updateTime, event, nextVersion, accessToken);
+      if (!committed.ok) {
+        const latest = await getFirestoreDoc("orders", orderId, accessToken);
+        if (latest && latest.status === (fields && fields.status) && (action !== "cancel_customer_order" || latest.cancelledBy === "customer")) {
+          await sendTransitionNotification(event, orderId, accessToken, notificationStateVersion(latest, event));
+          return jsonResponse({ success: true, idempotent: true, status: latest.status });
+        }
+        return jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
+      }
+      await sendTransitionNotification(event, orderId, accessToken, nextVersion);
+      return jsonResponse({ success: true, status: fields.status, stateVersion: nextVersion });
+    }
+    __name(handleOrderTransition, "handleOrderTransition");
+    __name2(handleOrderTransition, "handleOrderTransition");
     async function createFirestoreDocument(collectionPath, docId, fields, accessToken) {
       const url = docId ? `${FIRESTORE_BASE}/${collectionPath}/${docId}` : `${FIRESTORE_BASE}/${collectionPath}`;
       const firestoreFields = {};
@@ -638,6 +891,12 @@
     }
     __name(sha1Hex, "sha1Hex");
     __name2(sha1Hex, "sha1Hex");
+    async function sha256Hex(str) {
+      const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+      return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    __name(sha256Hex, "sha256Hex");
+    __name2(sha256Hex, "sha256Hex");
     async function uploadToCloudinary(imageBase64, folder, env) {
       const cloudName = env.CLOUDINARY_CLOUD_NAME || "dv6n9vnly";
       const apiKey = env.CLOUDINARY_API_KEY;
@@ -819,7 +1078,7 @@
               const owners = tokenOwners.get(tokenChunk[i]) || [];
               for (const uid of owners) {
                 try {
-                  await updateFirestoreDocument("users", uid, { expoPushToken: null }, accessToken);
+                  await updateFirestoreDocument("users", uid, { expoPushToken: null, pushNotificationsEnabled: false }, accessToken);
                 } catch (e) {
                   incrementReason(failureReasons, "StaleTokenCleanupFailed", e && e.message || "Could not clear stale token");
                 }
@@ -851,7 +1110,8 @@
     async function getUserPushToken(uid, accessToken) {
       const user = await getFirestoreDoc("users", uid, accessToken);
       if (!user) return null;
-      const token = user.expoPushToken;
+      if (user.pushNotificationsEnabled !== true) return null;
+      const token = typeof user.expoPushToken === "string" ? user.expoPushToken.trim() : "";
       if (!token || !isExpoPushToken(token)) return null;
       return token;
     }
@@ -863,29 +1123,112 @@
     }
     __name(getDriverPushTokens, "getDriverPushTokens");
     __name2(getDriverPushTokens, "getDriverPushTokens");
-    async function sendExpoPush(messages) {
-      if (!messages.length) return;
-      const chunks = [];
-      for (let i = 0; i < messages.length; i += 100) {
-        chunks.push(messages.slice(i, i + 100));
+    async function clearDeviceNotRegisteredToken(token, accessToken) {
+      if (!accessToken || !isExpoPushToken(token)) return;
+      const owners = await queryFirestore("users", "expoPushToken", "EQUAL", token, accessToken);
+      for (const owner of owners) {
+        const snapshot = await getFirestoreSnapshot("users", owner._id, accessToken);
+        if (snapshot && snapshot.data.expoPushToken === token) await compareAndSetFirestoreDocument("users", owner._id, { expoPushToken: null, pushNotificationsEnabled: false }, snapshot.updateTime, accessToken);
       }
+    }
+    __name(clearDeviceNotRegisteredToken, "clearDeviceNotRegisteredToken");
+    __name2(clearDeviceNotRegisteredToken, "clearDeviceNotRegisteredToken");
+    async function sendExpoPush(messages, accessToken) {
+      const safeMessages = messages.filter((message) => message && isExpoPushToken(message.to));
+      if (!safeMessages.length) return { acceptedCount: 0, failedCount: 0, staleTokensCount: 0 };
+      const chunks = [];
+      for (let i = 0; i < safeMessages.length; i += 100) {
+        chunks.push(safeMessages.slice(i, i + 100));
+      }
+      let acceptedCount = 0;
+      let failedCount = 0;
+      let staleTokensCount = 0;
+      const failureReasons = {};
+      const receiptRecipients = {};
+      const acceptedRecipientUids = [];
+      const failedRecipientUids = [];
+      const ticketByRecipient = {};
+      const tokenHashByRecipient = {};
       for (const chunk of chunks) {
+        let result = null;
+        let response = null;
+        let transientFailure = null;
+        // At most two retries (three total attempts).  Only failures where Expo
+        // could not have produced per-message tickets are retried.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            response = await fetch(EXPO_PUSH_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Accept": "application/json" },
+              body: JSON.stringify(chunk.map(({ _recipientUid, ...message }) => message)),
+              signal: AbortSignal.timeout(8e3)
+            });
+            try {
+              result = await response.json();
+            } catch {
+              result = null;
+            }
+            if (response.ok && result && Array.isArray(result.data)) break;
+            const retryable = !response.ok && (response.status === 429 || response.status >= 500) || response.ok && !result;
+            transientFailure = response.ok ? "MalformedExpoResponse" : "ExpoHTTP" + response.status;
+            if (!retryable || attempt === 2) break;
+          } catch (error) {
+            transientFailure = "ExpoNetworkError";
+            response = null;
+            result = null;
+            if (attempt === 2) break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 75 * (attempt + 1)));
+        }
         try {
-          const response = await fetch(EXPO_PUSH_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Accept": "application/json" },
-            body: JSON.stringify(chunk)
-          });
-          const result = await response.json();
-          console.log("[Push] Expo response:", JSON.stringify(result));
+          if (!response || !response.ok || !result || !Array.isArray(result.data)) {
+            failedCount += chunk.length;
+            for (const message of chunk) if (message._recipientUid) failedRecipientUids.push(message._recipientUid);
+            incrementReason(failureReasons, transientFailure || "MalformedExpoResponse", result && (result.message || result.error) || "Expo request failed");
+            continue;
+          }
+          for (let i = 0; i < chunk.length; i++) {
+            const ticket = result.data[i];
+            if (ticket && ticket.status === "ok" && typeof ticket.id === "string" && ticket.id) {
+              acceptedCount++;
+              receiptRecipients[ticket.id] = chunk[i].to;
+              if (chunk[i]._recipientUid) {
+                acceptedRecipientUids.push(chunk[i]._recipientUid);
+                ticketByRecipient[chunk[i]._recipientUid] = ticket.id;
+                tokenHashByRecipient[chunk[i]._recipientUid] = await sha256Hex(chunk[i].to);
+              }
+              continue;
+            }
+            failedCount++;
+            if (chunk[i]._recipientUid) failedRecipientUids.push(chunk[i]._recipientUid);
+            const code = ticket && ticket.details && ticket.details.error || "ExpoTicketError";
+            incrementReason(failureReasons, code, ticket && ticket.message || "Expo rejected the push notification");
+            if (code === "DeviceNotRegistered" && accessToken) {
+              staleTokensCount++;
+              try {
+                await clearDeviceNotRegisteredToken(chunk[i].to, accessToken);
+              } catch (error) {
+                incrementReason(failureReasons, "StaleTokenCleanupFailed", error && error.message || "Could not clear stale token");
+              }
+            }
+          }
+          if (result.data.length < chunk.length) {
+            failedCount += chunk.length - result.data.length;
+            for (let i = result.data.length; i < chunk.length; i++) if (chunk[i]._recipientUid) failedRecipientUids.push(chunk[i]._recipientUid);
+            incrementReason(failureReasons, "MissingExpoTickets", "Expo returned fewer tickets than submitted messages");
+          }
         } catch (e) {
-          console.error("[Push] Error sending chunk:", e);
+          failedCount += chunk.length;
+          for (const message of chunk) if (message._recipientUid) failedRecipientUids.push(message._recipientUid);
+          incrementReason(failureReasons, "ExpoNetworkError", e && e.message || "Expo Push API request failed");
         }
       }
+      console.log("[Push] Expo aggregate:", JSON.stringify({ acceptedCount, failedCount, staleTokensCount, reasons: Object.keys(failureReasons) }));
+      return { acceptedCount, failedCount, staleTokensCount, failureReasons, receiptIds: Object.keys(receiptRecipients), acceptedRecipientUids, failedRecipientUids, ticketByRecipient, tokenHashByRecipient };
     }
     __name(sendExpoPush, "sendExpoPush");
     __name2(sendExpoPush, "sendExpoPush");
-    async function handleEvent(event, orderId, accessToken) {
+    async function handleEvent(event, orderId, accessToken, recipientUids, leaseContext) {
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) {
         return { success: false, error: "Order not found" };
@@ -1134,6 +1477,19 @@
           }
           break;
         }
+        case "customer_cancelled": {
+          if (order.providerUid) {
+            const token = await getUserPushToken(order.providerUid, accessToken);
+            if (token) messages.push({
+              to: token,
+              title: "\u0623\u0644\u063A\u0649 \u0627\u0644\u0639\u0645\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 \u26D4",
+              body: '\u0623\u0644\u063A\u0649 \u0627\u0644\u0639\u0645\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
+              data: { type: "customer_cancelled", orderId, role: "provider" },
+              sound: "default"
+            });
+          }
+          break;
+        }
         case "driver_assigned_by_provider": {
           if (order.driverUid) {
             const t_driver = await getUserPushToken(order.driverUid, accessToken);
@@ -1189,16 +1545,51 @@
               });
             }
           }
+          if (order.customerUid) {
+            const t_customer = await getUserPushToken(order.customerUid, accessToken);
+            if (t_customer) {
+              messages.push({
+                to: t_customer,
+                title: "\u062C\u0627\u0631\u064A \u0627\u0644\u0628\u062D\u062B \u0639\u0646 \u0645\u0646\u062F\u0648\u0628 \u0622\u062E\u0631",
+                body: '\u0627\u0639\u062A\u0630\u0631 \u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0639\u0646 \u062A\u0648\u0635\u064A\u0644 \u0637\u0644\u0628\u0643 "' + orderLabel + '" \u0648\u0646\u0628\u062D\u062B \u0639\u0646 \u0628\u062F\u064A\u0644',
+                data: { type: "driver_rejected", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
           break;
         }
         default:
           return { success: false, error: "Unknown event: " + event };
       }
-      if (messages.length > 0) {
-        await sendExpoPush(messages);
-        console.log("[Push] Sent " + messages.length + " notifications for " + event + " on order " + orderId);
+      let skippedRecipientUids = [];
+      if (Array.isArray(recipientUids)) {
+        const tokenOwners = /* @__PURE__ */ new Map();
+        for (const uid of recipientUids) {
+          const token = await getUserPushToken(uid, accessToken);
+          if (token) tokenOwners.set(token, uid);
+          else skippedRecipientUids.push(uid);
+        }
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const uid = tokenOwners.get(messages[i].to);
+          if (!uid) messages.splice(i, 1);
+          else messages[i]._recipientUid = uid;
+        }
       }
-      return { success: true, notificationsSent: messages.length };
+      let pushResult = { acceptedCount: 0, failedCount: 0, staleTokensCount: 0, acceptedRecipientUids: [], failedRecipientUids: [], ticketByRecipient: {} };
+      let outboxUpdateTime = null;
+      if (messages.length > 0) {
+        if (leaseContext) {
+          const renewed = await renewRecipientLeases(leaseContext, accessToken);
+          if (!renewed) return { success: false, notificationsSent: 0, pushResult, skippedRecipientUids, outboxUpdateTime };
+          const fenced = new Set(renewed.recipientUids);
+          messages.splice(0, messages.length, ...messages.filter((message) => fenced.has(message._recipientUid)));
+          outboxUpdateTime = renewed.updateTime;
+        }
+        pushResult = await sendExpoPush(messages, accessToken);
+        console.log("[Push] Notification aggregate:", event, JSON.stringify({ acceptedCount: pushResult.acceptedCount, failedCount: pushResult.failedCount, staleTokensCount: pushResult.staleTokensCount }));
+      }
+      return { success: true, notificationsSent: messages.length, pushResult, skippedRecipientUids, outboxUpdateTime };
     }
     __name(handleEvent, "handleEvent");
     __name2(handleEvent, "handleEvent");
@@ -3281,6 +3672,97 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(getAdminHTML, "getAdminHTML");
     __name2(getAdminHTML, "getAdminHTML");
+    async function pollOutboxReceipts(eventDoc, accessToken) {
+      const snapshot = await getFirestoreSnapshot("order_transition_events", eventDoc._id, accessToken);
+      if (!snapshot || snapshot.data.status !== "sent") return;
+      const now = Date.now();
+      if (snapshot.data.receiptLeaseUntil && new Date(snapshot.data.receiptLeaseUntil).getTime() > now) return;
+      const receiptLeaseOwner = crypto.randomUUID();
+      const receiptLeaseUntil = new Date(now + 3e4).toISOString();
+      const lease = await compareAndSetFirestoreDocument("order_transition_events", eventDoc._id, { receiptLeaseOwner, receiptLeaseUntil }, snapshot.updateTime, accessToken);
+      if (!lease.ok) return;
+      const recipients = snapshot.data.recipients || [];
+      const awaiting = recipients.filter((recipient) => recipient.status === "accepted" && recipient.ticketId && (Number(recipient.receiptAttempts) || 0) < 10);
+      if (!awaiting.length) {
+        await compareAndSetFirestoreDocument("order_transition_events", eventDoc._id, { status: "terminal", receiptLeaseOwner: null, receiptLeaseUntil: null }, lease.document.updateTime, accessToken);
+        return;
+      }
+      let receipts = {};
+      try {
+        const response = await fetch("https://exp.host/--/api/v2/push/getReceipts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({ ids: awaiting.map((recipient) => recipient.ticketId) }),
+          signal: AbortSignal.timeout(8e3)
+        });
+        const result = response.ok ? await response.json() : null;
+        receipts = result && result.data || {};
+      } catch {}
+      for (let mergeAttempt = 0; mergeAttempt < 3; mergeAttempt++) {
+        const latest = await getFirestoreSnapshot("order_transition_events", eventDoc._id, accessToken);
+        if (!latest || latest.data.receiptLeaseOwner !== receiptLeaseOwner || new Date(latest.data.receiptLeaseUntil).getTime() <= Date.now()) return;
+        const next = [];
+        for (const recipient of latest.data.recipients || []) {
+          if (recipient.status !== "accepted" || !recipient.ticketId) {
+            next.push(recipient);
+            continue;
+          }
+          const receipt = receipts[recipient.ticketId];
+          const attempts = (Number(recipient.receiptAttempts) || 0) + 1;
+          if (!receipt) next.push({ ...recipient, receiptAttempts: attempts, status: attempts >= 10 ? "receipt_terminal" : "accepted" });
+          else if (receipt.status === "ok") next.push({ ...recipient, receiptAttempts: attempts, status: "receipt_complete" });
+          else {
+            if (receipt.details && receipt.details.error === "DeviceNotRegistered") {
+              try {
+                const userSnapshot = await getFirestoreSnapshot("users", recipient.uid, accessToken);
+                const currentToken = userSnapshot?.data?.expoPushToken;
+                if (userSnapshot && userSnapshot.data.pushNotificationsEnabled === true && isExpoPushToken(currentToken) && recipient.submittedTokenHash && await sha256Hex(currentToken) === recipient.submittedTokenHash) {
+                  await compareAndSetFirestoreDocument("users", recipient.uid, { expoPushToken: null, pushNotificationsEnabled: false }, userSnapshot.updateTime, accessToken);
+                }
+              } catch {}
+            }
+            next.push({ ...recipient, receiptAttempts: attempts, status: "receipt_terminal", receiptError: String(receipt.details?.error || "ExpoReceiptError").slice(0, 80) });
+          }
+        }
+        const stillPending = next.some((recipient) => recipient.status === "accepted");
+        const merged = await compareAndSetFirestoreDocument("order_transition_events", eventDoc._id, { recipients: next, status: stillPending ? "sent" : "terminal", receiptLeaseOwner: null, receiptLeaseUntil: null }, latest.updateTime, accessToken);
+        if (merged.ok) return;
+      }
+    }
+    __name(pollOutboxReceipts, "pollOutboxReceipts");
+    __name2(pollOutboxReceipts, "pollOutboxReceipts");
+    async function handleScheduledOutbox(env) {
+      const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      const [pending, failed, sent, pendingOrders] = await Promise.all([
+        queryFirestore("order_transition_events", "status", "EQUAL", "pending", accessToken),
+        queryFirestore("order_transition_events", "status", "EQUAL", "failed", accessToken),
+        queryFirestore("order_transition_events", "status", "EQUAL", "sent", accessToken),
+        queryFirestore("orders", "status", "EQUAL", "pending", accessToken)
+      ]);
+      for (const eventDoc of [...pending, ...failed].slice(0, 25)) {
+        if (eventDoc.leaseUntil && new Date(eventDoc.leaseUntil).getTime() > Date.now()) continue;
+        await sendTransitionNotification(eventDoc.transition, eventDoc.orderId, accessToken, eventDoc.stateVersion);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      for (const eventDoc of sent.slice(0, 25)) await pollOutboxReceipts(eventDoc, accessToken);
+      for (const order of pendingOrders.filter((item) => item.transactionalNotificationVersion === 1).slice(0, 25)) {
+        const version = notificationStateVersion(order, "order_created");
+        await sendTransitionNotification("order_created", order._id, accessToken, version);
+        const eventDoc = await getFirestoreDoc("order_transition_events", notificationEventId(order._id, "order_created", version), accessToken);
+        if (eventDoc) {
+          const orderSnapshot = await getFirestoreSnapshot("orders", order._id, accessToken);
+          if (orderSnapshot && orderSnapshot.data.status === "pending" && orderSnapshot.data.transactionalNotificationVersion === 1) {
+            await compareAndSetFirestoreDocument("orders", order._id, { transactionalNotificationVersion: 2, transactionalNotificationReconciledAt: new Date().toISOString() }, orderSnapshot.updateTime, accessToken);
+          }
+        }
+      }
+    }
+    __name(handleScheduledOutbox, "handleScheduledOutbox");
+    __name2(handleScheduledOutbox, "handleScheduledOutbox");
+    addEventListener("scheduled", (event) => {
+      const env = typeof globalThis !== "undefined" ? globalThis : {};
+      event.waitUntil(handleScheduledOutbox(env));
+    });
     addEventListener("fetch", (event) => {
       event.respondWith(handleRequest(event.request, event));
     });
@@ -3748,14 +4230,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const daysLeft = endDate ? Math.ceil((new Date(endDate) - Date.now()) / (1e3 * 60 * 60 * 24)) : 0;
               const name = user.displayName || "";
               const pushToken = user.expoPushToken;
-              if (pushToken && isExpoPushToken(pushToken)) {
+              if (user.pushNotificationsEnabled === true && pushToken && isExpoPushToken(pushToken)) {
                 await sendExpoPush([{
                   to: pushToken,
                   title: "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
                   body: "\u0647\u0644\u0627 " + name + "\n\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F " + daysLeft + " \u0623\u064A\u0627\u0645",
                   data: { type: "subscription_reminder" },
                   sound: "default"
-                }]);
+                }], accessToken);
               }
               if (user.email) {
                 const emailHtml = '<div dir="rtl" style="font-family:sans-serif;padding:20px;max-width:500px;margin:0 auto"><h2 style="color:#e8722a">\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643</h2><p>\u0647\u0644\u0627 ' + name + "</p><p>\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F <strong>" + daysLeft + '</strong> \u0623\u064A\u0627\u0645.</p><p>\u062C\u062F\u062F \u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u062D\u062A\u0649 \u064A\u0633\u062A\u0645\u0631 \u0638\u0647\u0648\u0631 \u062D\u0633\u0627\u0628\u0643 \u0648\u0627\u0633\u062A\u0642\u0628\u0627\u0644 \u0627\u0644\u0637\u0644\u0628\u0627\u062A / \u0627\u0644\u062A\u0648\u0635\u064A\u0644\u0627\u062A.</p><p style="margin-top:20px;color:#666">\u0641\u0631\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646</p></div>';
@@ -3951,27 +4433,50 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: false, code: "internal_error", error: "Internal error" }, 500);
         }
       }
+      if (path === "/order-transition" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderTransition(request, env, accessToken);
+        } catch (error) {
+          console.error("[OrderTransition] Error:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Internal error" }, 500);
+        }
+      }
       if (path === "/notify" && request.method === "POST") {
         try {
           const body = await request.json();
           const { event, orderId } = body;
-          if (!event || !orderId) {
+          const knownEvents = ["order_created", "order_accepted", "order_rejected", "order_preparing", "order_ready", "order_cancelled", "customer_cancelled", "self_pickup_selected", "self_pickup_completed", "driver_delivery_requested", "driver_assigned", "driver_rejected", "picked_up", "arrived", "delivery_pending_confirmation", "delivered", "driver_assigned_by_provider"];
+          if (!event || !orderId || !knownEvents.includes(event)) {
             return Response.json({ success: false, error: "Missing event or orderId" }, { status: 400 });
           }
-          console.log("[Worker] Processing event: " + event + " for order: " + orderId);
+          console.log("[Worker] Processing trusted notification event:", event);
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const authOrder = await getFirestoreDoc("orders", orderId, accessToken);
+          if (!authOrder) return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
           if (!hasServiceKey) {
-            const authOrder = await getFirestoreDoc("orders", orderId, accessToken);
-            if (!authOrder) {
-              return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
-            }
-            if (callerUid !== authOrder.customerUid && callerUid !== authOrder.providerUid && callerUid !== authOrder.driverUid) {
-              console.log("[Worker] Forbidden: caller is not a party to order " + orderId);
-              return Response.json({ success: false, error: "Forbidden" }, { status: 403, headers: { "Access-Control-Allow-Origin": "*" } });
-            }
+            const allowed = {
+              order_created: callerUid === authOrder.customerUid && authOrder.status === "pending",
+              order_accepted: callerUid === authOrder.providerUid && authOrder.status === "accepted",
+              order_rejected: callerUid === authOrder.providerUid && authOrder.status === "rejected",
+              order_preparing: callerUid === authOrder.providerUid && authOrder.status === "preparing",
+              order_ready: callerUid === authOrder.providerUid && authOrder.status === "ready_for_pickup",
+              customer_cancelled: callerUid === authOrder.customerUid && authOrder.status === "cancelled" && authOrder.cancelledBy === "customer",
+              self_pickup_selected: callerUid === authOrder.customerUid && authOrder.deliveryMethod === "self_pickup" && authOrder.deliveryStatus === "self_pickup_selected",
+              self_pickup_completed: (callerUid === authOrder.customerUid || callerUid === authOrder.providerUid) && authOrder.deliveryMethod === "self_pickup" && authOrder.deliveryStatus === "delivered",
+              driver_delivery_requested: callerUid === authOrder.customerUid && isDriverDeliveryMethod(authOrder.deliveryMethod) && authOrder.deliveryStatus === "ready_for_driver",
+              driver_assigned: callerUid === authOrder.driverUid && authOrder.deliveryStatus === "driver_assigned",
+              driver_rejected: callerUid === authOrder.lastRejectedDriverUid && authOrder.deliveryStatus === "ready_for_driver",
+              picked_up: callerUid === authOrder.driverUid && authOrder.deliveryStatus === "picked_up",
+              arrived: callerUid === authOrder.driverUid && authOrder.deliveryStatus === "arrived",
+              delivery_pending_confirmation: callerUid === authOrder.driverUid && authOrder.deliveryStatus === "delivered_pending_confirmation",
+              delivered: (callerUid === authOrder.customerUid || callerUid === authOrder.providerUid) && authOrder.deliveryStatus === "delivered",
+              driver_assigned_by_provider: callerUid === authOrder.providerUid && !!authOrder.driverUid && authOrder.deliveryStatus === "driver_assigned"
+            };
+            if (allowed[event] !== true) return Response.json({ success: false, error: "Forbidden" }, { status: 403, headers: { "Access-Control-Allow-Origin": "*" } });
           }
-          const result = await handleEvent(event, orderId, accessToken);
-          return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*" } });
+          await sendTransitionNotification(event, orderId, accessToken, notificationStateVersion(authOrder, event));
+          return Response.json({ success: true }, { headers: { "Access-Control-Allow-Origin": "*" } });
         } catch (e) {
           console.error("[Worker] Error:", e);
           return Response.json({ success: false, error: e.message || "Internal error" }, {
@@ -4123,9 +4628,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             responseData = { deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: distanceKm, deliveryQuoteId: quoteId };
             notificationEvent = "driver_delivery_requested";
           }
-          const committed = await compareAndSetFirestoreDocument("orders", orderId, fields, snapshot.updateTime, accessToken);
+          const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
           if (!committed.ok) return jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
-          await sendTransitionNotification(notificationEvent, orderId, accessToken);
+          await sendTransitionNotification(notificationEvent, orderId, accessToken, nextVersion);
           return jsonResponse({ success: true, ...responseData });
         } catch (error) {
           console.error("[Worker] Finalize delivery error:", error);
