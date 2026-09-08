@@ -478,6 +478,18 @@
     }
     __name(normalizeSaudiWhatsApp, "normalizeSaudiWhatsApp");
     __name2(normalizeSaudiWhatsApp, "normalizeSaudiWhatsApp");
+    function normalizeInternationalWhatsApp(value) {
+      const raw = String(value == null ? "" : value).trim();
+      if (!raw) return "";
+      if (!/^\+?[\d\s().-]+$/.test(raw)) return null;
+      if ((raw.match(/\+/g) || []).length > 1 || raw.includes("+") && !raw.startsWith("+")) return null;
+      let digits = raw.replace(/\D/g, "");
+      if (digits.startsWith("00")) digits = digits.slice(2);
+      if (!/^[1-9]\d{7,14}$/.test(digits)) return null;
+      return digits;
+    }
+    __name(normalizeInternationalWhatsApp, "normalizeInternationalWhatsApp");
+    __name2(normalizeInternationalWhatsApp, "normalizeInternationalWhatsApp");
     function incrementReason(reasons, code, message) {
       const safeCode = String(code || "UnknownError").slice(0, 80);
       const safeMessage = String(message || "").replace(/ExponentPushToken\[[^\]]+\]|ExpoPushToken\[[^\]]+\]/g, "[redacted-token]").slice(0, 240);
@@ -2577,6 +2589,7 @@ async function renderSettings(c){
     '<div class="upload-row"><input type="file" id="banner-file" accept="image/*" class="file-input"><button class="btn btn-sm btn-primary" id="upload-btn" onclick="uploadBanner()">'+t("upload")+'</button></div>'+
     '<div class="form-group"><label>'+t("bannerUrl")+'</label><input id="s-bannerImageUrl" value="'+esc(bannerUrl)+'" placeholder="https://..."></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-bannerEnabled"'+(bannerEnabled?" checked":"")+'> '+t("bannerEnabled")+'</label></div>'+
+    '<div class="form-group"><label>'+(lang==="ar"?"رقم واتساب البانر":"Banner WhatsApp number")+'</label><input id="s-bannerWhatsapp" inputmode="tel" autocomplete="tel" value="'+esc(appSettings.bannerWhatsapp||"")+'" placeholder="+9665XXXXXXXX"></div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("supportContact")+'</h3>'+
     '<div class="form-group"><label>'+t("supportEmail")+'</label><input id="s-supportEmail" value="'+esc(appSettings.supportEmail||"")+'"></div>'+
@@ -2684,6 +2697,7 @@ async function saveSettings(){
   var fields={
     bannerImageUrl:document.getElementById("s-bannerImageUrl")?document.getElementById("s-bannerImageUrl").value:"",
     bannerEnabled:document.getElementById("s-bannerEnabled")?document.getElementById("s-bannerEnabled").checked:true,
+    bannerWhatsapp:document.getElementById("s-bannerWhatsapp")?document.getElementById("s-bannerWhatsapp").value:"",
     supportEmail:document.getElementById("s-supportEmail")?document.getElementById("s-supportEmail").value:"",
     supportWhatsapp:document.getElementById("s-supportWhatsapp")?document.getElementById("s-supportWhatsapp").value:"",
     deliveryPricing:{
@@ -3344,6 +3358,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
+            if ("bannerWhatsapp" in body) {
+              const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
+              if (normalizedBannerWhatsapp === null) {
+                return jsonResponse({ error: "Banner WhatsApp must be a valid international number such as +9665XXXXXXXX or 9715XXXXXXXX" }, 400);
+              }
+              body.bannerWhatsapp = normalizedBannerWhatsapp;
+            }
             if ("supportWhatsapp" in body) {
               const normalizedWhatsapp = normalizeSaudiWhatsApp(body.supportWhatsapp);
               if (normalizedWhatsapp === null) {
@@ -3354,6 +3375,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const allowedSettings = [
               "bannerImageUrl",
               "bannerEnabled",
+              "bannerWhatsapp",
               "supportEmail",
               "supportWhatsapp",
               "deliveryPricing",
