@@ -1,7 +1,11 @@
 name = "tabbakheen-api"
 main = "worker.js"
 compatibility_date = "2026-06-01"
+account_id = "0e6461dc8ec69690ffda6c96d8cb0ac4"
+workers_dev = true
 
-routes = [
-  { pattern = "tabbakheen-api.tabbakheen.workers.dev/*", custom_domain = true }
-]
+# The Worker's 11 credentials (FIREBASE_PRIVATE_KEY, API_KEY, ADMIN_PASSWORD, ...) are
+# secret_text bindings set outside this file. Wrangler only sends keep_bindings for
+# secrets when keep_vars is on (keepSecrets: keepVars || !!secretsFile) — without this
+# line a deploy wipes every one of them.
+keep_vars = true

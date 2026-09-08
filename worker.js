@@ -4,1188 +4,1525 @@
   var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
   // worker.js
-  var FIRESTORE_BASE = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents";
-  var EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
-  var TOKEN_URL = "https://oauth2.googleapis.com/token";
-  function base64url(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let str = "";
-    for (const b of bytes) str += String.fromCharCode(b);
-    return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
-  __name(base64url, "base64url");
-  function base64urlStr(str) {
-    return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
-  __name(base64urlStr, "base64urlStr");
-  async function importPrivateKey(pem) {
-    const cleaned = pem.replace(/\\n/g, "\n").replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
-    const binaryDer = Uint8Array.from(atob(cleaned), (c) => c.charCodeAt(0));
-    return crypto.subtle.importKey(
-      "pkcs8",
-      binaryDer.buffer,
-      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-  }
-  __name(importPrivateKey, "importPrivateKey");
-  async function createJWT(clientEmail, privateKey) {
-    const now = Math.floor(Date.now() / 1e3);
-    const header = { alg: "RS256", typ: "JWT" };
-    const payload = {
-      iss: clientEmail,
-      sub: clientEmail,
-      aud: TOKEN_URL,
-      iat: now,
-      exp: now + 3600,
-      scope: "https://www.googleapis.com/auth/datastore"
-    };
-    const encodedHeader = base64urlStr(JSON.stringify(header));
-    const encodedPayload = base64urlStr(JSON.stringify(payload));
-    const signingInput = `${encodedHeader}.${encodedPayload}`;
-    const key = await importPrivateKey(privateKey);
-    const signature = await crypto.subtle.sign(
-      "RSASSA-PKCS1-v1_5",
-      key,
-      new TextEncoder().encode(signingInput)
-    );
-    return `${signingInput}.${base64url(signature)}`;
-  }
-  __name(createJWT, "createJWT");
-  async function getAccessToken(clientEmail, privateKey) {
-    const jwt = await createJWT(clientEmail, privateKey);
-    const response = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Token exchange failed: ${response.status} ${text}`);
+  (() => {
+    var __defProp2 = Object.defineProperty;
+    var __name2 = /* @__PURE__ */ __name((target, value) => __defProp2(target, "name", { value, configurable: true }), "__name");
+    var FIRESTORE_BASE = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents";
+    var EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+    var TOKEN_URL = "https://oauth2.googleapis.com/token";
+    function base64url(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let str = "";
+      for (const b of bytes) str += String.fromCharCode(b);
+      return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     }
-    const data = await response.json();
-    return data.access_token;
-  }
-  __name(getAccessToken, "getAccessToken");
-  function parseFirestoreValue(value) {
-    if (!value) return null;
-    if ("stringValue" in value) return value.stringValue;
-    if ("integerValue" in value) return parseInt(value.integerValue, 10);
-    if ("doubleValue" in value) return value.doubleValue;
-    if ("booleanValue" in value) return value.booleanValue;
-    if ("nullValue" in value) return null;
-    if ("timestampValue" in value) return value.timestampValue;
-    if ("mapValue" in value && value.mapValue.fields) {
+    __name(base64url, "base64url");
+    __name2(base64url, "base64url");
+    function base64urlStr(str) {
+      return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+    __name(base64urlStr, "base64urlStr");
+    __name2(base64urlStr, "base64urlStr");
+    async function importPrivateKey(pem) {
+      const cleaned = pem.replace(/\\n/g, "\n").replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
+      const binaryDer = Uint8Array.from(atob(cleaned), (c) => c.charCodeAt(0));
+      return crypto.subtle.importKey(
+        "pkcs8",
+        binaryDer.buffer,
+        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+    }
+    __name(importPrivateKey, "importPrivateKey");
+    __name2(importPrivateKey, "importPrivateKey");
+    async function createJWT(clientEmail, privateKey) {
+      const now = Math.floor(Date.now() / 1e3);
+      const header = { alg: "RS256", typ: "JWT" };
+      const payload = {
+        iss: clientEmail,
+        sub: clientEmail,
+        aud: TOKEN_URL,
+        iat: now,
+        exp: now + 3600,
+        scope: "https://www.googleapis.com/auth/datastore"
+      };
+      const encodedHeader = base64urlStr(JSON.stringify(header));
+      const encodedPayload = base64urlStr(JSON.stringify(payload));
+      const signingInput = `${encodedHeader}.${encodedPayload}`;
+      const key = await importPrivateKey(privateKey);
+      const signature = await crypto.subtle.sign(
+        "RSASSA-PKCS1-v1_5",
+        key,
+        new TextEncoder().encode(signingInput)
+      );
+      return `${signingInput}.${base64url(signature)}`;
+    }
+    __name(createJWT, "createJWT");
+    __name2(createJWT, "createJWT");
+    async function getAccessToken(clientEmail, privateKey) {
+      const jwt = await createJWT(clientEmail, privateKey);
+      const response = await fetch(TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Token exchange failed: ${response.status} ${text}`);
+      }
+      const data = await response.json();
+      return data.access_token;
+    }
+    __name(getAccessToken, "getAccessToken");
+    __name2(getAccessToken, "getAccessToken");
+    function parseFirestoreValue(value) {
+      if (!value) return null;
+      if ("stringValue" in value) return value.stringValue;
+      if ("integerValue" in value) return parseInt(value.integerValue, 10);
+      if ("doubleValue" in value) return value.doubleValue;
+      if ("booleanValue" in value) return value.booleanValue;
+      if ("nullValue" in value) return null;
+      if ("timestampValue" in value) return value.timestampValue;
+      if ("mapValue" in value && value.mapValue.fields) {
+        const result = {};
+        for (const [k, v] of Object.entries(value.mapValue.fields)) {
+          result[k] = parseFirestoreValue(v);
+        }
+        return result;
+      }
+      if ("arrayValue" in value) {
+        return (value.arrayValue.values || []).map(parseFirestoreValue);
+      }
+      return null;
+    }
+    __name(parseFirestoreValue, "parseFirestoreValue");
+    __name2(parseFirestoreValue, "parseFirestoreValue");
+    function parseFirestoreDoc(doc) {
+      if (!doc || !doc.fields) return null;
       const result = {};
-      for (const [k, v] of Object.entries(value.mapValue.fields)) {
-        result[k] = parseFirestoreValue(v);
+      for (const [key, value] of Object.entries(doc.fields)) {
+        result[key] = parseFirestoreValue(value);
+      }
+      if (doc.name) {
+        const parts = doc.name.split("/");
+        result._id = parts[parts.length - 1];
       }
       return result;
     }
-    if ("arrayValue" in value) {
-      return (value.arrayValue.values || []).map(parseFirestoreValue);
+    __name(parseFirestoreDoc, "parseFirestoreDoc");
+    __name2(parseFirestoreDoc, "parseFirestoreDoc");
+    async function getFirestoreDoc(collection, docId, accessToken) {
+      const url = `${FIRESTORE_BASE}/${collection}/${docId}`;
+      const response = await fetch(url, {
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
+      if (!response.ok) {
+        if (response.status === 404) return null;
+        const text = await response.text();
+        throw new Error(`Firestore GET ${collection}/${docId} failed: ${response.status} ${text}`);
+      }
+      const doc = await response.json();
+      return parseFirestoreDoc(doc);
     }
-    return null;
-  }
-  __name(parseFirestoreValue, "parseFirestoreValue");
-  function parseFirestoreDoc(doc) {
-    if (!doc || !doc.fields) return null;
-    const result = {};
-    for (const [key, value] of Object.entries(doc.fields)) {
-      result[key] = parseFirestoreValue(value);
-    }
-    if (doc.name) {
-      const parts = doc.name.split("/");
-      result._id = parts[parts.length - 1];
-    }
-    return result;
-  }
-  __name(parseFirestoreDoc, "parseFirestoreDoc");
-  async function getFirestoreDoc(collection, docId, accessToken) {
-    const url = `${FIRESTORE_BASE}/${collection}/${docId}`;
-    const response = await fetch(url, {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    if (!response.ok) {
-      if (response.status === 404) return null;
-      const text = await response.text();
-      throw new Error(`Firestore GET ${collection}/${docId} failed: ${response.status} ${text}`);
-    }
-    const doc = await response.json();
-    return parseFirestoreDoc(doc);
-  }
-  __name(getFirestoreDoc, "getFirestoreDoc");
-  async function queryFirestore(collectionId, fieldPath, op, value, accessToken) {
-    const url = `${FIRESTORE_BASE}:runQuery`;
-    let firestoreValue;
-    if (value === null) firestoreValue = { nullValue: null };
-    else if (typeof value === "string") firestoreValue = { stringValue: value };
-    else if (typeof value === "number") firestoreValue = { integerValue: String(value) };
-    else if (typeof value === "boolean") firestoreValue = { booleanValue: value };
-    else firestoreValue = { stringValue: String(value) };
-    const body = {
-      structuredQuery: {
-        from: [{ collectionId }],
-        where: {
-          fieldFilter: {
-            field: { fieldPath },
-            op,
-            value: firestoreValue
+    __name(getFirestoreDoc, "getFirestoreDoc");
+    __name2(getFirestoreDoc, "getFirestoreDoc");
+    async function queryFirestore(collectionId, fieldPath, op, value, accessToken) {
+      const url = `${FIRESTORE_BASE}:runQuery`;
+      let firestoreValue;
+      if (value === null) firestoreValue = { nullValue: null };
+      else if (typeof value === "string") firestoreValue = { stringValue: value };
+      else if (typeof value === "number") firestoreValue = { integerValue: String(value) };
+      else if (typeof value === "boolean") firestoreValue = { booleanValue: value };
+      else firestoreValue = { stringValue: String(value) };
+      const body = {
+        structuredQuery: {
+          from: [{ collectionId }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath },
+              op,
+              value: firestoreValue
+            }
           }
         }
-      }
-    };
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Firestore query failed: ${response.status} ${text}`);
-    }
-    const results = await response.json();
-    return results.filter((r) => r.document).map((r) => parseFirestoreDoc(r.document));
-  }
-  __name(queryFirestore, "queryFirestore");
-  function toFirestoreValue(value) {
-    if (value === null || value === void 0) return { nullValue: null };
-    if (typeof value === "string") return { stringValue: value };
-    if (typeof value === "number") {
-      if (Number.isInteger(value)) return { integerValue: String(value) };
-      return { doubleValue: value };
-    }
-    if (typeof value === "boolean") return { booleanValue: value };
-    if (typeof value === "object" && !Array.isArray(value)) {
-      const fields = {};
-      for (const [k, v] of Object.entries(value)) {
-        fields[k] = toFirestoreValue(v);
-      }
-      return { mapValue: { fields } };
-    }
-    if (Array.isArray(value)) {
-      return { arrayValue: { values: value.map(toFirestoreValue) } };
-    }
-    return { stringValue: String(value) };
-  }
-  __name(toFirestoreValue, "toFirestoreValue");
-  async function listAllUsers(accessToken) {
-    const users = [];
-    let pageToken = null;
-    do {
-      let url = `${FIRESTORE_BASE}/users?pageSize=300`;
-      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+      };
       const response = await fetch(url, {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Failed to list users: ${response.status} ${text}`);
-      }
-      const data = await response.json();
-      if (data.documents) {
-        for (const doc of data.documents) {
-          const parsed = parseFirestoreDoc(doc);
-          if (parsed) users.push(parsed);
-        }
-      }
-      pageToken = data.nextPageToken || null;
-    } while (pageToken);
-    return users;
-  }
-  __name(listAllUsers, "listAllUsers");
-  async function listAllOrders(accessToken) {
-    const orders = [];
-    let pageToken = null;
-    do {
-      let url = `${FIRESTORE_BASE}/orders?pageSize=300`;
-      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-      const response = await fetch(url, {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Failed to list orders: ${response.status} ${text}`);
-      }
-      const data = await response.json();
-      if (data.documents) {
-        for (const doc of data.documents) {
-          const parsed = parseFirestoreDoc(doc);
-          if (parsed) orders.push(parsed);
-        }
-      }
-      pageToken = data.nextPageToken || null;
-    } while (pageToken);
-    return orders;
-  }
-  __name(listAllOrders, "listAllOrders");
-  async function listAllOffers(accessToken) {
-    const offers = [];
-    let pageToken = null;
-    do {
-      let url = `${FIRESTORE_BASE}/offers?pageSize=300`;
-      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-      const response = await fetch(url, {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Failed to list offers: ${response.status} ${text}`);
-      }
-      const data = await response.json();
-      if (data.documents) {
-        for (const doc of data.documents) {
-          const parsed = parseFirestoreDoc(doc);
-          if (parsed) offers.push(parsed);
-        }
-      }
-      pageToken = data.nextPageToken || null;
-    } while (pageToken);
-    return offers;
-  }
-  __name(listAllOffers, "listAllOffers");
-  async function listAllInvoices(accessToken) {
-    const invoices = [];
-    let pageToken = null;
-    do {
-      let url = `${FIRESTORE_BASE}/invoices?pageSize=300`;
-      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-      const response = await fetch(url, {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      if (!response.ok) {
-        if (response.status === 404) return [];
-        const text = await response.text();
-        throw new Error(`Failed to list invoices: ${response.status} ${text}`);
-      }
-      const data = await response.json();
-      if (data.documents) {
-        for (const doc of data.documents) {
-          const parsed = parseFirestoreDoc(doc);
-          if (parsed) invoices.push(parsed);
-        }
-      }
-      pageToken = data.nextPageToken || null;
-    } while (pageToken);
-    return invoices;
-  }
-  __name(listAllInvoices, "listAllInvoices");
-  async function updateFirestoreDocument(collectionPath, docId, fields, accessToken) {
-    const fieldPaths = Object.keys(fields);
-    const maskParams = fieldPaths.map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join("&");
-    const url = `${FIRESTORE_BASE}/${collectionPath}/${docId}?${maskParams}`;
-    const firestoreFields = {};
-    for (const [key, value] of Object.entries(fields)) {
-      firestoreFields[key] = toFirestoreValue(value);
-    }
-    const response = await fetch(url, {
-      method: "PATCH",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ fields: firestoreFields })
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Firestore PATCH ${collectionPath}/${docId} failed: ${response.status} ${text}`);
-    }
-    return await response.json();
-  }
-  __name(updateFirestoreDocument, "updateFirestoreDocument");
-  async function createFirestoreDocument(collectionPath, docId, fields, accessToken) {
-    const url = docId ? `${FIRESTORE_BASE}/${collectionPath}/${docId}` : `${FIRESTORE_BASE}/${collectionPath}`;
-    const firestoreFields = {};
-    for (const [key, value] of Object.entries(fields)) {
-      firestoreFields[key] = toFirestoreValue(value);
-    }
-    const method = docId ? "PATCH" : "POST";
-    const response = await fetch(url, {
-      method,
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ fields: firestoreFields })
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Firestore CREATE ${collectionPath} failed: ${response.status} ${text}`);
-    }
-    return await response.json();
-  }
-  __name(createFirestoreDocument, "createFirestoreDocument");
-  async function sha1Hex(str) {
-    const data = new TextEncoder().encode(str);
-    const hash = await crypto.subtle.digest("SHA-1", data);
-    return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-  __name(sha1Hex, "sha1Hex");
-  async function uploadToCloudinary(imageBase64, folder, env) {
-    const cloudName = env.CLOUDINARY_CLOUD_NAME || "dv6n9vnly";
-    const apiKey = env.CLOUDINARY_API_KEY;
-    const apiSecret = env.CLOUDINARY_API_SECRET;
-    if (!apiKey || !apiSecret) {
-      throw new Error("Cloudinary API credentials not configured. Set CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET as Worker secrets.");
-    }
-    const timestamp = String(Math.floor(Date.now() / 1e3));
-    const params = { folder, timestamp };
-    const sortedStr = Object.keys(params).sort().map((k) => k + "=" + params[k]).join("&");
-    const signature = await sha1Hex(sortedStr + apiSecret);
-    const formData = new FormData();
-    formData.append("file", imageBase64);
-    formData.append("api_key", apiKey);
-    formData.append("timestamp", timestamp);
-    formData.append("folder", folder);
-    formData.append("signature", signature);
-    console.log("[Cloudinary] Uploading to folder:", folder, "cloud:", cloudName);
-    const res = await fetch("https://api.cloudinary.com/v1_1/" + cloudName + "/image/upload", {
-      method: "POST",
-      body: formData
-    });
-    const result = await res.json();
-    if (!res.ok || result.error) {
-      const errMsg = result.error ? result.error.message : "HTTP " + res.status;
-      console.error("[Cloudinary] Upload failed:", errMsg);
-      throw new Error("Cloudinary upload failed: " + errMsg);
-    }
-    console.log("[Cloudinary] Upload success:", result.secure_url);
-    return { secure_url: result.secure_url, public_id: result.public_id };
-  }
-  __name(uploadToCloudinary, "uploadToCloudinary");
-  async function hashPassword(password) {
-    const data = new TextEncoder().encode(password + "_tbk_salt_2026");
-    const hash = await crypto.subtle.digest("SHA-256", data);
-    return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-  __name(hashPassword, "hashPassword");
-  async function sendEmail(to, subject, html, env, attachments) {
-    const apiKey = env.EMAIL_API_KEY;
-    if (!apiKey) {
-      console.log("[Email] EMAIL_API_KEY not configured, skipping email to:", to);
-      return { sent: false, reason: "EMAIL_API_KEY not configured" };
-    }
-    const from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
-    try {
-      const payload = { from, to: [to], subject, html };
-      if (attachments && attachments.length > 0) {
-        payload.attachments = attachments;
-      }
-      const res = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: {
-          "Authorization": "Bearer " + apiKey,
+          "Authorization": `Bearer ${accessToken}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(body)
       });
-      const data = await res.json();
-      if (res.ok) {
-        console.log("[Email] Sent to", to, "id:", data.id);
-        return { sent: true, id: data.id };
-      } else {
-        console.error("[Email] Failed:", JSON.stringify(data));
-        return { sent: false, reason: data.message || "Failed" };
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Firestore query failed: ${response.status} ${text}`);
       }
-    } catch (e) {
-      console.error("[Email] Error:", e);
-      return { sent: false, reason: e.message };
+      const results = await response.json();
+      return results.filter((r) => r.document).map((r) => parseFirestoreDoc(r.document));
     }
-  }
-  __name(sendEmail, "sendEmail");
-  function isExpoPushToken(token) {
-    return typeof token === "string" && (token.startsWith("ExponentPushToken[") || token.startsWith("ExpoPushToken["));
-  }
-  __name(isExpoPushToken, "isExpoPushToken");
-  async function getUserPushToken(uid, accessToken) {
-    const user = await getFirestoreDoc("users", uid, accessToken);
-    if (!user) return null;
-    const token = user.expoPushToken;
-    if (!token || !isExpoPushToken(token)) return null;
-    return token;
-  }
-  __name(getUserPushToken, "getUserPushToken");
-  async function getDriverPushTokens(accessToken) {
-    const drivers = await queryFirestore("users", "role", "EQUAL", "driver", accessToken);
-    return drivers.filter((d) => d && d.pushNotificationsEnabled === true && d.expoPushToken && isExpoPushToken(d.expoPushToken)).map((d) => d.expoPushToken);
-  }
-  __name(getDriverPushTokens, "getDriverPushTokens");
-  async function sendExpoPush(messages) {
-    if (!messages.length) return;
-    const chunks = [];
-    for (let i = 0; i < messages.length; i += 100) {
-      chunks.push(messages.slice(i, i + 100));
+    __name(queryFirestore, "queryFirestore");
+    __name2(queryFirestore, "queryFirestore");
+    function toFirestoreValue(value) {
+      if (value === null || value === void 0) return { nullValue: null };
+      if (typeof value === "string") return { stringValue: value };
+      if (typeof value === "number") {
+        if (Number.isInteger(value)) return { integerValue: String(value) };
+        return { doubleValue: value };
+      }
+      if (typeof value === "boolean") return { booleanValue: value };
+      if (typeof value === "object" && !Array.isArray(value)) {
+        const fields = {};
+        for (const [k, v] of Object.entries(value)) {
+          fields[k] = toFirestoreValue(v);
+        }
+        return { mapValue: { fields } };
+      }
+      if (Array.isArray(value)) {
+        return { arrayValue: { values: value.map(toFirestoreValue) } };
+      }
+      return { stringValue: String(value) };
     }
-    for (const chunk of chunks) {
-      try {
-        const response = await fetch(EXPO_PUSH_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Accept": "application/json" },
-          body: JSON.stringify(chunk)
+    __name(toFirestoreValue, "toFirestoreValue");
+    __name2(toFirestoreValue, "toFirestoreValue");
+    async function listAllUsers(accessToken) {
+      const users = [];
+      let pageToken = null;
+      do {
+        let url = `${FIRESTORE_BASE}/users?pageSize=300`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const response = await fetch(url, {
+          headers: { "Authorization": `Bearer ${accessToken}` }
         });
-        const result = await response.json();
-        console.log("[Push] Expo response:", JSON.stringify(result));
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Failed to list users: ${response.status} ${text}`);
+        }
+        const data = await response.json();
+        if (data.documents) {
+          for (const doc of data.documents) {
+            const parsed = parseFirestoreDoc(doc);
+            if (parsed) users.push(parsed);
+          }
+        }
+        pageToken = data.nextPageToken || null;
+      } while (pageToken);
+      return users;
+    }
+    __name(listAllUsers, "listAllUsers");
+    __name2(listAllUsers, "listAllUsers");
+    async function listAllOrders(accessToken) {
+      const orders = [];
+      let pageToken = null;
+      do {
+        let url = `${FIRESTORE_BASE}/orders?pageSize=300`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const response = await fetch(url, {
+          headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Failed to list orders: ${response.status} ${text}`);
+        }
+        const data = await response.json();
+        if (data.documents) {
+          for (const doc of data.documents) {
+            const parsed = parseFirestoreDoc(doc);
+            if (parsed) orders.push(parsed);
+          }
+        }
+        pageToken = data.nextPageToken || null;
+      } while (pageToken);
+      return orders;
+    }
+    __name(listAllOrders, "listAllOrders");
+    __name2(listAllOrders, "listAllOrders");
+    async function listAllOffers(accessToken) {
+      const offers = [];
+      let pageToken = null;
+      do {
+        let url = `${FIRESTORE_BASE}/offers?pageSize=300`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const response = await fetch(url, {
+          headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Failed to list offers: ${response.status} ${text}`);
+        }
+        const data = await response.json();
+        if (data.documents) {
+          for (const doc of data.documents) {
+            const parsed = parseFirestoreDoc(doc);
+            if (parsed) offers.push(parsed);
+          }
+        }
+        pageToken = data.nextPageToken || null;
+      } while (pageToken);
+      return offers;
+    }
+    __name(listAllOffers, "listAllOffers");
+    __name2(listAllOffers, "listAllOffers");
+    async function listAllComplaints(accessToken) {
+      const complaints = [];
+      let pageToken = null;
+      do {
+        let url = `${FIRESTORE_BASE}/delivery_complaints?pageSize=300`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const response = await fetch(url, {
+          headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        if (!response.ok) {
+          if (response.status === 404) return [];
+          const text = await response.text();
+          throw new Error(`Failed to list complaints: ${response.status} ${text}`);
+        }
+        const data = await response.json();
+        if (data.documents) {
+          for (const doc of data.documents) {
+            const parsed = parseFirestoreDoc(doc);
+            if (parsed) complaints.push(parsed);
+          }
+        }
+        pageToken = data.nextPageToken || null;
+      } while (pageToken);
+      return complaints;
+    }
+    __name(listAllComplaints, "listAllComplaints");
+    __name2(listAllComplaints, "listAllComplaints");
+    async function listAllInvoices(accessToken) {
+      const invoices = [];
+      let pageToken = null;
+      do {
+        let url = `${FIRESTORE_BASE}/invoices?pageSize=300`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const response = await fetch(url, {
+          headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        if (!response.ok) {
+          if (response.status === 404) return [];
+          const text = await response.text();
+          throw new Error(`Failed to list invoices: ${response.status} ${text}`);
+        }
+        const data = await response.json();
+        if (data.documents) {
+          for (const doc of data.documents) {
+            const parsed = parseFirestoreDoc(doc);
+            if (parsed) invoices.push(parsed);
+          }
+        }
+        pageToken = data.nextPageToken || null;
+      } while (pageToken);
+      return invoices;
+    }
+    __name(listAllInvoices, "listAllInvoices");
+    __name2(listAllInvoices, "listAllInvoices");
+    async function updateFirestoreDocument(collectionPath, docId, fields, accessToken) {
+      const fieldPaths = Object.keys(fields);
+      const maskParams = fieldPaths.map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join("&");
+      const url = `${FIRESTORE_BASE}/${collectionPath}/${docId}?${maskParams}`;
+      const firestoreFields = {};
+      for (const [key, value] of Object.entries(fields)) {
+        firestoreFields[key] = toFirestoreValue(value);
+      }
+      const response = await fetch(url, {
+        method: "PATCH",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ fields: firestoreFields })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Firestore PATCH ${collectionPath}/${docId} failed: ${response.status} ${text}`);
+      }
+      return await response.json();
+    }
+    __name(updateFirestoreDocument, "updateFirestoreDocument");
+    __name2(updateFirestoreDocument, "updateFirestoreDocument");
+    async function createFirestoreDocument(collectionPath, docId, fields, accessToken) {
+      const url = docId ? `${FIRESTORE_BASE}/${collectionPath}/${docId}` : `${FIRESTORE_BASE}/${collectionPath}`;
+      const firestoreFields = {};
+      for (const [key, value] of Object.entries(fields)) {
+        firestoreFields[key] = toFirestoreValue(value);
+      }
+      const method = docId ? "PATCH" : "POST";
+      const response = await fetch(url, {
+        method,
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ fields: firestoreFields })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Firestore CREATE ${collectionPath} failed: ${response.status} ${text}`);
+      }
+      return await response.json();
+    }
+    __name(createFirestoreDocument, "createFirestoreDocument");
+    __name2(createFirestoreDocument, "createFirestoreDocument");
+    async function deleteFirestoreDocument(collectionPath, docId, accessToken) {
+      const url = `${FIRESTORE_BASE}/${collectionPath}/${docId}`;
+      const response = await fetch(url, {
+        method: "DELETE",
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
+      if (!response.ok && response.status !== 404) {
+        const text = await response.text();
+        throw new Error(`Firestore DELETE ${collectionPath}/${docId} failed: ${response.status} ${text}`);
+      }
+      return true;
+    }
+    __name(deleteFirestoreDocument, "deleteFirestoreDocument");
+    __name2(deleteFirestoreDocument, "deleteFirestoreDocument");
+    async function sha1Hex(str) {
+      const data = new TextEncoder().encode(str);
+      const hash = await crypto.subtle.digest("SHA-1", data);
+      return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    __name(sha1Hex, "sha1Hex");
+    __name2(sha1Hex, "sha1Hex");
+    async function uploadToCloudinary(imageBase64, folder, env) {
+      const cloudName = env.CLOUDINARY_CLOUD_NAME || "dv6n9vnly";
+      const apiKey = env.CLOUDINARY_API_KEY;
+      const apiSecret = env.CLOUDINARY_API_SECRET;
+      if (!apiKey || !apiSecret) {
+        throw new Error("Cloudinary API credentials not configured. Set CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET as Worker secrets.");
+      }
+      const timestamp = String(Math.floor(Date.now() / 1e3));
+      const params = { folder, timestamp };
+      const sortedStr = Object.keys(params).sort().map((k) => k + "=" + params[k]).join("&");
+      const signature = await sha1Hex(sortedStr + apiSecret);
+      const formData = new FormData();
+      formData.append("file", imageBase64);
+      formData.append("api_key", apiKey);
+      formData.append("timestamp", timestamp);
+      formData.append("folder", folder);
+      formData.append("signature", signature);
+      console.log("[Cloudinary] Uploading to folder:", folder, "cloud:", cloudName);
+      const res = await fetch("https://api.cloudinary.com/v1_1/" + cloudName + "/image/upload", {
+        method: "POST",
+        body: formData
+      });
+      const result = await res.json();
+      if (!res.ok || result.error) {
+        const errMsg = result.error ? result.error.message : "HTTP " + res.status;
+        console.error("[Cloudinary] Upload failed:", errMsg);
+        throw new Error("Cloudinary upload failed: " + errMsg);
+      }
+      console.log("[Cloudinary] Upload success:", result.secure_url);
+      return { secure_url: result.secure_url, public_id: result.public_id };
+    }
+    __name(uploadToCloudinary, "uploadToCloudinary");
+    __name2(uploadToCloudinary, "uploadToCloudinary");
+    async function hashPassword(password) {
+      const data = new TextEncoder().encode(password + "_tbk_salt_2026");
+      const hash = await crypto.subtle.digest("SHA-256", data);
+      return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    __name(hashPassword, "hashPassword");
+    __name2(hashPassword, "hashPassword");
+    async function sendEmail(to, subject, html, env, attachments) {
+      const apiKey = env.EMAIL_API_KEY;
+      if (!apiKey) {
+        console.log("[Email] EMAIL_API_KEY not configured, skipping email to:", to);
+        return { sent: false, reason: "EMAIL_API_KEY not configured" };
+      }
+      const from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
+      try {
+        const payload = { from, to: [to], subject, html };
+        if (attachments && attachments.length > 0) {
+          payload.attachments = attachments;
+        }
+        const res = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + apiKey,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (res.ok) {
+          console.log("[Email] Sent to", to, "id:", data.id);
+          return { sent: true, id: data.id };
+        } else {
+          console.error("[Email] Failed:", JSON.stringify(data));
+          return { sent: false, reason: data.message || "Failed" };
+        }
       } catch (e) {
-        console.error("[Push] Error sending chunk:", e);
+        console.error("[Email] Error:", e);
+        return { sent: false, reason: e.message };
       }
     }
-  }
-  __name(sendExpoPush, "sendExpoPush");
-  async function handleEvent(event, orderId, accessToken) {
-    const order = await getFirestoreDoc("orders", orderId, accessToken);
-    if (!order) {
-      return { success: false, error: "Order not found" };
+    __name(sendEmail, "sendEmail");
+    __name2(sendEmail, "sendEmail");
+    function isExpoPushToken(token) {
+      return typeof token === "string" && /^(ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]+\]$/.test(token);
     }
-    const orderLabel = order.offerTitleSnapshot || order.orderNumber || orderId;
-    const messages = [];
-    switch (event) {
-      case "order_accepted": {
-        if (order.customerUid) {
-          const token = await getUserPushToken(order.customerUid, accessToken);
-          if (token) {
-            messages.push({
-              to: token,
-              title: "\u062A\u0645 \u0642\u0628\u0648\u0644 \u0637\u0644\u0628\u0643 \u2705",
-              body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062A\u0645 \u0642\u0628\u0648\u0644\u0647 \u0648\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0636\u064A\u0631',
-              data: { type: "order_accepted", orderId, role: "customer" },
-              sound: "default"
-            });
-          }
+    __name(isExpoPushToken, "isExpoPushToken");
+    __name2(isExpoPushToken, "isExpoPushToken");
+    function normalizeSaudiWhatsApp(value) {
+      const raw = String(value == null ? "" : value).trim();
+      if (!raw) return "";
+      let digits = raw.replace(/[^\d]/g, "");
+      if (digits.startsWith("00966")) digits = digits.slice(2);
+      if (digits.startsWith("05") && digits.length === 10) digits = "966" + digits.slice(1);
+      else if (digits.startsWith("5") && digits.length === 9) digits = "966" + digits;
+      if (!/^9665\d{8}$/.test(digits)) return null;
+      return digits;
+    }
+    __name(normalizeSaudiWhatsApp, "normalizeSaudiWhatsApp");
+    __name2(normalizeSaudiWhatsApp, "normalizeSaudiWhatsApp");
+    function incrementReason(reasons, code, message) {
+      const safeCode = String(code || "UnknownError").slice(0, 80);
+      const safeMessage = String(message || "").replace(/ExponentPushToken\[[^\]]+\]|ExpoPushToken\[[^\]]+\]/g, "[redacted-token]").slice(0, 240);
+      if (!reasons[safeCode]) reasons[safeCode] = { count: 0, message: safeMessage };
+      reasons[safeCode].count++;
+      if (!reasons[safeCode].message && safeMessage) reasons[safeCode].message = safeMessage;
+    }
+    __name(incrementReason, "incrementReason");
+    __name2(incrementReason, "incrementReason");
+    async function sendAdminBroadcast(users, title, message, accessToken) {
+      const tokenOwners = /* @__PURE__ */ new Map();
+      let totalCandidateTokens = 0;
+      let invalidTokensCount = 0;
+      for (const user of users) {
+        const token = user && typeof user.expoPushToken === "string" ? user.expoPushToken.trim() : "";
+        if (!token) continue;
+        totalCandidateTokens++;
+        if (!isExpoPushToken(token)) {
+          invalidTokensCount++;
+          continue;
         }
-        break;
+        if (!tokenOwners.has(token)) tokenOwners.set(token, []);
+        tokenOwners.get(token).push(user._id);
       }
-      case "order_ready": {
-        if (order.customerUid) {
-          const token = await getUserPushToken(order.customerUid, accessToken);
-          if (token) {
-            messages.push({
-              to: token,
-              title: "\u0637\u0644\u0628\u0643 \u062C\u0627\u0647\u0632 \u{1F37D}\uFE0F",
-              body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062C\u0627\u0647\u0632. \u0627\u062E\u062A\u0631 \u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u0627\u0633\u062A\u0644\u0627\u0645',
-              data: { type: "order_ready", orderId, role: "customer" },
-              sound: "default"
-            });
-          }
-        }
-        break;
-      }
-      case "self_pickup_selected": {
-        if (order.providerUid) {
-          const token = await getUserPushToken(order.providerUid, accessToken);
-          if (token) {
-            messages.push({
-              to: token,
-              title: "\u0627\u0633\u062A\u0644\u0627\u0645 \u0630\u0627\u062A\u064A \u{1F4E6}",
-              body: '\u0627\u0644\u0639\u0645\u064A\u0644 \u0633\u064A\u0633\u062A\u0644\u0645 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u0628\u0646\u0641\u0633\u0647',
-              data: { type: "self_pickup_selected", orderId, role: "provider" },
-              sound: "default"
-            });
-          }
-        }
-        break;
-      }
-      case "driver_delivery_requested": {
-        if (order.providerUid) {
-          const providerToken = await getUserPushToken(order.providerUid, accessToken);
-          if (providerToken) {
-            messages.push({
-              to: providerToken,
-              title: "\u062A\u0648\u0635\u064A\u0644 \u0628\u0645\u0646\u062F\u0648\u0628 \u{1F697}",
-              body: '\u0627\u0644\u0639\u0645\u064A\u0644 \u0637\u0644\u0628 \u062A\u0648\u0635\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u0628\u0648\u0627\u0633\u0637\u0629 \u0645\u0646\u062F\u0648\u0628',
-              data: { type: "driver_delivery_requested", orderId, role: "provider" },
-              sound: "default"
-            });
-          }
-        }
-        const driverTokens = await getDriverPushTokens(accessToken);
-        for (const token of driverTokens) {
-          messages.push({
-            to: token,
-            title: "\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u{1F680}",
-            body: '\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u0644\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
-            data: { type: "new_delivery_available", orderId, role: "driver" },
-            sound: "default"
+      const validTokens = Array.from(tokenOwners.keys());
+      let sentCount = 0;
+      let failedCount = 0;
+      let staleTokensCount = 0;
+      const failureReasons = {};
+      const chunks = [];
+      for (let i = 0; i < validTokens.length; i += 100) chunks.push(validTokens.slice(i, i + 100));
+      for (const tokenChunk of chunks) {
+        const messages = tokenChunk.map((token) => ({
+          to: token,
+          title,
+          body: message,
+          sound: "default",
+          data: { type: "admin_broadcast" }
+        }));
+        try {
+          const expoResp = await fetch(EXPO_PUSH_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify(messages)
           });
+          let expoResult = null;
+          try {
+            expoResult = await expoResp.json();
+          } catch {
+            expoResult = null;
+          }
+          if (!expoResp.ok) {
+            failedCount += messages.length;
+            incrementReason(failureReasons, "ExpoHTTP" + expoResp.status, expoResult && (expoResult.message || expoResult.error) || "Expo Push API rejected the request");
+            continue;
+          }
+          if (!expoResult || !Array.isArray(expoResult.data)) {
+            failedCount += messages.length;
+            incrementReason(failureReasons, "MalformedExpoResponse", "Expo Push API returned no ticket array");
+            continue;
+          }
+          for (let i = 0; i < messages.length; i++) {
+            const ticket = expoResult.data[i];
+            if (ticket && ticket.status === "ok" && typeof ticket.id === "string" && ticket.id.trim().length > 0) {
+              sentCount++;
+              continue;
+            }
+            failedCount++;
+            const malformedSuccess = ticket && ticket.status === "ok";
+            const code = malformedSuccess ? "MalformedExpoTicket" : ticket && ticket.details && ticket.details.error || "ExpoTicketError";
+            const reason = malformedSuccess ? "Expo returned an accepted ticket without an ID" : ticket && ticket.message || "Expo rejected the push notification";
+            incrementReason(failureReasons, code, reason);
+            if (code === "DeviceNotRegistered") {
+              staleTokensCount++;
+              const owners = tokenOwners.get(tokenChunk[i]) || [];
+              for (const uid of owners) {
+                try {
+                  await updateFirestoreDocument("users", uid, { expoPushToken: null }, accessToken);
+                } catch (e) {
+                  incrementReason(failureReasons, "StaleTokenCleanupFailed", e && e.message || "Could not clear stale token");
+                }
+              }
+            }
+          }
+          if (expoResult.data.length < messages.length) {
+            const missing = messages.length - expoResult.data.length;
+            incrementReason(failureReasons, "MissingExpoTickets", "Expo returned fewer tickets than submitted messages");
+          }
+        } catch (e) {
+          failedCount += messages.length;
+          incrementReason(failureReasons, "ExpoNetworkError", e && e.message || "Expo Push API request failed");
         }
-        break;
       }
-      case "driver_assigned": {
-        if (order.customerUid) {
-          const customerToken = await getUserPushToken(order.customerUid, accessToken);
-          if (customerToken) {
-            messages.push({
-              to: customerToken,
-              title: "\u062A\u0645 \u062A\u0639\u064A\u064A\u0646 \u0645\u0646\u062F\u0648\u0628 \u{1F3CD}\uFE0F",
-              body: '\u062A\u0645 \u062A\u0639\u064A\u064A\u0646 \u0645\u0646\u062F\u0648\u0628 \u0644\u062A\u0648\u0635\u064A\u0644 \u0637\u0644\u0628\u0643 "' + orderLabel + '"',
-              data: { type: "driver_assigned", orderId, role: "customer" },
-              sound: "default"
-            });
-          }
-        }
-        if (order.providerUid) {
-          const providerToken = await getUserPushToken(order.providerUid, accessToken);
-          if (providerToken) {
-            messages.push({
-              to: providerToken,
-              title: "\u0645\u0646\u062F\u0648\u0628 \u0641\u064A \u0627\u0644\u0637\u0631\u064A\u0642 \u{1F3CD}\uFE0F",
-              body: '\u0645\u0646\u062F\u0648\u0628 \u0641\u064A \u0637\u0631\u064A\u0642\u0647 \u0644\u0627\u0633\u062A\u0644\u0627\u0645 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
-              data: { type: "driver_assigned", orderId, role: "provider" },
-              sound: "default"
-            });
-          }
-        }
-        break;
-      }
-      case "picked_up": {
-        if (order.customerUid) {
-          const token = await getUserPushToken(order.customerUid, accessToken);
-          if (token) {
-            messages.push({
-              to: token,
-              title: "\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0627\u0633\u062A\u0644\u0645 \u0637\u0644\u0628\u0643 \u{1F4E6}",
-              body: '\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0627\u0633\u062A\u0644\u0645 \u0637\u0644\u0628\u0643 "' + orderLabel + '" \u0648\u0641\u064A \u0627\u0644\u0637\u0631\u064A\u0642 \u0625\u0644\u064A\u0643',
-              data: { type: "order_picked_up", orderId, role: "customer" },
-              sound: "default"
-            });
-          }
-        }
-        break;
-      }
-      case "arrived": {
-        if (order.customerUid) {
-          const token = await getUserPushToken(order.customerUid, accessToken);
-          if (token) {
-            messages.push({
-              to: token,
-              title: "\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0648\u0635\u0644 \u{1F4CD}",
-              body: '\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0648\u0635\u0644 \u0644\u0645\u0648\u0642\u0639\u0643 \u0628\u0637\u0644\u0628\u0643 "' + orderLabel + '"',
-              data: { type: "driver_arrived", orderId, role: "customer" },
-              sound: "default"
-            });
-          }
-        }
-        break;
-      }
-      case "delivered": {
-        if (order.customerUid) {
-          const customerToken = await getUserPushToken(order.customerUid, accessToken);
-          if (customerToken) {
-            messages.push({
-              to: customerToken,
-              title: "\u062A\u0645 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u2705",
-              body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062A\u0645 \u062A\u0648\u0635\u064A\u0644\u0647 \u0628\u0646\u062C\u0627\u062D',
-              data: { type: "order_delivered", orderId, role: "customer" },
-              sound: "default"
-            });
-          }
-        }
-        if (order.providerUid) {
-          const providerToken = await getUserPushToken(order.providerUid, accessToken);
-          if (providerToken) {
-            messages.push({
-              to: providerToken,
-              title: "\u062A\u0645 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u2705",
-              body: '\u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u062A\u0645 \u062A\u0648\u0635\u064A\u0644\u0647 \u0644\u0644\u0639\u0645\u064A\u0644 \u0628\u0646\u062C\u0627\u062D',
-              data: { type: "order_delivered", orderId, role: "provider" },
-              sound: "default"
-            });
-          }
-        }
-        break;
-      }
-      case "self_pickup_completed": {
-        if (order.customerUid) {
-          const token = await getUserPushToken(order.customerUid, accessToken);
-          if (token) {
-            messages.push({
-              to: token,
-              title: "\u062A\u0645 \u062A\u0633\u0644\u064A\u0645 \u0627\u0644\u0637\u0644\u0628 \u2705",
-              body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062A\u0645 \u062A\u0633\u0644\u064A\u0645\u0647 \u0628\u0646\u062C\u0627\u062D',
-              data: { type: "order_completed", orderId, role: "customer" },
-              sound: "default"
-            });
-          }
-        }
-        break;
-      }
-      default:
-        return { success: false, error: "Unknown event: " + event };
+      return {
+        totalCandidateTokens,
+        validTokensCount: validTokens.length,
+        sentCount,
+        acceptedCount: sentCount,
+        failedCount,
+        invalidTokensCount,
+        staleTokensCount,
+        failureReasons
+      };
     }
-    if (messages.length > 0) {
-      await sendExpoPush(messages);
-      console.log("[Push] Sent " + messages.length + " notifications for " + event + " on order " + orderId);
+    __name(sendAdminBroadcast, "sendAdminBroadcast");
+    __name2(sendAdminBroadcast, "sendAdminBroadcast");
+    async function getUserPushToken(uid, accessToken) {
+      const user = await getFirestoreDoc("users", uid, accessToken);
+      if (!user) return null;
+      const token = user.expoPushToken;
+      if (!token || !isExpoPushToken(token)) return null;
+      return token;
     }
-    return { success: true, notificationsSent: messages.length };
-  }
-  __name(handleEvent, "handleEvent");
-  async function createAdminToken(env) {
-    const exp = Date.now() + 24 * 60 * 60 * 1e3;
-    const payload = btoa(JSON.stringify({ exp, r: Math.random().toString(36).slice(2) }));
-    const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
-    const key = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-    const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    return payload + "." + sigB64;
-  }
-  __name(createAdminToken, "createAdminToken");
-  async function verifyAdminToken(token, env) {
-    try {
-      if (!token) return false;
-      const parts = token.split(".");
-      if (parts.length !== 2) return false;
-      const [payload, sigB64] = parts;
-      const data = JSON.parse(atob(payload));
-      if (Date.now() > data.exp) return false;
+    __name(getUserPushToken, "getUserPushToken");
+    __name2(getUserPushToken, "getUserPushToken");
+    async function getDriverPushTokens(accessToken) {
+      const drivers = await queryFirestore("users", "role", "EQUAL", "driver", accessToken);
+      return drivers.filter((d) => d && d.pushNotificationsEnabled === true && d.expoPushToken && isExpoPushToken(d.expoPushToken)).map((d) => d.expoPushToken);
+    }
+    __name(getDriverPushTokens, "getDriverPushTokens");
+    __name2(getDriverPushTokens, "getDriverPushTokens");
+    async function sendExpoPush(messages) {
+      if (!messages.length) return;
+      const chunks = [];
+      for (let i = 0; i < messages.length; i += 100) {
+        chunks.push(messages.slice(i, i + 100));
+      }
+      for (const chunk of chunks) {
+        try {
+          const response = await fetch(EXPO_PUSH_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify(chunk)
+          });
+          const result = await response.json();
+          console.log("[Push] Expo response:", JSON.stringify(result));
+        } catch (e) {
+          console.error("[Push] Error sending chunk:", e);
+        }
+      }
+    }
+    __name(sendExpoPush, "sendExpoPush");
+    __name2(sendExpoPush, "sendExpoPush");
+    async function handleEvent(event, orderId, accessToken) {
+      const order = await getFirestoreDoc("orders", orderId, accessToken);
+      if (!order) {
+        return { success: false, error: "Order not found" };
+      }
+      const orderLabel = order.offerTitleSnapshot || order.orderNumber || orderId;
+      const messages = [];
+      switch (event) {
+        case "order_accepted": {
+          if (order.customerUid) {
+            const token = await getUserPushToken(order.customerUid, accessToken);
+            if (token) {
+              messages.push({
+                to: token,
+                title: "\u062A\u0645 \u0642\u0628\u0648\u0644 \u0637\u0644\u0628\u0643 \u2705",
+                body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062A\u0645 \u0642\u0628\u0648\u0644\u0647 \u0648\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0636\u064A\u0631',
+                data: { type: "order_accepted", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "order_ready": {
+          if (order.customerUid) {
+            const token = await getUserPushToken(order.customerUid, accessToken);
+            if (token) {
+              messages.push({
+                to: token,
+                title: "\u0637\u0644\u0628\u0643 \u062C\u0627\u0647\u0632 \u{1F37D}\uFE0F",
+                body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062C\u0627\u0647\u0632. \u0627\u062E\u062A\u0631 \u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u0627\u0633\u062A\u0644\u0627\u0645',
+                data: { type: "order_ready", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "self_pickup_selected": {
+          if (order.providerUid) {
+            const token = await getUserPushToken(order.providerUid, accessToken);
+            if (token) {
+              messages.push({
+                to: token,
+                title: "\u0627\u0633\u062A\u0644\u0627\u0645 \u0630\u0627\u062A\u064A \u{1F4E6}",
+                body: '\u0627\u0644\u0639\u0645\u064A\u0644 \u0633\u064A\u0633\u062A\u0644\u0645 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u0628\u0646\u0641\u0633\u0647',
+                data: { type: "self_pickup_selected", orderId, role: "provider" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "driver_delivery_requested": {
+          if (order.providerUid) {
+            const providerToken = await getUserPushToken(order.providerUid, accessToken);
+            if (providerToken) {
+              messages.push({
+                to: providerToken,
+                title: "\u062A\u0648\u0635\u064A\u0644 \u0628\u0645\u0646\u062F\u0648\u0628 \u{1F697}",
+                body: '\u0627\u0644\u0639\u0645\u064A\u0644 \u0637\u0644\u0628 \u062A\u0648\u0635\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u0628\u0648\u0627\u0633\u0637\u0629 \u0645\u0646\u062F\u0648\u0628',
+                data: { type: "driver_delivery_requested", orderId, role: "provider" },
+                sound: "default"
+              });
+            }
+          }
+          const driverTokens = await getDriverPushTokens(accessToken);
+          for (const token of driverTokens) {
+            messages.push({
+              to: token,
+              title: "\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u{1F680}",
+              body: '\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u0644\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
+              data: { type: "new_delivery_available", orderId, role: "driver" },
+              sound: "default"
+            });
+          }
+          break;
+        }
+        case "driver_assigned": {
+          if (order.customerUid) {
+            const customerToken = await getUserPushToken(order.customerUid, accessToken);
+            if (customerToken) {
+              messages.push({
+                to: customerToken,
+                title: "\u062A\u0645 \u062A\u0639\u064A\u064A\u0646 \u0645\u0646\u062F\u0648\u0628 \u{1F3CD}\uFE0F",
+                body: '\u062A\u0645 \u062A\u0639\u064A\u064A\u0646 \u0645\u0646\u062F\u0648\u0628 \u0644\u062A\u0648\u0635\u064A\u0644 \u0637\u0644\u0628\u0643 "' + orderLabel + '"',
+                data: { type: "driver_assigned", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          if (order.providerUid) {
+            const providerToken = await getUserPushToken(order.providerUid, accessToken);
+            if (providerToken) {
+              messages.push({
+                to: providerToken,
+                title: "\u0645\u0646\u062F\u0648\u0628 \u0641\u064A \u0627\u0644\u0637\u0631\u064A\u0642 \u{1F3CD}\uFE0F",
+                body: '\u0645\u0646\u062F\u0648\u0628 \u0641\u064A \u0637\u0631\u064A\u0642\u0647 \u0644\u0627\u0633\u062A\u0644\u0627\u0645 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
+                data: { type: "driver_assigned", orderId, role: "provider" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "picked_up": {
+          if (order.customerUid) {
+            const token = await getUserPushToken(order.customerUid, accessToken);
+            if (token) {
+              messages.push({
+                to: token,
+                title: "\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0627\u0633\u062A\u0644\u0645 \u0637\u0644\u0628\u0643 \u{1F4E6}",
+                body: '\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0627\u0633\u062A\u0644\u0645 \u0637\u0644\u0628\u0643 "' + orderLabel + '" \u0648\u0641\u064A \u0627\u0644\u0637\u0631\u064A\u0642 \u0625\u0644\u064A\u0643',
+                data: { type: "order_picked_up", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "arrived": {
+          if (order.customerUid) {
+            const token = await getUserPushToken(order.customerUid, accessToken);
+            if (token) {
+              messages.push({
+                to: token,
+                title: "\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0648\u0635\u0644 \u{1F4CD}",
+                body: '\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0648\u0635\u0644 \u0644\u0645\u0648\u0642\u0639\u0643 \u0628\u0637\u0644\u0628\u0643 "' + orderLabel + '"',
+                data: { type: "driver_arrived", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "delivered": {
+          if (order.customerUid) {
+            const customerToken = await getUserPushToken(order.customerUid, accessToken);
+            if (customerToken) {
+              messages.push({
+                to: customerToken,
+                title: "\u062A\u0645 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u2705",
+                body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062A\u0645 \u062A\u0648\u0635\u064A\u0644\u0647 \u0628\u0646\u062C\u0627\u062D',
+                data: { type: "order_delivered", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          if (order.providerUid) {
+            const providerToken = await getUserPushToken(order.providerUid, accessToken);
+            if (providerToken) {
+              messages.push({
+                to: providerToken,
+                title: "\u062A\u0645 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u2705",
+                body: '\u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u062A\u0645 \u062A\u0648\u0635\u064A\u0644\u0647 \u0644\u0644\u0639\u0645\u064A\u0644 \u0628\u0646\u062C\u0627\u062D',
+                data: { type: "order_delivered", orderId, role: "provider" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "self_pickup_completed": {
+          if (order.customerUid) {
+            const token = await getUserPushToken(order.customerUid, accessToken);
+            if (token) {
+              messages.push({
+                to: token,
+                title: "\u062A\u0645 \u062A\u0633\u0644\u064A\u0645 \u0627\u0644\u0637\u0644\u0628 \u2705",
+                body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062A\u0645 \u062A\u0633\u0644\u064A\u0645\u0647 \u0628\u0646\u062C\u0627\u062D',
+                data: { type: "order_completed", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "order_created": {
+          if (order.providerUid) {
+            const t_provider = await getUserPushToken(order.providerUid, accessToken);
+            if (t_provider) {
+              messages.push({
+                to: t_provider,
+                title: "\u0637\u0644\u0628 \u062C\u062F\u064A\u062F \uD83D\uDECE\uFE0F",
+                body: '\u0648\u0635\u0644\u0643 \u0637\u0644\u0628 \u062C\u062F\u064A\u062F "' + orderLabel + '" \u2014 \u0627\u0641\u062A\u062D \u0627\u0644\u062A\u0637\u0628\u064A\u0642 \u0644\u0642\u0628\u0648\u0644\u0647',
+                data: { type: "order_created", orderId, role: "provider" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "order_rejected": {
+          if (order.customerUid) {
+            const t_customer = await getUserPushToken(order.customerUid, accessToken);
+            if (t_customer) {
+              messages.push({
+                to: t_customer,
+                title: "\u062A\u0645 \u0631\u0641\u0636 \u0637\u0644\u0628\u0643 \u274C",
+                body: '\u0637\u0644\u0628\u0643 "' + orderLabel + '" \u062A\u0645 \u0631\u0641\u0636\u0647 \u0645\u0646 \u0645\u0642\u062F\u0645 \u0627\u0644\u062E\u062F\u0645\u0629',
+                data: { type: "order_rejected", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "order_preparing": {
+          if (order.customerUid) {
+            const t_customer = await getUserPushToken(order.customerUid, accessToken);
+            if (t_customer) {
+              messages.push({
+                to: t_customer,
+                title: "\u062C\u0627\u0631\u064A \u062A\u062D\u0636\u064A\u0631 \u0637\u0644\u0628\u0643 \uD83D\uDC68\u200D\uD83C\uDF73",
+                body: '\u0628\u062F\u0623 \u062A\u062D\u0636\u064A\u0631 \u0637\u0644\u0628\u0643 "' + orderLabel + '"',
+                data: { type: "order_preparing", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "order_cancelled": {
+          if (order.customerUid) {
+            const t_customer = await getUserPushToken(order.customerUid, accessToken);
+            if (t_customer) {
+              messages.push({
+                to: t_customer,
+                title: "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0637\u0644\u0628 \u26D4",
+                body: '\u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u062A\u0645 \u0625\u0644\u063A\u0627\u0624\u0647',
+                data: { type: "order_cancelled", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          if (order.providerUid) {
+            const t_provider = await getUserPushToken(order.providerUid, accessToken);
+            if (t_provider) {
+              messages.push({
+                to: t_provider,
+                title: "\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0637\u0644\u0628 \u26D4",
+                body: '\u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u062A\u0645 \u0625\u0644\u063A\u0627\u0624\u0647',
+                data: { type: "order_cancelled", orderId, role: "provider" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "driver_assigned_by_provider": {
+          if (order.driverUid) {
+            const t_driver = await getUserPushToken(order.driverUid, accessToken);
+            if (t_driver) {
+              messages.push({
+                to: t_driver,
+                title: "\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u0633\u0646\u062F\u0629 \u0644\u0643 \uD83D\uDEF5",
+                body: '\u062A\u0645 \u0625\u0633\u0646\u0627\u062F \u062A\u0648\u0635\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u0625\u0644\u064A\u0643',
+                data: { type: "driver_assigned", orderId, role: "driver" },
+                sound: "default"
+              });
+            }
+          }
+          if (order.customerUid) {
+            const t_customer = await getUserPushToken(order.customerUid, accessToken);
+            if (t_customer) {
+              messages.push({
+                to: t_customer,
+                title: "\u062A\u0645 \u062A\u0639\u064A\u064A\u0646 \u0645\u0646\u062F\u0648\u0628 \uD83C\uDFCD\uFE0F",
+                body: '\u062A\u0645 \u062A\u0639\u064A\u064A\u0646 \u0645\u0646\u062F\u0648\u0628 \u0644\u062A\u0648\u0635\u064A\u0644 \u0637\u0644\u0628\u0643 "' + orderLabel + '"',
+                data: { type: "driver_assigned", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "delivery_pending_confirmation": {
+          if (order.customerUid) {
+            const t_customer = await getUserPushToken(order.customerUid, accessToken);
+            if (t_customer) {
+              messages.push({
+                to: t_customer,
+                title: "\u0628\u0627\u0646\u062A\u0638\u0627\u0631 \u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0627\u0633\u062A\u0644\u0627\u0645 \uD83D\uDCE6",
+                body: '\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0633\u0644\u0651\u0645 \u0637\u0644\u0628\u0643 "' + orderLabel + '" \u2014 \u0623\u0643\u062F \u0627\u0644\u0627\u0633\u062A\u0644\u0627\u0645 \u0645\u0646 \u0627\u0644\u062A\u0637\u0628\u064A\u0642',
+                data: { type: "delivery_pending_confirmation", orderId, role: "customer" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        case "driver_rejected": {
+          if (order.providerUid) {
+            const t_provider = await getUserPushToken(order.providerUid, accessToken);
+            if (t_provider) {
+              messages.push({
+                to: t_provider,
+                title: "\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0627\u0639\u062A\u0630\u0631 \u0639\u0646 \u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u26A0\uFE0F",
+                body: '\u0627\u0644\u0645\u0646\u062F\u0648\u0628 \u0627\u0639\u062A\u0630\u0631 \u0639\u0646 \u062A\u0648\u0635\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u2014 \u062C\u0627\u0631\u064A \u0627\u0644\u0628\u062D\u062B \u0639\u0646 \u0645\u0646\u062F\u0648\u0628 \u0622\u062E\u0631',
+                data: { type: "driver_rejected", orderId, role: "provider" },
+                sound: "default"
+              });
+            }
+          }
+          break;
+        }
+        default:
+          return { success: false, error: "Unknown event: " + event };
+      }
+      if (messages.length > 0) {
+        await sendExpoPush(messages);
+        console.log("[Push] Sent " + messages.length + " notifications for " + event + " on order " + orderId);
+      }
+      return { success: true, notificationsSent: messages.length };
+    }
+    __name(handleEvent, "handleEvent");
+    __name2(handleEvent, "handleEvent");
+    async function createAdminToken(env) {
+      const exp = Date.now() + 24 * 60 * 60 * 1e3;
+      const payload = btoa(JSON.stringify({ exp, r: Math.random().toString(36).slice(2) }));
       const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
       const key = await crypto.subtle.importKey(
         "raw",
         new TextEncoder().encode(secret),
         { name: "HMAC", hash: "SHA-256" },
         false,
-        ["verify"]
+        ["sign"]
       );
-      const normalizedSig = sigB64.replace(/-/g, "+").replace(/_/g, "/");
-      const padded = normalizedSig + "=".repeat((4 - normalizedSig.length % 4) % 4);
-      const sig = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
-      return await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload));
-    } catch (e) {
-      console.error("[Admin] Token verify error:", e);
+      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+      const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      return payload + "." + sigB64;
+    }
+    __name(createAdminToken, "createAdminToken");
+    __name2(createAdminToken, "createAdminToken");
+    async function verifyAdminToken(token, env) {
+      try {
+        if (!token) return false;
+        const parts = token.split(".");
+        if (parts.length !== 2) return false;
+        const [payload, sigB64] = parts;
+        const data = JSON.parse(atob(payload));
+        if (Date.now() > data.exp) return false;
+        const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
+        const key = await crypto.subtle.importKey(
+          "raw",
+          new TextEncoder().encode(secret),
+          { name: "HMAC", hash: "SHA-256" },
+          false,
+          ["verify"]
+        );
+        const normalizedSig = sigB64.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalizedSig + "=".repeat((4 - normalizedSig.length % 4) % 4);
+        const sig = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+        return await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload));
+      } catch (e) {
+        console.error("[Admin] Token verify error:", e);
+        return false;
+      }
+    }
+    __name(verifyAdminToken, "verifyAdminToken");
+    __name2(verifyAdminToken, "verifyAdminToken");
+    async function verifyAdminPassword(password, env, accessToken) {
+      if (password === env.ADMIN_PASSWORD) return true;
+      try {
+        const adminDoc = await getFirestoreDoc("app_config", "admin", accessToken);
+        if (adminDoc && adminDoc.passwordHash) {
+          const inputHash = await hashPassword(password);
+          return inputHash === adminDoc.passwordHash;
+        }
+      } catch (e) {
+        console.log("[Admin] Firestore password check error:", e);
+      }
       return false;
     }
-  }
-  __name(verifyAdminToken, "verifyAdminToken");
-  async function verifyAdminPassword(password, env, accessToken) {
-    if (password === env.ADMIN_PASSWORD) return true;
-    try {
-      const adminDoc = await getFirestoreDoc("app_config", "admin", accessToken);
-      if (adminDoc && adminDoc.passwordHash) {
-        const inputHash = await hashPassword(password);
-        return inputHash === adminDoc.passwordHash;
-      }
-    } catch (e) {
-      console.log("[Admin] Firestore password check error:", e);
-    }
-    return false;
-  }
-  __name(verifyAdminPassword, "verifyAdminPassword");
-  async function createSignedInvoiceToken(invoiceId, env) {
-    const exp = Date.now() + 60 * 60 * 1e3;
-    const payload = btoa(JSON.stringify({ inv: invoiceId, exp }));
-    const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
-    const key = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-    const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    return payload + "." + sigB64;
-  }
-  __name(createSignedInvoiceToken, "createSignedInvoiceToken");
-  async function verifySignedInvoiceToken(token, invoiceId, env) {
-    try {
-      if (!token) return false;
-      const parts = token.split(".");
-      if (parts.length !== 2) return false;
-      const [payload, sigB64] = parts;
-      const data = JSON.parse(atob(payload));
-      if (Date.now() > data.exp) return false;
-      if (data.inv !== invoiceId) return false;
+    __name(verifyAdminPassword, "verifyAdminPassword");
+    __name2(verifyAdminPassword, "verifyAdminPassword");
+    async function createSignedInvoiceToken(invoiceId, env) {
+      const exp = Date.now() + 60 * 60 * 1e3;
+      const payload = btoa(JSON.stringify({ inv: invoiceId, exp }));
       const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
       const key = await crypto.subtle.importKey(
         "raw",
         new TextEncoder().encode(secret),
         { name: "HMAC", hash: "SHA-256" },
         false,
+        ["sign"]
+      );
+      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+      const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      return payload + "." + sigB64;
+    }
+    __name(createSignedInvoiceToken, "createSignedInvoiceToken");
+    __name2(createSignedInvoiceToken, "createSignedInvoiceToken");
+    async function verifySignedInvoiceToken(token, invoiceId, env) {
+      try {
+        if (!token) return false;
+        const parts = token.split(".");
+        if (parts.length !== 2) return false;
+        const [payload, sigB64] = parts;
+        const data = JSON.parse(atob(payload));
+        if (Date.now() > data.exp) return false;
+        if (data.inv !== invoiceId) return false;
+        const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
+        const key = await crypto.subtle.importKey(
+          "raw",
+          new TextEncoder().encode(secret),
+          { name: "HMAC", hash: "SHA-256" },
+          false,
+          ["verify"]
+        );
+        const normalizedSig = sigB64.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalizedSig + "=".repeat((4 - normalizedSig.length % 4) % 4);
+        const sig = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+        return await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload));
+      } catch {
+        return false;
+      }
+    }
+    __name(verifySignedInvoiceToken, "verifySignedInvoiceToken");
+    __name2(verifySignedInvoiceToken, "verifySignedInvoiceToken");
+    function getTokenFromRequest(request) {
+      const authHeader = request.headers.get("Authorization");
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        return authHeader.slice(7);
+      }
+      return null;
+    }
+    __name(getTokenFromRequest, "getTokenFromRequest");
+    __name2(getTokenFromRequest, "getTokenFromRequest");
+    function jsonResponse(data, status = 200) {
+      return new Response(JSON.stringify(data), {
+        status,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+    __name(jsonResponse, "jsonResponse");
+    __name2(jsonResponse, "jsonResponse");
+    function base64urlDecode(input) {
+      const normalized = String(input || "").replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+      const binary = atob(padded);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+    __name(base64urlDecode, "base64urlDecode");
+    __name2(base64urlDecode, "base64urlDecode");
+    function base64urlDecodeJson(input) {
+      return JSON.parse(new TextDecoder().decode(base64urlDecode(input)));
+    }
+    __name(base64urlDecodeJson, "base64urlDecodeJson");
+    __name2(base64urlDecodeJson, "base64urlDecodeJson");
+    var FIREBASE_JWKS_CACHE = null;
+    var FIREBASE_JWKS_CACHE_EXP = 0;
+    async function getFirebaseJwks() {
+      if (FIREBASE_JWKS_CACHE && Date.now() < FIREBASE_JWKS_CACHE_EXP) return FIREBASE_JWKS_CACHE;
+      const response = await fetch("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com");
+      if (!response.ok) {
+        throw new Error("Firebase JWKS fetch failed: " + response.status);
+      }
+      const cacheControl = response.headers.get("cache-control") || "";
+      const maxAgeMatch = cacheControl.match(/max-age=(\d+)/);
+      const maxAge = maxAgeMatch ? parseInt(maxAgeMatch[1], 10) : 3600;
+      FIREBASE_JWKS_CACHE = await response.json();
+      FIREBASE_JWKS_CACHE_EXP = Date.now() + Math.max(300, maxAge) * 1e3;
+      return FIREBASE_JWKS_CACHE;
+    }
+    __name(getFirebaseJwks, "getFirebaseJwks");
+    __name2(getFirebaseJwks, "getFirebaseJwks");
+    async function verifyFirebaseIdToken(idToken) {
+      if (!idToken || typeof idToken !== "string") throw new Error("Missing Firebase ID token");
+      const parts = idToken.split(".");
+      if (parts.length !== 3) throw new Error("Invalid Firebase ID token");
+      const [encodedHeader, encodedPayload, encodedSignature] = parts;
+      const header = base64urlDecodeJson(encodedHeader);
+      const payload = base64urlDecodeJson(encodedPayload);
+      if (header.alg !== "RS256" || !header.kid) throw new Error("Unsupported Firebase token header");
+      const projectId = "tabbakheen-99883";
+      const now = Math.floor(Date.now() / 1e3);
+      if (payload.aud !== projectId) throw new Error("Invalid Firebase token audience");
+      if (payload.iss !== "https://securetoken.google.com/" + projectId) throw new Error("Invalid Firebase token issuer");
+      if (!payload.sub || typeof payload.sub !== "string") throw new Error("Invalid Firebase token subject");
+      if (payload.exp <= now) throw new Error("Expired Firebase token");
+      if (payload.iat && payload.iat > now + 300) throw new Error("Invalid Firebase token issued time");
+      const jwks = await getFirebaseJwks();
+      const jwk = (jwks.keys || []).find((key2) => key2.kid === header.kid);
+      if (!jwk) throw new Error("Firebase token signing key not found");
+      const key = await crypto.subtle.importKey(
+        "jwk",
+        jwk,
+        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        false,
         ["verify"]
       );
-      const normalizedSig = sigB64.replace(/-/g, "+").replace(/_/g, "/");
-      const padded = normalizedSig + "=".repeat((4 - normalizedSig.length % 4) % 4);
-      const sig = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
-      return await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload));
-    } catch {
-      return false;
+      const signature = base64urlDecode(encodedSignature);
+      const valid = await crypto.subtle.verify(
+        "RSASSA-PKCS1-v1_5",
+        key,
+        signature,
+        new TextEncoder().encode(encodedHeader + "." + encodedPayload)
+      );
+      if (!valid) throw new Error("Invalid Firebase token signature");
+      return payload.sub;
     }
-  }
-  __name(verifySignedInvoiceToken, "verifySignedInvoiceToken");
-  function getTokenFromRequest(request) {
-    const authHeader = request.headers.get("Authorization");
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-      return authHeader.slice(7);
-    }
-    return null;
-  }
-  __name(getTokenFromRequest, "getTokenFromRequest");
-  function jsonResponse(data, status = 200) {
-    return new Response(JSON.stringify(data), {
-      status,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+    __name(verifyFirebaseIdToken, "verifyFirebaseIdToken");
+    __name2(verifyFirebaseIdToken, "verifyFirebaseIdToken");
+    function isCrActive(data) {
+      const status = data && typeof data === "object" ? data.status : null;
+      if (!status || typeof status !== "object") {
+        return { active: false, token: "no_status_field" };
       }
-    });
-  }
-  __name(jsonResponse, "jsonResponse");
-
-  function base64urlDecode(input) {
-    const normalized = String(input || "").replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
-    const binary = atob(padded);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  }
-  __name(base64urlDecode, "base64urlDecode");
-  function base64urlDecodeJson(input) {
-    return JSON.parse(new TextDecoder().decode(base64urlDecode(input)));
-  }
-  __name(base64urlDecodeJson, "base64urlDecodeJson");
-  var FIREBASE_JWKS_CACHE = null;
-  var FIREBASE_JWKS_CACHE_EXP = 0;
-  async function getFirebaseJwks() {
-    if (FIREBASE_JWKS_CACHE && Date.now() < FIREBASE_JWKS_CACHE_EXP) return FIREBASE_JWKS_CACHE;
-    const response = await fetch("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com");
-    if (!response.ok) {
-      throw new Error("Firebase JWKS fetch failed: " + response.status);
-    }
-    const cacheControl = response.headers.get("cache-control") || "";
-    const maxAgeMatch = cacheControl.match(/max-age=(\d+)/);
-    const maxAge = maxAgeMatch ? parseInt(maxAgeMatch[1], 10) : 3600;
-    FIREBASE_JWKS_CACHE = await response.json();
-    FIREBASE_JWKS_CACHE_EXP = Date.now() + Math.max(300, maxAge) * 1000;
-    return FIREBASE_JWKS_CACHE;
-  }
-  __name(getFirebaseJwks, "getFirebaseJwks");
-  async function verifyFirebaseIdToken(idToken) {
-    if (!idToken || typeof idToken !== "string") throw new Error("Missing Firebase ID token");
-    const parts = idToken.split(".");
-    if (parts.length !== 3) throw new Error("Invalid Firebase ID token");
-    const [encodedHeader, encodedPayload, encodedSignature] = parts;
-    const header = base64urlDecodeJson(encodedHeader);
-    const payload = base64urlDecodeJson(encodedPayload);
-    if (header.alg !== "RS256" || !header.kid) throw new Error("Unsupported Firebase token header");
-    const projectId = "tabbakheen-99883";
-    const now = Math.floor(Date.now() / 1000);
-    if (payload.aud !== projectId) throw new Error("Invalid Firebase token audience");
-    if (payload.iss !== "https://securetoken.google.com/" + projectId) throw new Error("Invalid Firebase token issuer");
-    if (!payload.sub || typeof payload.sub !== "string") throw new Error("Invalid Firebase token subject");
-    if (payload.exp <= now) throw new Error("Expired Firebase token");
-    if (payload.iat && payload.iat > now + 300) throw new Error("Invalid Firebase token issued time");
-    const jwks = await getFirebaseJwks();
-    const jwk = (jwks.keys || []).find((key) => key.kid === header.kid);
-    if (!jwk) throw new Error("Firebase token signing key not found");
-    const key = await crypto.subtle.importKey(
-      "jwk",
-      jwk,
-      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-      false,
-      ["verify"]
-    );
-    const signature = base64urlDecode(encodedSignature);
-    const valid = await crypto.subtle.verify(
-      "RSASSA-PKCS1-v1_5",
-      key,
-      signature,
-      new TextEncoder().encode(encodedHeader + "." + encodedPayload)
-    );
-    if (!valid) throw new Error("Invalid Firebase token signature");
-    return payload.sub;
-  }
-  __name(verifyFirebaseIdToken, "verifyFirebaseIdToken");
-  function isCrActive(data) {
-    const status = data && typeof data === "object" ? data.status : null;
-    if (!status || typeof status !== "object") {
-      return { active: false, token: "no_status_field" };
-    }
-    const idActive = String(status.id).trim() === "1";
-    const name = typeof status.name === "string" ? status.name.trim() : "";
-    const nameActive = name === "نشط" || name === "فعال" || name === "فعّال";
-    if (idActive || nameActive) {
-      return { active: true, token: idActive ? "id_1" : "name_active" };
-    }
-    return { active: false, token: "not_active" };
-  }
-  __name(isCrActive, "isCrActive");
-  async function fetchWathqCommercialRegistration(crNumber, env) {
-    if (!env.WATHQ_API_KEY) throw new Error("WATHQ_API_KEY is not configured");
-    const targetUrl = "https://api.wathq.sa/commercial-registration/fullinfo/" + encodeURIComponent(crNumber);
-    const response = await fetch(targetUrl, {
-      method: "GET",
-      headers: {
-        "apiKey": env.WATHQ_API_KEY,
-        "Accept": "application/json"
+      const idActive = String(status.id).trim() === "1";
+      const name = typeof status.name === "string" ? status.name.trim() : "";
+      const nameActive = name === "\u0646\u0634\u0637" || name === "\u0641\u0639\u0627\u0644" || name === "\u0641\u0639\u0651\u0627\u0644";
+      if (idActive || nameActive) {
+        return { active: true, token: idActive ? "id_1" : "name_active" };
       }
-    });
-    if (response.ok) {
-      const data = await response.json();
-      const result = isCrActive(data);
-      return { ok: true, active: result.active, statusToken: result.token };
+      return { active: false, token: "not_active" };
     }
-    return { ok: false, active: false, status: response.status, statusToken: "wathq_http_" + response.status };
-  }
-  __name(fetchWathqCommercialRegistration, "fetchWathqCommercialRegistration");
-  async function handleVerifyCr(request, env, accessToken) {
-    const idToken = getTokenFromRequest(request);
-    let uid = "";
-    try {
-      uid = await verifyFirebaseIdToken(idToken);
-    } catch (e) {
-      console.log("[Wathq] Firebase token verification failed");
-      return jsonResponse({ success: false, verificationStatus: "pending_review", error: "Unauthorized" }, 401);
+    __name(isCrActive, "isCrActive");
+    __name2(isCrActive, "isCrActive");
+    async function fetchWathqCommercialRegistration(crNumber, env) {
+      if (!env.WATHQ_API_KEY) throw new Error("WATHQ_API_KEY is not configured");
+      const targetUrl = "https://api.wathq.sa/commercial-registration/fullinfo/" + encodeURIComponent(crNumber);
+      const response = await fetch(targetUrl, {
+        method: "GET",
+        headers: {
+          "apiKey": env.WATHQ_API_KEY,
+          "Accept": "application/json"
+        }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        const result = isCrActive(data);
+        return { ok: true, active: result.active, statusToken: result.token };
+      }
+      return { ok: false, active: false, status: response.status, statusToken: "wathq_http_" + response.status };
     }
-    let body = {};
-    try {
-      body = await request.json();
-    } catch {
-      body = {};
-    }
-    const crNumber = String(body.crNumber || "").trim();
-    if (!/^\d{10}$/.test(crNumber)) {
-      return jsonResponse({ success: false, verificationStatus: "pending_review", error: "Invalid CR number format" }, 400);
-    }
-    const now = new Date().toISOString();
-    await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
-    await createFirestoreDocument("verifications", uid, { crNumber, submittedAt: now, checkedAt: now }, accessToken);
-    try {
-      const result = await fetchWathqCommercialRegistration(crNumber, env);
-      if (result.active) {
-        await updateFirestoreDocument("users", uid, {
-          verificationStatus: "verified",
-          verificationSource: "wathq",
-          verifiedAt: now
-        }, accessToken);
+    __name(fetchWathqCommercialRegistration, "fetchWathqCommercialRegistration");
+    __name2(fetchWathqCommercialRegistration, "fetchWathqCommercialRegistration");
+    async function handleVerifyCr(request, env, accessToken) {
+      const idToken = getTokenFromRequest(request);
+      let uid = "";
+      try {
+        uid = await verifyFirebaseIdToken(idToken);
+      } catch (e) {
+        console.log("[Wathq] Firebase token verification failed");
+        return jsonResponse({ success: false, verificationStatus: "pending_review", error: "Unauthorized" }, 401);
+      }
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+      const crNumber = String(body.crNumber || "").trim();
+      if (!/^\d{10}$/.test(crNumber)) {
+        return jsonResponse({ success: false, verificationStatus: "pending_review", error: "Invalid CR number format" }, 400);
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+      await createFirestoreDocument("verifications", uid, { crNumber, submittedAt: now, checkedAt: now }, accessToken);
+      try {
+        const result = await fetchWathqCommercialRegistration(crNumber, env);
+        if (result.active) {
+          await updateFirestoreDocument("users", uid, {
+            verificationStatus: "verified",
+            verificationSource: "wathq",
+            verifiedAt: now
+          }, accessToken);
+          await updateFirestoreDocument("verifications", uid, {
+            checkedAt: now,
+            verificationSource: "wathq",
+            internalError: "",
+            statusToken: result.statusToken || "verified"
+          }, accessToken);
+          return jsonResponse({ success: true, verificationStatus: "verified", verifiedAt: now });
+        }
+        await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
         await updateFirestoreDocument("verifications", uid, {
           checkedAt: now,
-          verificationSource: "wathq",
-          internalError: "",
-          statusToken: result.statusToken || "verified"
+          internalError: result && result.statusToken ? result.statusToken : result && result.status ? "wathq_http_" + result.status : "wathq_not_active_or_unclear"
         }, accessToken);
-        return jsonResponse({ success: true, verificationStatus: "verified", verifiedAt: now });
+        return jsonResponse({ success: true, verificationStatus: "pending_review" });
+      } catch (e) {
+        await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+        await updateFirestoreDocument("verifications", uid, {
+          checkedAt: now,
+          internalError: e && e.message ? e.message.slice(0, 180) : "wathq_unreachable"
+        }, accessToken);
+        return jsonResponse({ success: true, verificationStatus: "pending_review" });
       }
-      await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
-      await updateFirestoreDocument("verifications", uid, {
-        checkedAt: now,
-        internalError: result && result.statusToken ? result.statusToken : result && result.status ? "wathq_http_" + result.status : "wathq_not_active_or_unclear"
-      }, accessToken);
-      return jsonResponse({ success: true, verificationStatus: "pending_review" });
-    } catch (e) {
-      await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
-      await updateFirestoreDocument("verifications", uid, {
-        checkedAt: now,
-        internalError: e && e.message ? e.message.slice(0, 180) : "wathq_unreachable"
-      }, accessToken);
-      return jsonResponse({ success: true, verificationStatus: "pending_review" });
     }
-  }
-  __name(handleVerifyCr, "handleVerifyCr");
-  async function handleSubmitFreelanceCert(request, env, accessToken) {
-    const idToken = getTokenFromRequest(request);
-    let uid = "";
-    try {
-      uid = await verifyFirebaseIdToken(idToken);
-    } catch (e) {
-      console.log("[Freelance] Firebase token verification failed");
-      return jsonResponse({ success: false, error: "Unauthorized" }, 401);
-    }
-    let body = {};
-    try {
-      body = await request.json();
-    } catch {
-      body = {};
-    }
-    const certificateNumber = String(body.certificateNumber || "").trim();
-    const fileUrl = String(body.fileUrl || "").trim();
-    if (!certificateNumber) {
-      return jsonResponse({ success: false, error: "certificateNumber is required" }, 400);
-    }
-    if (!fileUrl) {
-      return jsonResponse({ success: false, error: "fileUrl is required" }, 400);
-    }
-    const now = new Date().toISOString();
-    await updateFirestoreDocument("verifications", uid, {
-      freelanceCertificate: {
-        certificateNumber,
-        fileUrl,
-        submittedAt: now,
-        reviewStatus: "pending"
+    __name(handleVerifyCr, "handleVerifyCr");
+    __name2(handleVerifyCr, "handleVerifyCr");
+    async function handleSubmitFreelanceCert(request, env, accessToken) {
+      const idToken = getTokenFromRequest(request);
+      let uid = "";
+      try {
+        uid = await verifyFirebaseIdToken(idToken);
+      } catch (e) {
+        console.log("[Freelance] Firebase token verification failed");
+        return jsonResponse({ success: false, error: "Unauthorized" }, 401);
       }
-    }, accessToken);
-    const udoc = await getFirestoreDoc("users", uid, accessToken);
-    const curStatus = udoc && udoc.verificationStatus ? udoc.verificationStatus : "";
-    const curSource = udoc && udoc.verificationSource ? udoc.verificationSource : "";
-    const alreadyWathqVerified = curStatus === "verified" && curSource === "wathq";
-    if (!alreadyWathqVerified) {
-      await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+      const certificateNumber = String(body.certificateNumber || "").trim();
+      const fileUrl = String(body.fileUrl || "").trim();
+      if (!certificateNumber) {
+        return jsonResponse({ success: false, error: "certificateNumber is required" }, 400);
+      }
+      if (!fileUrl) {
+        return jsonResponse({ success: false, error: "fileUrl is required" }, 400);
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      await updateFirestoreDocument("verifications", uid, {
+        freelanceCertificate: {
+          certificateNumber,
+          fileUrl,
+          submittedAt: now,
+          reviewStatus: "pending"
+        }
+      }, accessToken);
+      const udoc = await getFirestoreDoc("users", uid, accessToken);
+      const curStatus = udoc && udoc.verificationStatus ? udoc.verificationStatus : "";
+      const curSource = udoc && udoc.verificationSource ? udoc.verificationSource : "";
+      const alreadyWathqVerified = curStatus === "verified" && curSource === "wathq";
+      if (!alreadyWathqVerified) {
+        await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+      }
+      return jsonResponse({ success: true, verificationStatus: alreadyWathqVerified ? curStatus : "pending_review" });
     }
-    return jsonResponse({ success: true, verificationStatus: alreadyWathqVerified ? curStatus : "pending_review" });
-  }
-  __name(handleSubmitFreelanceCert, "handleSubmitFreelanceCert");
-
-function pdfEscape(str) {
-    if (!str) return "";
-    return String(str).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)").replace(/\r/g, "\\r");
-  }
-  __name(pdfEscape, "pdfEscape");
-  var LOGO_URL = "https://pub-e001eb4506b145aa938b5d3badbff6a5.r2.dev/attachments/mp58h8z5x4szfl3c5f7xm";
-  function generatePDFBytes(invoice, lang) {
-    const isAr = lang === "ar";
-    const biz = {
-      name: "\u0645\u0624\u0633\u0633\u0629 \u0633\u0627\u0644\u0645 \u0628\u0646 \u0639\u0644\u064A \u0627\u0644\u0646\u0639\u064A\u0645\u064A",
-      nameEn: "Salem Bin Ali Al-Nuaimi Est.",
-      cr: "7050191290",
-      building: "2500",
-      street: "\u0623\u062D\u0645\u062F \u0628\u0646 \u062D\u062C\u0631 \u0627\u0644\u0639\u0633\u0642\u0644\u0627\u0646\u064A",
-      streetEn: "Ahmad bin Hajar Al-Asqalani",
-      district: "\u062D\u064A \u0637\u064A\u0628\u0629",
-      districtEn: "Taibah District",
-      city: "\u0627\u0644\u062C\u0628\u064A\u0644",
-      cityEn: "Jubail",
-      postal: "35513",
-      country: "\u0627\u0644\u0645\u0645\u0644\u0643\u0629 \u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u0627\u0644\u0633\u0639\u0648\u062F\u064A\u0629",
-      countryEn: "Kingdom of Saudi Arabia"
-    };
-    const invoiceNumber = invoice.invoiceNumber || "N/A";
-    const createdDate = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "N/A";
-    const userName = invoice.userName || "N/A";
-    const userEmail = invoice.userEmail || "";
-    const userPhone = invoice.userPhone || "";
-    const plan = invoice.subscriptionPlan || "Basic";
-    const amount = invoice.amount || 0;
-    const currency = invoice.currency || "SAR";
-    const startDate = invoice.startDate || "";
-    const endDate = invoice.endDate || "";
-    const paymentMethod = invoice.paymentMethod || "";
-    const notes = invoice.notes || "";
-    const objects = [];
-    let objectCount = 0;
-    const offsets = [];
-    function addObject(content) {
-      objectCount++;
-      objects.push(content);
-      return objectCount;
+    __name(handleSubmitFreelanceCert, "handleSubmitFreelanceCert");
+    __name2(handleSubmitFreelanceCert, "handleSubmitFreelanceCert");
+    function pdfEscape(str) {
+      if (!str) return "";
+      return String(str).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)").replace(/\r/g, "\\r");
     }
-    __name(addObject, "addObject");
-    const catalogId = addObject("");
-    const pagesId = addObject("");
-    const pageId = addObject("");
-    const fontId = addObject(
-      `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>`
-    );
-    const fontBoldId = addObject(
-      `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>`
-    );
-    const pageW = 595.28;
-    const pageH = 841.89;
-    const margin = 50;
-    let y = pageH - margin;
-    let streamContent = "";
-    function addText(text, x, yPos, size, font, color) {
-      const safeText = pdfEscape(text);
-      const f = font === "bold" ? "F2" : "F1";
-      const c = color || "0 0 0";
-      streamContent += `BT
+    __name(pdfEscape, "pdfEscape");
+    __name2(pdfEscape, "pdfEscape");
+    var LOGO_URL = "https://pub-e001eb4506b145aa938b5d3badbff6a5.r2.dev/attachments/mp58h8z5x4szfl3c5f7xm";
+    function generatePDFBytes(invoice, lang) {
+      const isAr = lang === "ar";
+      const biz = {
+        name: "\u0645\u0624\u0633\u0633\u0629 \u0633\u0627\u0644\u0645 \u0628\u0646 \u0639\u0644\u064A \u0627\u0644\u0646\u0639\u064A\u0645\u064A",
+        nameEn: "Salem Bin Ali Al-Nuaimi Est.",
+        cr: "7050191290",
+        building: "2500",
+        street: "\u0623\u062D\u0645\u062F \u0628\u0646 \u062D\u062C\u0631 \u0627\u0644\u0639\u0633\u0642\u0644\u0627\u0646\u064A",
+        streetEn: "Ahmad bin Hajar Al-Asqalani",
+        district: "\u062D\u064A \u0637\u064A\u0628\u0629",
+        districtEn: "Taibah District",
+        city: "\u0627\u0644\u062C\u0628\u064A\u0644",
+        cityEn: "Jubail",
+        postal: "35513",
+        country: "\u0627\u0644\u0645\u0645\u0644\u0643\u0629 \u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u0627\u0644\u0633\u0639\u0648\u062F\u064A\u0629",
+        countryEn: "Kingdom of Saudi Arabia"
+      };
+      const invoiceNumber = invoice.invoiceNumber || "N/A";
+      const createdDate = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "N/A";
+      const userName = invoice.userName || "N/A";
+      const userEmail = invoice.userEmail || "";
+      const userPhone = invoice.userPhone || "";
+      const plan = invoice.subscriptionPlan || "Basic";
+      const amount = invoice.amount || 0;
+      const currency = invoice.currency || "SAR";
+      const startDate = invoice.startDate || "";
+      const endDate = invoice.endDate || "";
+      const paymentMethod = invoice.paymentMethod || "";
+      const notes = invoice.notes || "";
+      const objects = [];
+      let objectCount = 0;
+      const offsets = [];
+      function addObject(content) {
+        objectCount++;
+        objects.push(content);
+        return objectCount;
+      }
+      __name(addObject, "addObject");
+      __name2(addObject, "addObject");
+      const catalogId = addObject("");
+      const pagesId = addObject("");
+      const pageId = addObject("");
+      const fontId = addObject(
+        `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>`
+      );
+      const fontBoldId = addObject(
+        `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>`
+      );
+      const pageW = 595.28;
+      const pageH = 841.89;
+      const margin = 50;
+      let y = pageH - margin;
+      let streamContent = "";
+      function addText(text, x, yPos, size, font, color) {
+        const safeText = pdfEscape(text);
+        const f = font === "bold" ? "F2" : "F1";
+        const c = color || "0 0 0";
+        streamContent += `BT
 /${f} ${size} Tf
 ${c} rg
 ${x} ${yPos} Td
 (${safeText}) Tj
 ET
 `;
-    }
-    __name(addText, "addText");
-    function addCenteredText(text, yPos, size, font, color) {
-      const safeText = pdfEscape(text);
-      const f = font === "bold" ? "F2" : "F1";
-      const c = color || "0 0 0";
-      const approxWidth = safeText.length * size * 0.52;
-      const x = (pageW - approxWidth) / 2;
-      streamContent += `BT
+      }
+      __name(addText, "addText");
+      __name2(addText, "addText");
+      function addCenteredText(text, yPos, size, font, color) {
+        const safeText = pdfEscape(text);
+        const f = font === "bold" ? "F2" : "F1";
+        const c = color || "0 0 0";
+        const approxWidth = safeText.length * size * 0.52;
+        const x = (pageW - approxWidth) / 2;
+        streamContent += `BT
 /${f} ${size} Tf
 ${c} rg
 ${x} ${yPos} Td
 (${safeText}) Tj
 ET
 `;
-    }
-    __name(addCenteredText, "addCenteredText");
-    function addLine(x1, y1, x2, y2, width, color) {
-      const c = color || "0 0 0";
-      streamContent += `${c} RG
+      }
+      __name(addCenteredText, "addCenteredText");
+      __name2(addCenteredText, "addCenteredText");
+      function addLine(x1, y1, x2, y2, width, color) {
+        const c = color || "0 0 0";
+        streamContent += `${c} RG
 ${width || 1} w
 ${x1} ${y1} m
 ${x2} ${y2} l
 S
 `;
-    }
-    __name(addLine, "addLine");
-    function addRect(x, yPos, w, h, color) {
-      const c = color || "0.95 0.95 0.95";
-      streamContent += `${c} rg
+      }
+      __name(addLine, "addLine");
+      __name2(addLine, "addLine");
+      function addRect(x, yPos, w, h, color) {
+        const c = color || "0.95 0.95 0.95";
+        streamContent += `${c} rg
 ${x} ${yPos} ${w} ${h} re
 f
 `;
-    }
-    __name(addRect, "addRect");
-    function addCircle(cx, cy, r, fillColor, strokeColor, strokeWidth) {
-      const k = 0.5523;
-      const kr = k * r;
-      if (fillColor) streamContent += `${fillColor} rg
+      }
+      __name(addRect, "addRect");
+      __name2(addRect, "addRect");
+      function addCircle(cx, cy, r, fillColor, strokeColor, strokeWidth) {
+        const k = 0.5523;
+        const kr = k * r;
+        if (fillColor) streamContent += `${fillColor} rg
 `;
-      if (strokeColor) streamContent += `${strokeColor} RG
+        if (strokeColor) streamContent += `${strokeColor} RG
 ${strokeWidth || 1} w
 `;
-      streamContent += `${cx} ${cy + r} m
+        streamContent += `${cx} ${cy + r} m
 `;
-      streamContent += `${cx + kr} ${cy + r} ${cx + r} ${cy + kr} ${cx + r} ${cy} c
+        streamContent += `${cx + kr} ${cy + r} ${cx + r} ${cy + kr} ${cx + r} ${cy} c
 `;
-      streamContent += `${cx + r} ${cy - kr} ${cx + kr} ${cy - r} ${cx} ${cy - r} c
+        streamContent += `${cx + r} ${cy - kr} ${cx + kr} ${cy - r} ${cx} ${cy - r} c
 `;
-      streamContent += `${cx - kr} ${cy - r} ${cx - r} ${cy - kr} ${cx - r} ${cy} c
+        streamContent += `${cx - kr} ${cy - r} ${cx - r} ${cy - kr} ${cx - r} ${cy} c
 `;
-      streamContent += `${cx - r} ${cy + kr} ${cx - kr} ${cy + r} ${cx} ${cy + r} c
+        streamContent += `${cx - r} ${cy + kr} ${cx - kr} ${cy + r} ${cx} ${cy + r} c
 `;
-      if (fillColor && strokeColor) streamContent += "B\n";
-      else if (fillColor) streamContent += "f\n";
-      else streamContent += "S\n";
-    }
-    __name(addCircle, "addCircle");
-    const headerH = 120;
-    addRect(0, pageH - headerH, pageW, headerH, "0.91 0.45 0.16");
-    const badgeCx = pageW / 2;
-    const badgeCy = pageH - headerH + 5;
-    const badgeR = 50;
-    addCircle(badgeCx, badgeCy, badgeR + 2, "0.85 0.85 0.85", null, 0);
-    addCircle(badgeCx, badgeCy, badgeR, "1 1 1", null, 0);
-    addCenteredText("T", badgeCy - 8, 36, "bold", "0.91 0.45 0.16");
-    y = badgeCy - badgeR - 16;
-    addCenteredText("Tabbakheen", y, 22, "bold", "0.91 0.45 0.16");
-    y -= 18;
-    addCenteredText("Tabakheen", y, 11, "normal", "0.5 0.5 0.5");
-    const metaX = pageW - margin - 160;
-    const metaY = pageH - 40;
-    addText("Invoice", metaX, metaY, 18, "bold", "1 1 1");
-    addText("#" + invoiceNumber, metaX, metaY - 18, 10, "normal", "1 0.95 0.9");
-    addText("Date: " + createdDate, metaX, metaY - 32, 10, "normal", "1 0.95 0.9");
-    y -= 30;
-    addRect(margin, y - 80, 230, 80, "0.96 0.97 0.98");
-    addText("ISSUED BY", margin + 10, y - 15, 9, "bold", "0.91 0.45 0.16");
-    addText(biz.nameEn, margin + 10, y - 30, 9, "bold", "0.1 0.1 0.1");
-    addText("CR. " + biz.cr, margin + 10, y - 43, 8, "normal", "0.3 0.3 0.3");
-    addText(biz.building + " " + biz.streetEn, margin + 10, y - 55, 8, "normal", "0.3 0.3 0.3");
-    addText(biz.districtEn + ", " + biz.cityEn + " " + biz.postal, margin + 10, y - 67, 8, "normal", "0.3 0.3 0.3");
-    addText(biz.countryEn, margin + 10, y - 79, 8, "normal", "0.3 0.3 0.3");
-    addRect(pageW - margin - 230, y - 80, 230, 80, "0.96 0.97 0.98");
-    addText("INVOICE TO", pageW - margin - 220, y - 15, 9, "bold", "0.91 0.45 0.16");
-    addText(userName, pageW - margin - 220, y - 30, 9, "bold", "0.1 0.1 0.1");
-    if (userEmail) addText(userEmail, pageW - margin - 220, y - 43, 8, "normal", "0.3 0.3 0.3");
-    if (userPhone) addText(userPhone, pageW - margin - 220, y - 55, 8, "normal", "0.3 0.3 0.3");
-    y -= 110;
-    const tableX = margin;
-    const tableW = pageW - 2 * margin;
-    const col1W = tableW * 0.4;
-    const col2W = tableW * 0.35;
-    const rowH = 28;
-    addRect(tableX, y - rowH, tableW, rowH, "0.94 0.96 0.98");
-    addText("Description", tableX + 10, y - 18, 9, "bold", "0.3 0.3 0.3");
-    addText("Period", tableX + col1W + 10, y - 18, 9, "bold", "0.3 0.3 0.3");
-    addText("Amount", tableX + col1W + col2W + 10, y - 18, 9, "bold", "0.3 0.3 0.3");
-    y -= rowH;
-    addLine(tableX, y, tableX + tableW, y, 0.5, "0.85 0.85 0.85");
-    addText("Subscription - " + plan, tableX + 10, y - 18, 9, "normal", "0.1 0.1 0.1");
-    addText(startDate + " - " + endDate, tableX + col1W + 10, y - 18, 9, "normal", "0.1 0.1 0.1");
-    addText(amount + " " + currency, tableX + col1W + col2W + 10, y - 18, 9, "normal", "0.1 0.1 0.1");
-    y -= rowH;
-    addLine(tableX, y, tableX + tableW, y, 0.5, "0.85 0.85 0.85");
-    addRect(tableX, y - rowH, tableW, rowH, "1 0.97 0.94");
-    addText("Total", tableX + 10, y - 18, 10, "bold", "0.1 0.1 0.1");
-    addText(amount + " " + currency, tableX + col1W + col2W + 10, y - 18, 10, "bold", "0.91 0.45 0.16");
-    y -= rowH + 20;
-    if (paymentMethod) {
-      addText("Payment Method: " + paymentMethod, margin, y, 9, "normal", "0.3 0.3 0.3");
-      y -= 16;
-    }
-    if (notes) {
-      addText("Notes: " + notes, margin, y, 9, "normal", "0.3 0.3 0.3");
-      y -= 16;
-    }
-    y -= 20;
-    addLine(margin, y, pageW - margin, y, 0.5, "0.85 0.85 0.85");
-    y -= 20;
-    addText(biz.nameEn, margin, y, 8, "normal", "0.5 0.5 0.5");
-    y -= 12;
-    addText("CR: " + biz.cr + " | " + biz.building + " " + biz.streetEn + ", " + biz.districtEn + ", " + biz.cityEn + " " + biz.postal, margin, y, 7, "normal", "0.5 0.5 0.5");
-    y -= 12;
-    addText(biz.countryEn, margin, y, 7, "normal", "0.5 0.5 0.5");
-    y -= 25;
-    addRect(margin, y - 55, tableW, 55, "0.96 0.97 0.98");
-    addText("Arabic Business Name:", margin + 10, y - 14, 8, "bold", "0.3 0.3 0.3");
-    addText("Muassasat Salem bin Ali Al-Nuaimi", margin + 10, y - 28, 8, "normal", "0.3 0.3 0.3");
-    addText("Commercial Reg: 7050191290 | Jubail, Saudi Arabia", margin + 10, y - 42, 8, "normal", "0.3 0.3 0.3");
-    const streamId = addObject("");
-    const streamBytes = new TextEncoder().encode(streamContent);
-    objects[streamId - 1] = `<< /Length ${streamBytes.length} >>
+        if (fillColor && strokeColor) streamContent += "B\n";
+        else if (fillColor) streamContent += "f\n";
+        else streamContent += "S\n";
+      }
+      __name(addCircle, "addCircle");
+      __name2(addCircle, "addCircle");
+      const headerH = 120;
+      addRect(0, pageH - headerH, pageW, headerH, "0.91 0.45 0.16");
+      const badgeCx = pageW / 2;
+      const badgeCy = pageH - headerH + 5;
+      const badgeR = 50;
+      addCircle(badgeCx, badgeCy, badgeR + 2, "0.85 0.85 0.85", null, 0);
+      addCircle(badgeCx, badgeCy, badgeR, "1 1 1", null, 0);
+      addCenteredText("T", badgeCy - 8, 36, "bold", "0.91 0.45 0.16");
+      y = badgeCy - badgeR - 16;
+      addCenteredText("Tabbakheen", y, 22, "bold", "0.91 0.45 0.16");
+      y -= 18;
+      addCenteredText("Tabakheen", y, 11, "normal", "0.5 0.5 0.5");
+      const metaX = pageW - margin - 160;
+      const metaY = pageH - 40;
+      addText("Invoice", metaX, metaY, 18, "bold", "1 1 1");
+      addText("#" + invoiceNumber, metaX, metaY - 18, 10, "normal", "1 0.95 0.9");
+      addText("Date: " + createdDate, metaX, metaY - 32, 10, "normal", "1 0.95 0.9");
+      y -= 30;
+      addRect(margin, y - 80, 230, 80, "0.96 0.97 0.98");
+      addText("ISSUED BY", margin + 10, y - 15, 9, "bold", "0.91 0.45 0.16");
+      addText(biz.nameEn, margin + 10, y - 30, 9, "bold", "0.1 0.1 0.1");
+      addText("CR. " + biz.cr, margin + 10, y - 43, 8, "normal", "0.3 0.3 0.3");
+      addText(biz.building + " " + biz.streetEn, margin + 10, y - 55, 8, "normal", "0.3 0.3 0.3");
+      addText(biz.districtEn + ", " + biz.cityEn + " " + biz.postal, margin + 10, y - 67, 8, "normal", "0.3 0.3 0.3");
+      addText(biz.countryEn, margin + 10, y - 79, 8, "normal", "0.3 0.3 0.3");
+      addRect(pageW - margin - 230, y - 80, 230, 80, "0.96 0.97 0.98");
+      addText("INVOICE TO", pageW - margin - 220, y - 15, 9, "bold", "0.91 0.45 0.16");
+      addText(userName, pageW - margin - 220, y - 30, 9, "bold", "0.1 0.1 0.1");
+      if (userEmail) addText(userEmail, pageW - margin - 220, y - 43, 8, "normal", "0.3 0.3 0.3");
+      if (userPhone) addText(userPhone, pageW - margin - 220, y - 55, 8, "normal", "0.3 0.3 0.3");
+      y -= 110;
+      const tableX = margin;
+      const tableW = pageW - 2 * margin;
+      const col1W = tableW * 0.4;
+      const col2W = tableW * 0.35;
+      const rowH = 28;
+      addRect(tableX, y - rowH, tableW, rowH, "0.94 0.96 0.98");
+      addText("Description", tableX + 10, y - 18, 9, "bold", "0.3 0.3 0.3");
+      addText("Period", tableX + col1W + 10, y - 18, 9, "bold", "0.3 0.3 0.3");
+      addText("Amount", tableX + col1W + col2W + 10, y - 18, 9, "bold", "0.3 0.3 0.3");
+      y -= rowH;
+      addLine(tableX, y, tableX + tableW, y, 0.5, "0.85 0.85 0.85");
+      addText("Subscription - " + plan, tableX + 10, y - 18, 9, "normal", "0.1 0.1 0.1");
+      addText(startDate + " - " + endDate, tableX + col1W + 10, y - 18, 9, "normal", "0.1 0.1 0.1");
+      addText(amount + " " + currency, tableX + col1W + col2W + 10, y - 18, 9, "normal", "0.1 0.1 0.1");
+      y -= rowH;
+      addLine(tableX, y, tableX + tableW, y, 0.5, "0.85 0.85 0.85");
+      addRect(tableX, y - rowH, tableW, rowH, "1 0.97 0.94");
+      addText("Total", tableX + 10, y - 18, 10, "bold", "0.1 0.1 0.1");
+      addText(amount + " " + currency, tableX + col1W + col2W + 10, y - 18, 10, "bold", "0.91 0.45 0.16");
+      y -= rowH + 20;
+      if (paymentMethod) {
+        addText("Payment Method: " + paymentMethod, margin, y, 9, "normal", "0.3 0.3 0.3");
+        y -= 16;
+      }
+      if (notes) {
+        addText("Notes: " + notes, margin, y, 9, "normal", "0.3 0.3 0.3");
+        y -= 16;
+      }
+      y -= 20;
+      addLine(margin, y, pageW - margin, y, 0.5, "0.85 0.85 0.85");
+      y -= 20;
+      addText(biz.nameEn, margin, y, 8, "normal", "0.5 0.5 0.5");
+      y -= 12;
+      addText("CR: " + biz.cr + " | " + biz.building + " " + biz.streetEn + ", " + biz.districtEn + ", " + biz.cityEn + " " + biz.postal, margin, y, 7, "normal", "0.5 0.5 0.5");
+      y -= 12;
+      addText(biz.countryEn, margin, y, 7, "normal", "0.5 0.5 0.5");
+      y -= 25;
+      addRect(margin, y - 55, tableW, 55, "0.96 0.97 0.98");
+      addText("Arabic Business Name:", margin + 10, y - 14, 8, "bold", "0.3 0.3 0.3");
+      addText("Muassasat Salem bin Ali Al-Nuaimi", margin + 10, y - 28, 8, "normal", "0.3 0.3 0.3");
+      addText("Commercial Reg: 7050191290 | Jubail, Saudi Arabia", margin + 10, y - 42, 8, "normal", "0.3 0.3 0.3");
+      const streamId = addObject("");
+      const streamBytes = new TextEncoder().encode(streamContent);
+      objects[streamId - 1] = `<< /Length ${streamBytes.length} >>
 stream
 ${streamContent}endstream`;
-    objects[pageId - 1] = `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${pageW} ${pageH}] /Contents ${streamId} 0 R /Resources << /Font << /F1 ${fontId} 0 R /F2 ${fontBoldId} 0 R >> >> >>`;
-    objects[pagesId - 1] = `<< /Type /Pages /Kids [${pageId} 0 R] /Count 1 >>`;
-    objects[catalogId - 1] = `<< /Type /Catalog /Pages ${pagesId} 0 R >>`;
-    let pdf = "%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
-    for (let i = 0; i < objects.length; i++) {
-      offsets.push(pdf.length);
-      pdf += `${i + 1} 0 obj
+      objects[pageId - 1] = `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${pageW} ${pageH}] /Contents ${streamId} 0 R /Resources << /Font << /F1 ${fontId} 0 R /F2 ${fontBoldId} 0 R >> >> >>`;
+      objects[pagesId - 1] = `<< /Type /Pages /Kids [${pageId} 0 R] /Count 1 >>`;
+      objects[catalogId - 1] = `<< /Type /Catalog /Pages ${pagesId} 0 R >>`;
+      let pdf = "%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
+      for (let i = 0; i < objects.length; i++) {
+        offsets.push(pdf.length);
+        pdf += `${i + 1} 0 obj
 ${objects[i]}
 endobj
 `;
-    }
-    const xrefOffset = pdf.length;
-    pdf += "xref\n";
-    pdf += `0 ${objects.length + 1}
+      }
+      const xrefOffset = pdf.length;
+      pdf += "xref\n";
+      pdf += `0 ${objects.length + 1}
 `;
-    pdf += "0000000000 65535 f \n";
-    for (const off of offsets) {
-      pdf += String(off).padStart(10, "0") + " 00000 n \n";
-    }
-    pdf += "trailer\n";
-    pdf += `<< /Size ${objects.length + 1} /Root ${catalogId} 0 R >>
+      pdf += "0000000000 65535 f \n";
+      for (const off of offsets) {
+        pdf += String(off).padStart(10, "0") + " 00000 n \n";
+      }
+      pdf += "trailer\n";
+      pdf += `<< /Size ${objects.length + 1} /Root ${catalogId} 0 R >>
 `;
-    pdf += "startxref\n";
-    pdf += xrefOffset + "\n";
-    pdf += "%%EOF\n";
-    return new TextEncoder().encode(pdf);
-  }
-  __name(generatePDFBytes, "generatePDFBytes");
-  function generateInvoiceHTML(invoice, lang) {
-    const isAr = lang === "ar";
-    const dir = isAr ? "rtl" : "ltr";
-    const biz = {
-      name: "\u0645\u0624\u0633\u0633\u0629 \u0633\u0627\u0644\u0645 \u0628\u0646 \u0639\u0644\u064A \u0627\u0644\u0646\u0639\u064A\u0645\u064A",
-      nameEn: "Salem Bin Ali Al-Nuaimi Est.",
-      cr: "7050191290",
-      building: "2500",
-      street: "\u0623\u062D\u0645\u062F \u0628\u0646 \u062D\u062C\u0631 \u0627\u0644\u0639\u0633\u0642\u0644\u0627\u0646\u064A",
-      streetEn: "Ahmad bin Hajar Al-Asqalani",
-      district: "\u062D\u064A \u0637\u064A\u0628\u0629",
-      districtEn: "Taibah District",
-      city: "\u0627\u0644\u062C\u0628\u064A\u0644",
-      cityEn: "Jubail",
-      postal: "35513",
-      country: "\u0627\u0644\u0645\u0645\u0644\u0643\u0629 \u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u0627\u0644\u0633\u0639\u0648\u062F\u064A\u0629",
-      countryEn: "Kingdom of Saudi Arabia"
-    };
-    const invoiceNum = invoice.invoiceNumber || "N/A";
-    const created = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "N/A";
-    return `<!DOCTYPE html><html dir="${dir}" lang="${lang}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629" : "Invoice"} ${invoiceNum}</title><style>
+      pdf += "startxref\n";
+      pdf += xrefOffset + "\n";
+      pdf += "%%EOF\n";
+      return new TextEncoder().encode(pdf);
+    }
+    __name(generatePDFBytes, "generatePDFBytes");
+    __name2(generatePDFBytes, "generatePDFBytes");
+    function generateInvoiceHTML(invoice, lang) {
+      const isAr = lang === "ar";
+      const dir = isAr ? "rtl" : "ltr";
+      const biz = {
+        name: "\u0645\u0624\u0633\u0633\u0629 \u0633\u0627\u0644\u0645 \u0628\u0646 \u0639\u0644\u064A \u0627\u0644\u0646\u0639\u064A\u0645\u064A",
+        nameEn: "Salem Bin Ali Al-Nuaimi Est.",
+        cr: "7050191290",
+        building: "2500",
+        street: "\u0623\u062D\u0645\u062F \u0628\u0646 \u062D\u062C\u0631 \u0627\u0644\u0639\u0633\u0642\u0644\u0627\u0646\u064A",
+        streetEn: "Ahmad bin Hajar Al-Asqalani",
+        district: "\u062D\u064A \u0637\u064A\u0628\u0629",
+        districtEn: "Taibah District",
+        city: "\u0627\u0644\u062C\u0628\u064A\u0644",
+        cityEn: "Jubail",
+        postal: "35513",
+        country: "\u0627\u0644\u0645\u0645\u0644\u0643\u0629 \u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u0627\u0644\u0633\u0639\u0648\u062F\u064A\u0629",
+        countryEn: "Kingdom of Saudi Arabia"
+      };
+      const invoiceNum = invoice.invoiceNumber || "N/A";
+      const created = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "N/A";
+      return `<!DOCTYPE html><html dir="${dir}" lang="${lang}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629" : "Invoice"} ${invoiceNum}</title><style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:#f0f0f0;color:#1a1a2e}
 .invoice{max-width:800px;margin:0 auto;background:#fff;border-radius:12px;overflow:visible;box-shadow:0 4px 24px rgba(0,0,0,.12)}
@@ -1278,25 +1615,26 @@ ${invoice.notes ? '<div class="meta-info"><strong>' + (isAr ? "\u0645\u0644\u062
 <button class="btn btn-secondary" onclick="window.close()">${isAr ? "\u0625\u063A\u0644\u0627\u0642" : "Close"}</button>
 </div>
 </body></html>`;
-  }
-  __name(generateInvoiceHTML, "generateInvoiceHTML");
-  function generateInvoiceEmailHTML(invoice, lang) {
-    const isAr = lang === "ar";
-    const biz = {
-      name: "\u0645\u0624\u0633\u0633\u0629 \u0633\u0627\u0644\u0645 \u0628\u0646 \u0639\u0644\u064A \u0627\u0644\u0646\u0639\u064A\u0645\u064A",
-      nameEn: "Salem Bin Ali Al-Nuaimi Est.",
-      cr: "7050191290",
-      building: "2500",
-      streetEn: "Ahmad bin Hajar Al-Asqalani",
-      districtEn: "Taibah District",
-      cityEn: "Jubail",
-      postal: "35513",
-      countryEn: "Kingdom of Saudi Arabia"
-    };
-    const dir = isAr ? "rtl" : "ltr";
-    const invoiceNum = invoice.invoiceNumber || "";
-    const created = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "";
-    return `<div dir="${dir}" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;background:#f0f0f0;padding:20px">
+    }
+    __name(generateInvoiceHTML, "generateInvoiceHTML");
+    __name2(generateInvoiceHTML, "generateInvoiceHTML");
+    function generateInvoiceEmailHTML(invoice, lang) {
+      const isAr = lang === "ar";
+      const biz = {
+        name: "\u0645\u0624\u0633\u0633\u0629 \u0633\u0627\u0644\u0645 \u0628\u0646 \u0639\u0644\u064A \u0627\u0644\u0646\u0639\u064A\u0645\u064A",
+        nameEn: "Salem Bin Ali Al-Nuaimi Est.",
+        cr: "7050191290",
+        building: "2500",
+        streetEn: "Ahmad bin Hajar Al-Asqalani",
+        districtEn: "Taibah District",
+        cityEn: "Jubail",
+        postal: "35513",
+        countryEn: "Kingdom of Saudi Arabia"
+      };
+      const dir = isAr ? "rtl" : "ltr";
+      const invoiceNum = invoice.invoiceNumber || "";
+      const created = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "";
+      return `<div dir="${dir}" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;background:#f0f0f0;padding:20px">
 <div style="background:#fff;border-radius:12px;overflow:visible">
 <div style="background:#e8722a;padding:30px 30px 55px;border-radius:12px 12px 0 0;position:relative;text-align:center">
 <table width="100%" cellpadding="0" cellspacing="0" style="position:relative;z-index:1"><tr>
@@ -1349,10 +1687,11 @@ ${invoice.notes ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>'
 </div>
 </div>
 </div>`;
-  }
-  __name(generateInvoiceEmailHTML, "generateInvoiceEmailHTML");
-  function getAdminHTML() {
-    return `<!DOCTYPE html>
+    }
+    __name(generateInvoiceEmailHTML, "generateInvoiceEmailHTML");
+    __name2(generateInvoiceEmailHTML, "generateInvoiceEmailHTML");
+    function getAdminHTML() {
+      return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
@@ -1381,7 +1720,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;bac
 .btn-sm{padding:6px 12px;font-size:12px;border-radius:6px}
 .btn-block{width:100%;padding:12px}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.err-msg{background:#fef2f2;color:var(--error);padding:10px;border-radius:8px;font-size:13px;margin-bottom:12px;display:none}
+ .err-msg{background:#fef2f2;color:var(--error);padding:10px;border-radius:8px;font-size:13px;margin-bottom:12px;display:none}
+ .login-status{min-height:18px;margin:10px 0 0;font-size:13px;text-align:center;color:var(--text2)}
+ .login-status.error{color:var(--error)}.login-status.success{color:var(--success)}.login-status.loading{color:var(--info)}
 .success-msg{background:#d1fae5;color:#065f46;padding:10px;border-radius:8px;font-size:13px;margin-bottom:12px;display:none}
 #main-view{display:none}
 .layout{display:flex;min-height:100vh}
@@ -1415,6 +1756,11 @@ html[dir="rtl"] .main{margin-right:240px}html[dir="ltr"] .main{margin-left:240px
 .stat-card.amber{border-top-color:var(--warning)}.stat-card.amber .value{color:var(--warning)}
 .stat-card.red{border-top-color:var(--error)}.stat-card.red .value{color:var(--error)}
 .stat-card.teal{border-top-color:var(--primary)}.stat-card.teal .value{color:var(--primary)}
+.stat-card.selected{outline:2px solid var(--orange);outline-offset:-2px}
+.stat-label{font-size:13px;color:var(--text2);margin-bottom:8px}.stat-value{font-size:28px;font-weight:700;color:var(--text)}
+.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:18px}
+.detail-grid label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px}
+.detail-grid strong{font-size:14px;overflow-wrap:anywhere}
 .filters{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;align-items:center}
 .filters select,.filters input{padding:8px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;outline:none;background:var(--card)}
 .filters input{min-width:200px}
@@ -1493,6 +1839,7 @@ html[dir="rtl"] .drill-close{float:left}
   .stats-grid{grid-template-columns:repeat(2,1fr);gap:10px}
   .filters{flex-direction:column;gap:8px}.filters select,.filters input{width:100%}
   .grid-2{grid-template-columns:1fr}
+  .detail-grid{grid-template-columns:1fr;gap:10px}
   .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}
   .table-wrap table{min-width:640px}
   .page-title{font-size:20px;margin-bottom:16px}
@@ -1525,14 +1872,17 @@ html[dir="rtl"] .drill-close{float:left}
   <div class="login-card">
     <div class="login-logo">
       <h1>Tabbakheen</h1>
-      <p id="login-subtitle"></p>
+       <p id="login-subtitle">\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646</p>
     </div>
-    <div id="login-error" class="err-msg"></div>
-    <div class="form-group">
-      <label id="login-pw-label"></label>
-      <input type="password" id="login-password" onkeydown="if(event.key==='Enter')doLogin()">
-    </div>
-    <button class="btn btn-primary btn-block" onclick="doLogin()" id="login-btn"></button>
+    <form id="login-form" onsubmit="doLogin(event);return false;">
+      <div id="login-error" class="err-msg"></div>
+      <div class="form-group">
+        <label id="login-pw-label">\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644</label>
+        <input type="password" id="login-password" autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn btn-primary btn-block" id="login-btn">\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644</button>
+      <div id="login-status" class="login-status" role="status" aria-live="polite"></div>
+    </form>
   </div>
 </div>
 
@@ -1558,6 +1908,10 @@ html[dir="rtl"] .drill-close{float:left}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           <span id="nav-users"></span>
         </div>
+        <div class="nav-item" data-page="complaints" onclick="navigate('complaints')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><path d="M8 9h8M8 13h5"/></svg>
+          <span id="nav-complaints"></span>
+        </div>
         <div class="nav-item" data-page="verification" onclick="navigate('verification')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
           <span id="nav-verification"></span>
@@ -1569,6 +1923,10 @@ html[dir="rtl"] .drill-close{float:left}
         <div class="nav-item" data-page="settings" onclick="navigate('settings')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           <span id="nav-settings"></span>
+        </div>
+        <div class="nav-item" data-page="notifications" onclick="navigate('notifications')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          <span id="nav-notifications"></span>
         </div>
       </div>
       <div class="sidebar-footer">
@@ -1591,7 +1949,7 @@ html[dir="rtl"] .drill-close{float:left}
 <div id="toast" class="toast"></div>
 
 <script>
-var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",verification:"التوثيق",crVerifications:"توثيق السجل التجاري",freelanceRequests:"طلبات شهادة العمل الحر",certNumber:"رقم الشهادة",submittedAt:"تاريخ التقديم",reviewStatus:"حالة المراجعة",approve:"اعتماد",reject:"رفض",pendingReview:"قيد المراجعة",verifiedStatus:"موثّق",unverifiedStatus:"غير موثّق",notVerified:"غير موثّق",viewDocument:"تحقق من الوثيقة",viewImage:"عرض الصورة",rejectReason:"سبب الرفض (داخلي)",verificationApproved:"تم اعتماد التوثيق",verificationRejected:"تم رفض التوثيق",notifyCrVerification:"إشعار عند توثيق سجل تجاري جديد",notifyFreelanceRequest:"إشعار عند طلب شهادة عمل حر جديد",noVerificationData:"لا توجد بيانات توثيق",source:"المصدر",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",verification:"Verification",crVerifications:"CR Verification",freelanceRequests:"Freelance Certificate Requests",certNumber:"Certificate #",submittedAt:"Submitted At",reviewStatus:"Review Status",approve:"Approve",reject:"Reject",pendingReview:"Pending Review",verifiedStatus:"Verified",unverifiedStatus:"Unverified",notVerified:"Not Verified",viewDocument:"Verify Document",viewImage:"View Image",rejectReason:"Reject reason (internal)",verificationApproved:"Verification approved",verificationRejected:"Verification rejected",notifyCrVerification:"Notify on new CR verification",notifyFreelanceRequest:"Notify on new freelance request",noVerificationData:"No verification data",source:"Source",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices"}};
+var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",verification:"\u0627\u0644\u062A\u0648\u062B\u064A\u0642",crVerifications:"\u062A\u0648\u062B\u064A\u0642 \u0627\u0644\u0633\u062C\u0644 \u0627\u0644\u062A\u062C\u0627\u0631\u064A",freelanceRequests:"\u0637\u0644\u0628\u0627\u062A \u0634\u0647\u0627\u062F\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u062D\u0631",certNumber:"\u0631\u0642\u0645 \u0627\u0644\u0634\u0647\u0627\u062F\u0629",submittedAt:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u062A\u0642\u062F\u064A\u0645",reviewStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",approve:"\u0627\u0639\u062A\u0645\u0627\u062F",reject:"\u0631\u0641\u0636",pendingReview:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",verifiedStatus:"\u0645\u0648\u062B\u0651\u0642",unverifiedStatus:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",notVerified:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",viewDocument:"\u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0648\u062B\u064A\u0642\u0629",viewImage:"\u0639\u0631\u0636 \u0627\u0644\u0635\u0648\u0631\u0629",rejectReason:"\u0633\u0628\u0628 \u0627\u0644\u0631\u0641\u0636 (\u062F\u0627\u062E\u0644\u064A)",verificationApproved:"\u062A\u0645 \u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062A\u0648\u062B\u064A\u0642",verificationRejected:"\u062A\u0645 \u0631\u0641\u0636 \u0627\u0644\u062A\u0648\u062B\u064A\u0642",notifyCrVerification:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0648\u062B\u064A\u0642 \u0633\u062C\u0644 \u062A\u062C\u0627\u0631\u064A \u062C\u062F\u064A\u062F",notifyFreelanceRequest:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u0637\u0644\u0628 \u0634\u0647\u0627\u062F\u0629 \u0639\u0645\u0644 \u062D\u0631 \u062C\u062F\u064A\u062F",noVerificationData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u0648\u062B\u064A\u0642",source:"\u0627\u0644\u0645\u0635\u062F\u0631",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",notifications:"\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastTitle:"\u0639\u0646\u0648\u0627\u0646 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastMessage:"\u0646\u0635 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastAudience:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u0633\u062A\u0647\u062F\u0641",audienceCustomers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",audienceProviders:"\u0645\u0642\u062F\u0645\u0648 \u0627\u0644\u062E\u062F\u0645\u0629",audienceDrivers:"\u0645\u0646\u0627\u062F\u064A\u0628 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",audienceAll:"\u0627\u0644\u0643\u0644",broadcastSend:"\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastHistory:"\u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastConfirm:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastConfirmMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u062C\u0645\u064A\u0639 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0645\u062D\u062F\u062F\u064A\u0646.",broadcastResult:"\u0646\u062A\u064A\u062C\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastMatched:"\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0645\u0637\u0627\u0628\u0642\u0648\u0646",broadcastTokens:"\u0631\u0645\u0648\u0632 \u0635\u0627\u0644\u062D\u0629",broadcastSentCount:"\u062A\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastFailed:"\u0641\u0634\u0644 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",noBroadcastHistory:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0633\u062C\u0644 \u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastAudienceLabel:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631",deleteNotif:"\u062D\u0630\u0641",resendNotif:"\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResend:"\u062A\u0639\u062F\u064A\u0644 \u0648\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResendSend:"\u0625\u0631\u0633\u0627\u0644 \u0646\u0633\u062E\u0629 \u0645\u0639\u062F\u0644\u0629",confirmDelete:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u062D\u0630\u0641",confirmDeleteMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u062D\u0630\u0641 \u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0641\u0642\u0637 \u062F\u0648\u0646 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0631\u0633\u0644\u0629.",confirmResend:"\u062A\u0623\u0643\u064A\u062F \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",confirmResendMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u062D\u062F\u062F.",notifDeleted:"\u062A\u0645 \u062D\u0630\u0641 \u0627\u0644\u0633\u062C\u0644",deleteFailed:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0630\u0641",resendSuccess:"\u062A\u0645\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",resendFailed:"\u0641\u0634\u0644\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",providerSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0632\u0648\u062F \u0627\u0644\u062E\u062F\u0645\u0629",driverSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0633\u0627\u0626\u0642",subActive:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0641\u0639\u0651\u0644",subPrice:"\u0633\u0639\u0631 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 (SAR)",subPeriod:"\u0641\u062A\u0631\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",periodWeekly:"\u0623\u0633\u0628\u0648\u0639\u064A",periodMonthly:"\u0634\u0647\u0631\u064A",periodQuarterly:"\u0631\u0628\u0639 \u0633\u0646\u0648\u064A",periodYearly:"\u0633\u0646\u0648\u064A",freeTrialEnabledLabel:"\u0627\u0644\u062A\u062C\u0631\u0628\u0629 \u0627\u0644\u0645\u062C\u0627\u0646\u064A\u0629 \u0645\u0641\u0639\u0651\u0644\u0629",freeTrialTextArLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0639\u0631\u0628\u064A)",freeTrialTextEnLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0625\u0646\u062C\u0644\u064A\u0632\u064A)"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",verification:"Verification",crVerifications:"CR Verification",freelanceRequests:"Freelance Certificate Requests",certNumber:"Certificate #",submittedAt:"Submitted At",reviewStatus:"Review Status",approve:"Approve",reject:"Reject",pendingReview:"Pending Review",verifiedStatus:"Verified",unverifiedStatus:"Unverified",notVerified:"Not Verified",viewDocument:"Verify Document",viewImage:"View Image",rejectReason:"Reject reason (internal)",verificationApproved:"Verification approved",verificationRejected:"Verification rejected",notifyCrVerification:"Notify on new CR verification",notifyFreelanceRequest:"Notify on new freelance request",noVerificationData:"No verification data",source:"Source",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices",notifications:"Notifications",broadcastTitle:"Notification Title",broadcastMessage:"Message",broadcastAudience:"Target Audience",audienceCustomers:"Customers",audienceProviders:"Providers",audienceDrivers:"Drivers",audienceAll:"All",broadcastSend:"Send Notification",broadcastHistory:"Notification History",broadcastConfirm:"Confirm Send",broadcastConfirmMsg:"Are you sure? This notification will be sent to all targeted users.",broadcastResult:"Send Result",broadcastMatched:"Users Matched",broadcastTokens:"Valid Tokens",broadcastSentCount:"Sent",broadcastFailed:"Failed",noBroadcastHistory:"No notification history",broadcastAudienceLabel:"Audience",deleteNotif:"Delete",resendNotif:"Resend",editResend:"Edit & Resend",editResendSend:"Send Edited Copy",confirmDelete:"Confirm Delete",confirmDeleteMsg:"Are you sure? Only the history record will be deleted. Sent notifications are not recalled.",confirmResend:"Confirm Resend",confirmResendMsg:"Are you sure? This notification will be resent to the targeted audience.",notifDeleted:"Record deleted",deleteFailed:"Delete failed",resendSuccess:"Resend successful",resendFailed:"Resend failed",providerSubSettings:"Provider Subscription Settings",driverSubSettings:"Driver Subscription Settings",subActive:"Subscription Active",subPrice:"Subscription Price (SAR)",subPeriod:"Subscription Period",periodWeekly:"Weekly",periodMonthly:"Monthly",periodQuarterly:"Quarterly",periodYearly:"Yearly",freeTrialEnabledLabel:"Free Trial Enabled",freeTrialTextArLabel:"Free Trial Text (Arabic)",freeTrialTextEnLabel:"Free Trial Text (English)"}};
 var lang=localStorage.getItem("tbk_admin_lang")||"ar";
 function t(k){return(T[lang]&&T[lang][k])||T.en[k]||k;}
 function setLang(l){lang=l;localStorage.setItem("tbk_admin_lang",l);var d=l==="ar"?"rtl":"ltr";document.documentElement.dir=d;document.documentElement.lang=l;updateStaticLabels();renderPage();}
@@ -1603,10 +1961,12 @@ function updateStaticLabels(){
   document.getElementById("sidebar-subtitle").textContent=t("adminPanel");
   document.getElementById("nav-dashboard").textContent=t("dashboard");
   document.getElementById("nav-users").textContent=t("users");
+   var ncEl=document.getElementById("nav-complaints");if(ncEl)ncEl.textContent=ct("nav");
   var nvEl=document.getElementById("nav-verification");if(nvEl)nvEl.textContent=t("verification");
   document.getElementById("nav-invoices").textContent=t("invoices");
   document.getElementById("nav-settings").textContent=t("settings");
   document.getElementById("nav-logout").textContent=t("logout");
+  var nnEl=document.getElementById("nav-notifications");if(nnEl)nnEl.textContent=t("notifications");
 }
 
 var TOKEN=sessionStorage.getItem("tbk_admin_token");
@@ -1616,6 +1976,8 @@ var allOrders=[];
 var allOffers=[];
 var allInvoices=[];
 var appSettings={};
+ var complaintLabels={ar:{nav:"\u0628\u0644\u0627\u063A\u0627\u062A",title:"\u0628\u0644\u0627\u063A\u0627\u062A \u0627\u0644\u0634\u0643\u0627\u0648\u0649",all:"\u0627\u0644\u0643\u0644",pending:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",resolved:"\u062A\u0645 \u0627\u0644\u062D\u0644",closed:"\u0645\u063A\u0644\u0642\u0629",customerComplaint:"\u0634\u0643\u0648\u0649 \u0639\u0645\u064A\u0644",providerComplaint:"\u0634\u0643\u0648\u0649 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",deliveryNotConfirmed:"\u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u063A\u064A\u0631 \u0645\u0624\u0643\u062F",customerRejectedReceipt:"\u0631\u0641\u0636 \u0627\u0633\u062A\u0644\u0627\u0645 \u0627\u0644\u0625\u064A\u0635\u0627\u0644",customer:"\u0627\u0644\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u0627\u0644\u062E\u062F\u0645\u0629",driver:"\u0627\u0644\u0633\u0627\u0626\u0642",order:"\u0627\u0644\u0637\u0644\u0628",orderNumber:"\u0631\u0642\u0645 \u0627\u0644\u0637\u0644\u0628",complaintType:"\u0646\u0648\u0639 \u0627\u0644\u0628\u0644\u0627\u063A",source:"\u0627\u0644\u0645\u0635\u062F\u0631",target:"\u0627\u0644\u0637\u0631\u0641 \u0627\u0644\u0645\u0639\u0646\u064A",note:"\u0646\u0635 \u0627\u0644\u0628\u0644\u0627\u063A",adminReply:"\u0631\u062F \u0627\u0644\u0625\u062F\u0627\u0631\u0629",created:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0625\u0646\u0634\u0627\u0621",updated:"\u0622\u062E\u0631 \u062A\u062D\u062F\u064A\u062B",status:"\u0627\u0644\u062D\u0627\u0644\u0629",details:"\u0627\u0644\u062A\u0641\u0627\u0635\u064A\u0644",save:"\u062D\u0641\u0638 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",saved:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0628\u0644\u0627\u063A",saveFailed:"\u0641\u0634\u0644 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0628\u0644\u0627\u063A",noComplaints:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u0644\u0627\u063A\u0627\u062A",search:"\u0628\u062D\u062B \u0628\u0631\u0642\u0645 \u0627\u0644\u0637\u0644\u0628 \u0623\u0648 \u0627\u0644\u0646\u0635 \u0623\u0648 \u0627\u0644\u0627\u0633\u0645",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",unknown:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",noUser:"\u062D\u0633\u0627\u0628 \u0645\u062D\u0630\u0648\u0641 \u0623\u0648 \u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631"},en:{nav:"Complaints",title:"Complaint Management",all:"All",pending:"Pending",resolved:"Resolved",closed:"Closed",customerComplaint:"Customer complaint",providerComplaint:"Provider complaint",deliveryNotConfirmed:"Delivery not confirmed",customerRejectedReceipt:"Receipt rejected",customer:"Customer",provider:"Provider",driver:"Driver",order:"Order",orderNumber:"Order number",complaintType:"Type",source:"Source",target:"Target",note:"Complaint",adminReply:"Admin reply",created:"Created",updated:"Updated",status:"Status",details:"Details",save:"Save update",saved:"Complaint updated",saveFailed:"Failed to update complaint",noComplaints:"No complaints found",search:"Search by order, text, or name",loading:"Loading...",unknown:"Unavailable",noUser:"Deleted or unavailable account"}};
+ function ct(k){return(complaintLabels[lang]&&complaintLabels[lang][k])||complaintLabels.en[k]||k;}
 
 async function api(path,opts){
   opts=opts||{};
@@ -1630,17 +1992,49 @@ async function api(path,opts){
 function showLogin(){document.getElementById("login-view").style.display="flex";document.getElementById("main-view").style.display="none";}
 function showMain(){document.getElementById("login-view").style.display="none";document.getElementById("main-view").style.display="block";if(isMobile()){forceSidebarClosed();}else{closeSidebar();}setTimeout(function(){navigate("dashboard");},0);}
 
-async function doLogin(){
-  var pw=document.getElementById("login-password").value;
+function setLoginStatus(message,type){
+  var el=document.getElementById("login-status");
+  if(!el)return;
+  el.textContent=message||"";
+  el.className="login-status"+(type?" "+type:"");
+}
+async function doLogin(event){
+  if(event&&event.preventDefault)event.preventDefault();
+  var pwEl=document.getElementById("login-password");
+  var btn=document.getElementById("login-btn");
   var errEl=document.getElementById("login-error");
-  if(!pw){errEl.textContent=t("enterPassword");errEl.style.display="block";return;}
-  errEl.style.display="none";
+  var pw=pwEl?pwEl.value:"";
+  if(errEl){errEl.textContent="";errEl.style.display="none";}
+  if(!pw){
+    setLoginStatus(t("enterPassword"),"error");
+    if(pwEl)pwEl.focus();
+    return false;
+  }
+  if(btn){btn.disabled=true;btn.textContent="\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...";}
+  setLoginStatus("\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...","loading");
   try{
     var res=await fetch("/admin/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
-    var data=await res.json();
-    if(data.token){TOKEN=data.token;sessionStorage.setItem("tbk_admin_token",TOKEN);showMain();}
-    else{errEl.textContent=data.error||t("invalidPassword");errEl.style.display="block";}
-  }catch(e){errEl.textContent=t("connectionError");errEl.style.display="block";}
+    var data=null;
+    try{data=await res.json();}catch(e){data=null;}
+    if(res.status===401){
+      setLoginStatus("\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629","error");
+      return false;
+    }
+    if(!res.ok||!data||!data.token){
+      setLoginStatus("\u062A\u0639\u0630\u0631 \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644\u060C \u062D\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062E\u0631\u0649","error");
+      return false;
+    }
+    TOKEN=data.token;
+    sessionStorage.setItem("tbk_admin_token",TOKEN);
+    setLoginStatus("","success");
+    showMain();
+    return true;
+  }catch(e){
+    setLoginStatus("\u062A\u0639\u0630\u0631 \u0627\u0644\u0627\u062A\u0635\u0627\u0644 \u0628\u0627\u0644\u062E\u0627\u062F\u0645","error");
+    return false;
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent=t("signIn");}
+  }
 }
 
 function doLogout(){TOKEN=null;sessionStorage.removeItem("tbk_admin_token");showLogin();}
@@ -1692,7 +2086,7 @@ function subStatusLabel(u){
   if(u.role==="customer")return "";
   var days=getSubDaysRemaining(u);
   if(days===null)return "";
-  var warnDays=appSettings.subscriptionWarningDays||7;
+  var warnDays=appSettings.subscriptionWarningDays!=null?appSettings.subscriptionWarningDays:7;
   if(days<=0)return '<span class="sub-expired">'+t("expired")+" ("+Math.abs(days)+" "+t("days")+")</span>";
   if(days<=warnDays)return '<span class="sub-warn">'+t("expiringIn")+" "+days+" "+t("days")+"</span>";
   return '<span class="sub-active">'+days+" "+t("daysRemaining")+"</span>";
@@ -1707,6 +2101,108 @@ function flReviewBadge(s){
   var m={approved:"green",pending:"yellow",pending_review:"yellow",rejected:"red"};
   var l={approved:t("verifiedStatus"),pending:t("pendingReview"),pending_review:t("pendingReview"),rejected:t("unverifiedStatus")};
   return '<span class="badge badge-'+(m[s]||"gray")+'">'+(l[s]||s||t("na"))+'</span>';
+}
+function complaintStatusBadge(status){
+  var m={pending:"yellow",resolved:"green",closed:"gray"};
+  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(complaintStatusLabel(status))+'</span>';
+}
+function complaintStatusLabel(status){return ct(status==="pending"?"pending":status==="resolved"?"resolved":status==="closed"?"closed":"unknown");}
+function complaintTypeLabel(type){
+  var m={customer_complaint:"customerComplaint",provider_complaint:"providerComplaint",delivery_not_confirmed:"deliveryNotConfirmed",customer_rejected_receipt:"customerRejectedReceipt"};
+  return ct(m[type]||"unknown");
+}
+function complaintDate(value){
+  if(!value)return "-";
+  var d=new Date(value);
+  return isNaN(d.getTime())?esc(String(value)):esc(d.toLocaleString(lang==="ar"?"ar-SA":"en-US"));
+}
+function complaintPerson(item,role){
+  var p=item&&item[role]||{};
+  return '<strong>'+esc(p.displayName||p.email||p.uid||ct("noUser"))+'</strong>'+(p.email&&p.displayName?'<div style="font-size:12px;color:var(--text2)">'+esc(p.email)+'</div>':"");
+}
+var complaintFilter={status:"all",search:""};
+var allComplaints=[];
+async function renderComplaints(c){
+  var data=await api("/complaints");
+  if(!data)return;
+  allComplaints=data.complaints||[];
+  var counts={all:allComplaints.length,pending:0,resolved:0,closed:0};
+  allComplaints.forEach(function(x){if(counts[x.complaintStatus]!==undefined)counts[x.complaintStatus]++;});
+  var cards=["all","pending","resolved","closed"].map(function(s){
+    return '<button class="stat-card '+(complaintFilter.status===s?"selected":"")+'" data-status="'+s+'" onclick="setComplaintStatusFilter(this.dataset.status)" style="text-align:inherit;cursor:pointer"><div class="stat-label">'+ct(s)+'</div><div class="stat-value">'+counts[s]+'</div></button>';
+  }).join("");
+  c.innerHTML='<h1 class="page-title">'+ct("title")+'</h1>'+
+    '<div class="stats-grid complaint-stats">'+cards+'</div>'+
+    '<div class="settings-section">'+
+    '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">'+
+    '<input id="complaint-search" type="search" value="'+esc(complaintFilter.search)+'" placeholder="'+ct("search")+'" style="flex:1;min-width:220px;padding:9px;border:1px solid var(--border);border-radius:6px" oninput="filterComplaints(this.value)">'+
+    '<select id="complaint-status-filter" onchange="setComplaintStatusFilter(this.value)" style="padding:9px;border:1px solid var(--border);border-radius:6px">'+
+    ["all","pending","resolved","closed"].map(function(s){return'<option value="'+s+'" '+(complaintFilter.status===s?"selected":"")+'>'+ct(s)+'</option>';}).join("")+
+    '</select></div>'+
+    '<div class="table-wrap"><table><thead><tr><th>'+ct("orderNumber")+'</th><th>'+ct("complaintType")+'</th><th>'+ct("source")+'</th><th>'+ct("target")+'</th><th>'+ct("note")+'</th><th>'+ct("status")+'</th><th>'+ct("created")+'</th><th>'+ct("details")+'</th></tr></thead><tbody id="complaints-body"></tbody></table></div></div>';
+  paintComplaintRows();
+}
+function setComplaintStatusFilter(status){
+  complaintFilter.status=status||"all";
+  renderPage();
+}
+function filterComplaints(search){
+  complaintFilter.search=search||"";
+  paintComplaintRows();
+}
+function paintComplaintRows(){
+  var body=document.getElementById("complaints-body");
+  if(!body)return;
+  var q=(complaintFilter.search||"").toLowerCase();
+  var items=allComplaints.filter(function(x){
+    if(complaintFilter.status!=="all"&&x.complaintStatus!==complaintFilter.status)return false;
+    if(!q)return true;
+    var text=[x.orderNumber,x.note,x.type,x.source,x.target,x.customer&&x.customer.displayName,x.provider&&x.provider.displayName,x.driver&&x.driver.displayName].join(" ").toLowerCase();
+    return text.indexOf(q)>=0;
+  });
+  body.innerHTML=items.map(function(x){
+    var id=esc(x.id||"");
+    return '<tr><td><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong><div style="font-size:11px;color:var(--text2)">'+esc(x.orderId||"")+'</div></td>'+
+      '<td>'+esc(complaintTypeLabel(x.type))+'</td>'+
+      '<td>'+esc(complaintRoleLabel(x.source))+'</td>'+
+      '<td>'+esc(complaintRoleLabel(x.target))+'</td>'+
+      '<td style="max-width:260px;white-space:pre-wrap">'+esc(x.note||"-")+'</td>'+
+      '<td>'+complaintStatusBadge(x.complaintStatus)+'</td>'+
+      '<td style="font-size:12px;white-space:nowrap">'+complaintDate(x.createdAt)+'</td>'+
+      '<td><button class="btn btn-secondary btn-sm" data-id="'+id+'" onclick="viewComplaint(this.dataset.id)">'+ct("details")+'</button></td></tr>';
+  }).join("")||'<tr><td colspan="8" class="empty">'+ct("noComplaints")+'</td></tr>';
+}
+function complaintRoleLabel(role){
+  var m={customer:"customer",provider:"provider",driver:"driver"};
+  return ct(m[role]||"unknown");
+}
+async function viewComplaint(id){
+  openModal('<div class="loading">'+ct("loading")+'</div>');
+  var data=await api("/complaints/"+encodeURIComponent(id));
+  if(!data||!data.complaint){closeModal();toast((data&&data.error)||ct("saveFailed"),"error");return;}
+  var x=data.complaint;
+  openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span style="font-size:13px;color:var(--text2)">#'+esc(x.orderNumber||x.orderId||x.id)+'</span></h3>'+
+    '<div class="detail-grid">'+
+    '<div><label>'+ct("orderNumber")+'</label><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong></div>'+
+    '<div><label>'+ct("complaintType")+'</label><strong>'+esc(complaintTypeLabel(x.type))+'</strong></div>'+
+    '<div><label>'+ct("source")+'</label><strong>'+esc(complaintRoleLabel(x.source))+'</strong></div>'+
+    '<div><label>'+ct("target")+'</label><strong>'+esc(complaintRoleLabel(x.target))+'</strong></div>'+
+    '<div><label>'+ct("customer")+'</label>'+complaintPerson(x,"customer")+'</div>'+
+    '<div><label>'+ct("provider")+'</label>'+complaintPerson(x,"provider")+'</div>'+
+    '<div><label>'+ct("driver")+'</label>'+complaintPerson(x,"driver")+'</div>'+
+    '<div><label>'+ct("created")+'</label><strong>'+complaintDate(x.createdAt)+'</strong></div>'+
+    '</div>'+
+    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+
+    '<div class="form-group"><label for="complaint-status">'+ct("status")+'</label><select id="complaint-status" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px">'+["pending","resolved","closed"].map(function(s){return'<option value="'+s+'" '+(x.complaintStatus===s?"selected":"")+'>'+ct(s)+'</option>';}).join("")+'</select></div>'+
+    '<div class="form-group"><label for="complaint-admin-note">'+ct("adminReply")+'</label><textarea id="complaint-admin-note" rows="4" maxlength="4000" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;resize:vertical">'+esc(x.adminNote||"")+'</textarea></div>'+
+    '<div style="font-size:12px;color:var(--text2);margin-bottom:12px">'+ct("updated")+': '+complaintDate(x.updatedAt)+'</div>'+
+    '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-orange" data-id="'+esc(x.id)+'" onclick="saveComplaint(this.dataset.id)">'+ct("save")+'</button></div>');
+}
+async function saveComplaint(id){
+  var statusEl=document.getElementById("complaint-status");
+  var noteEl=document.getElementById("complaint-admin-note");
+  var data=await api("/complaints/"+encodeURIComponent(id)+"/update",{method:"POST",body:JSON.stringify({complaintStatus:statusEl?statusEl.value:"pending",adminNote:noteEl?noteEl.value:""})});
+  if(data&&data.success){closeModal();toast(ct("saved"));renderPage();}else{toast((data&&data.error)||ct("saveFailed"),"error");}
 }
 async function renderVerification(c){
   var data=await api("/verification");
@@ -1761,9 +2257,11 @@ async function renderPage(){
   try{
     if(currentPage==="dashboard")await renderDashboard(c);
     else if(currentPage==="users")await renderUsers(c);
+     else if(currentPage==="complaints")await renderComplaints(c);
     else if(currentPage==="verification")await renderVerification(c);
     else if(currentPage==="invoices")await renderInvoices(c);
     else if(currentPage==="settings")await renderSettings(c);
+    else if(currentPage==="notifications")await renderNotifications(c);
   }catch(e){c.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
 }
 
@@ -2096,7 +2594,7 @@ async function renderSettings(c){
     '<div id="pricing-preview" style="margin-top:12px;padding:16px;background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:10px"></div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("subWarning")+'</h3>'+
-    '<div class="form-group"><label>'+t("warningDays")+'</label><input type="number" id="s-warningDays" value="'+(appSettings.subscriptionWarningDays||7)+'"></div>'+
+    '<div class="form-group"><label>'+t("warningDays")+'</label><input type="number" id="s-warningDays" value="'+(appSettings.subscriptionWarningDays!=null?appSettings.subscriptionWarningDays:7)+'"></div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("adminNotifications")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewUser"'+(appSettings.notifyOnNewUser?" checked":"")+'> '+t("notifyNewUser")+'</label></div>'+
@@ -2104,6 +2602,30 @@ async function renderSettings(c){
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewDriver"'+(appSettings.notifyOnNewDriver?" checked":"")+'> '+t("notifyNewDriver")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyCrVerification"'+(appSettings.notifyOnCrVerification?" checked":"")+'> '+t("notifyCrVerification")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyFreelanceRequest"'+(appSettings.notifyOnFreelanceRequest?" checked":"")+'> '+t("notifyFreelanceRequest")+'</label></div>'+
+    '</div>'+
+    '<div class="settings-section"><h3>'+t("providerSubSettings")+'</h3>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ps-active"'+(appSettings.providerSubscription&&appSettings.providerSubscription.active?" checked":"")+'> '+t("subActive")+'</label></div>'+
+    '<div class="form-group"><label>'+t("subPrice")+'</label><input type="number" min="0" step="0.5" id="s-ps-price" value="'+(appSettings.providerSubscription&&appSettings.providerSubscription.price!=null?appSettings.providerSubscription.price:15)+'"></div>'+
+    '<div class="form-group"><label>'+t("subPeriod")+'</label><select id="s-ps-period"><option value="weekly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="weekly"?" selected":"")+'>'+t("periodWeekly")+'</option><option value="monthly"'+((appSettings.providerSubscription&&appSettings.providerSubscription.period==="monthly")||(!appSettings.providerSubscription||!appSettings.providerSubscription.period)?" selected":"")+'>'+t("periodMonthly")+'</option><option value="quarterly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="quarterly"?" selected":"")+'>'+t("periodQuarterly")+'</option><option value="yearly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="yearly"?" selected":"")+'>'+t("periodYearly")+'</option></select></div>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ps-freeTrialEnabled"'+(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialEnabled?" checked":"")+'> '+t("freeTrialEnabledLabel")+'</label></div>'+
+    '<div class="form-group"><label>'+t("freeTrialTextArLabel")+'</label><input id="s-ps-freeTrialTextAr" value="'+esc(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialTextAr||"")+'"></div>'+
+    '<div class="form-group"><label>'+t("freeTrialTextEnLabel")+'</label><input id="s-ps-freeTrialTextEn" value="'+esc(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialTextEn||"")+'"></div>'+
+    '</div>'+
+    '<div class="settings-section"><h3>'+t("driverSubSettings")+'</h3>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ds-active"'+(appSettings.driverSubscription&&appSettings.driverSubscription.active?" checked":"")+'> '+t("subActive")+'</label></div>'+
+    '<div class="form-group"><label>'+t("subPrice")+'</label><input type="number" min="0" step="0.5" id="s-ds-price" value="'+(appSettings.driverSubscription&&appSettings.driverSubscription.price!=null?appSettings.driverSubscription.price:15)+'"></div>'+
+    '<div class="form-group"><label>'+t("subPeriod")+'</label><select id="s-ds-period"><option value="weekly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="weekly"?" selected":"")+'>'+t("periodWeekly")+'</option><option value="monthly"'+((appSettings.driverSubscription&&appSettings.driverSubscription.period==="monthly")||(!appSettings.driverSubscription||!appSettings.driverSubscription.period)?" selected":"")+'>'+t("periodMonthly")+'</option><option value="quarterly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="quarterly"?" selected":"")+'>'+t("periodQuarterly")+'</option><option value="yearly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="yearly"?" selected":"")+'>'+t("periodYearly")+'</option></select></div>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ds-freeTrialEnabled"'+(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialEnabled?" checked":"")+'> '+t("freeTrialEnabledLabel")+'</label></div>'+
+    '<div class="form-group"><label>'+t("freeTrialTextArLabel")+'</label><input id="s-ds-freeTrialTextAr" value="'+esc(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialTextAr||"")+'"></div>'+
+    '<div class="form-group"><label>'+t("freeTrialTextEnLabel")+'</label><input id="s-ds-freeTrialTextEn" value="'+esc(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialTextEn||"")+'"></div>'+
+    '</div>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A Apple":"Apple Subscriptions")+'</h3>'+
+    '<p style="font-size:13px;color:var(--text2);margin-bottom:16px">'+(lang==="ar"?"\u0627\u0644\u0645\u0639\u0644\u0648\u0645\u0627\u062A \u0623\u062F\u0646\u0627\u0647 \u0645\u0646 \u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642. \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064A \u0648\u0645\u062F\u0629 \u0627\u0644\u0641\u0648\u062A\u0631\u0629 \u0648\u0634\u0631\u0648\u0637 \u0627\u0644\u062A\u062C\u062F\u064A\u062F \u0641\u064A iOS \u062A\u062A\u062D\u0643\u0645 \u0628\u0647\u0627 Apple App Store Connect.":"The information below is from App Configuration. Final iOS price, billing duration, renewal, cancellation, and entitlement terms are controlled by Apple App Store Connect.")+'</p>'+
+    '<div class="grid-2">'+
+    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px"><strong>'+(lang==="ar"?"\u0645\u0642\u062F\u0645 \u0627\u0644\u062E\u062F\u0645\u0629":"Provider")+'</strong><div style="font-size:12px;color:var(--text2);margin-top:8px">App Configuration</div><div style="margin-top:4px"><code>tabbakheen_provider_monthly</code></div><div style="margin-top:6px">'+(lang==="ar"?"\u0627\u0644\u062F\u0648\u0631: \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629":"Role: Provider")+'</div><div>'+(lang==="ar"?"\u0645\u0641\u0639\u0651\u0644: ":"Configured: ")+(appSettings.providerSubscription&&appSettings.providerSubscription.active?(lang==="ar"?"\u0646\u0639\u0645":"Yes"):(lang==="ar"?"\u0644\u0627":"No"))+'</div></div>'+
+    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px"><strong>'+(lang==="ar"?"\u0627\u0644\u0633\u0627\u0626\u0642":"Driver")+'</strong><div style="font-size:12px;color:var(--text2);margin-top:8px">App Configuration</div><div style="margin-top:4px"><code>tabbakheen_driver_monthly</code></div><div style="margin-top:6px">'+(lang==="ar"?"\u0627\u0644\u062F\u0648\u0631: \u0633\u0627\u0626\u0642":"Role: Driver")+'</div><div>'+(lang==="ar"?"\u0645\u0641\u0639\u0651\u0644: ":"Configured: ")+(appSettings.driverSubscription&&appSettings.driverSubscription.active?(lang==="ar"?"\u0646\u0639\u0645":"Yes"):(lang==="ar"?"\u0644\u0627":"No"))+'</div></div>'+
+    '</div>'+
+    '<div style="margin-top:14px;padding:12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412">'+(lang==="ar"?"Apple / StoreKit: \u0644\u0627 \u062A\u062A\u0648\u0641\u0631 \u0628\u064A\u0627\u0646\u0627\u062A \u0645\u0628\u0627\u0634\u0631\u0629 \u0648\u0645\u0648\u062B\u0648\u0642\u0629 \u0645\u0646 App Store Connect \u062F\u0627\u062E\u0644 \u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u062D\u0627\u0644\u064A\u0627\u064B. \u0644\u0627 \u062A\u064F\u0639\u062F \u0627\u0644\u0623\u0633\u0639\u0627\u0631 \u0627\u0644\u0645\u062F\u062E\u0644\u0629 \u0641\u064A \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u0623\u0633\u0639\u0627\u0631 Apple.":"Apple / StoreKit: Direct authoritative App Store Connect data is not currently available in Admin. Admin-entered prices are not Apple prices.")+'</div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
     '<div id="pw-msg" class="success-msg"></div>'+
@@ -2149,6 +2671,16 @@ async function uploadBanner(){
 }
 
 async function saveSettings(){
+  function numberValue(id,fallback){
+    var el=document.getElementById(id);
+    var parsed=el?parseFloat(el.value):fallback;
+    return Number.isFinite(parsed)?parsed:fallback;
+  }
+  function integerValue(id,fallback){
+    var el=document.getElementById(id);
+    var parsed=el?parseInt(el.value,10):fallback;
+    return Number.isFinite(parsed)?parsed:fallback;
+  }
   var fields={
     bannerImageUrl:document.getElementById("s-bannerImageUrl")?document.getElementById("s-bannerImageUrl").value:"",
     bannerEnabled:document.getElementById("s-bannerEnabled")?document.getElementById("s-bannerEnabled").checked:true,
@@ -2156,18 +2688,34 @@ async function saveSettings(){
     supportWhatsapp:document.getElementById("s-supportWhatsapp")?document.getElementById("s-supportWhatsapp").value:"",
     deliveryPricing:{
       currency:"SAR",
-      baseFee:Math.max(0,parseFloat(document.getElementById("s-baseFee")?document.getElementById("s-baseFee").value:"5")||5),
-      perKmInsideCity:Math.max(0,parseFloat(document.getElementById("s-perKmCity")?document.getElementById("s-perKmCity").value:"2")||2),
-      minFee:Math.max(0,parseFloat(document.getElementById("s-minFee")?document.getElementById("s-minFee").value:"5")||5),
-      maxFee:Math.max(0,parseFloat(document.getElementById("s-maxFee")?document.getElementById("s-maxFee").value:"50")||50)
+      baseFee:Math.max(0,numberValue("s-baseFee",5)),
+      perKmInsideCity:Math.max(0,numberValue("s-perKmCity",2)),
+      minFee:Math.max(0,numberValue("s-minFee",5)),
+      maxFee:Math.max(0,numberValue("s-maxFee",50))
     },
     defaultLanguage:lang,
-    subscriptionWarningDays:parseInt(document.getElementById("s-warningDays")?document.getElementById("s-warningDays").value:"7")||7,
+    subscriptionWarningDays:Math.max(0,integerValue("s-warningDays",7)),
     notifyOnNewUser:document.getElementById("s-notifyNewUser")?document.getElementById("s-notifyNewUser").checked:false,
     notifyOnNewProvider:document.getElementById("s-notifyNewProvider")?document.getElementById("s-notifyNewProvider").checked:false,
     notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
     notifyOnCrVerification:document.getElementById("s-notifyCrVerification")?document.getElementById("s-notifyCrVerification").checked:false,
-    notifyOnFreelanceRequest:document.getElementById("s-notifyFreelanceRequest")?document.getElementById("s-notifyFreelanceRequest").checked:false
+    notifyOnFreelanceRequest:document.getElementById("s-notifyFreelanceRequest")?document.getElementById("s-notifyFreelanceRequest").checked:false,
+    providerSubscription:{
+      active:document.getElementById("s-ps-active")?document.getElementById("s-ps-active").checked:false,
+      price:Math.max(0,numberValue("s-ps-price",15)),
+      period:document.getElementById("s-ps-period")?document.getElementById("s-ps-period").value:"monthly",
+      freeTrialEnabled:document.getElementById("s-ps-freeTrialEnabled")?document.getElementById("s-ps-freeTrialEnabled").checked:false,
+      freeTrialTextAr:document.getElementById("s-ps-freeTrialTextAr")?document.getElementById("s-ps-freeTrialTextAr").value:"",
+      freeTrialTextEn:document.getElementById("s-ps-freeTrialTextEn")?document.getElementById("s-ps-freeTrialTextEn").value:""
+    },
+    driverSubscription:{
+      active:document.getElementById("s-ds-active")?document.getElementById("s-ds-active").checked:false,
+      price:Math.max(0,numberValue("s-ds-price",15)),
+      period:document.getElementById("s-ds-period")?document.getElementById("s-ds-period").value:"monthly",
+      freeTrialEnabled:document.getElementById("s-ds-freeTrialEnabled")?document.getElementById("s-ds-freeTrialEnabled").checked:false,
+      freeTrialTextAr:document.getElementById("s-ds-freeTrialTextAr")?document.getElementById("s-ds-freeTrialTextAr").value:"",
+      freeTrialTextEn:document.getElementById("s-ds-freeTrialTextEn")?document.getElementById("s-ds-freeTrialTextEn").value:""
+    }
   };
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
@@ -2220,6 +2768,238 @@ function updatePricingPreview(){
   prevEl.innerHTML=html;
 }
 
+var _bcSourceId=null;
+var _bcSending=false;
+var _bcHistoryData={};
+var _bcActionId=null;
+async function renderNotifications(c){
+  var data=await api("/broadcast-notifications/history");
+  var history=(data&&data.history)||[];
+  var audienceOptions=[
+    {value:"customer",label:t("audienceCustomers")},
+    {value:"provider",label:t("audienceProviders")},
+    {value:"driver",label:t("audienceDrivers")},
+    {value:"all",label:t("audienceAll")}
+  ];
+  var optHtml=audienceOptions.map(function(o){return'<option value="'+o.value+'">'+esc(o.label)+'</option>';}).join("");
+  _bcHistoryData={};
+  history.forEach(function(h){if(h&&h._id)_bcHistoryData[h._id]=h;});
+  var histRows=history.map(function(h){
+    var d=h.createdAt?new Date(h.createdAt).toLocaleString():"-";
+    var audMap={customer:t("audienceCustomers"),provider:t("audienceProviders"),driver:t("audienceDrivers"),all:t("audienceAll")};
+    var hid=h._id||"";
+    var reasons=h.failureReasons&&typeof h.failureReasons==="object"?Object.keys(h.failureReasons).map(function(code){var item=h.failureReasons[code]||{};return esc(code)+" ("+esc(String(item.count||0))+")"+(item.message?": "+esc(item.message):"");}).join("<br>"):"-";
+    return '<tr>'+
+      '<td style="font-size:12px;color:var(--text2)">'+esc(d)+'</td>'+
+      '<td><strong>'+esc(h.title||"-")+'</strong><div style="font-size:12px;color:var(--text2)">'+esc(h.message||"")+'</div></td>'+
+      '<td>'+esc(audMap[h.audience]||h.audience||"-")+'</td>'+
+      '<td style="text-align:center">'+esc(String(h.totalCandidateTokens||h.validTokensCount||0))+'</td>'+
+      '<td style="text-align:center">'+esc(String(h.validTokensCount||0))+'</td>'+
+      '<td style="text-align:center;color:var(--success)">'+esc(String(h.sentCount||0))+'</td>'+
+      '<td style="text-align:center;color:var(--error)">'+esc(String(h.failedCount||0))+'</td>'+
+      '<td style="text-align:center;color:var(--error)">'+esc(String((h.invalidTokensCount||0)+(h.staleTokensCount||0)))+'</td>'+
+      '<td style="font-size:11px;max-width:260px">'+reasons+'</td>'+
+      '<td style="white-space:nowrap">'+
+        '<button data-id="'+hid+'" class="btn btn-secondary" style="padding:4px 8px;font-size:11px;margin:2px" onclick="deleteNotification(this.dataset.id)">'+t("deleteNotif")+'</button>'+
+        '<button data-id="'+hid+'" class="btn btn-secondary" style="padding:4px 8px;font-size:11px;margin:2px" onclick="resendNotification(this.dataset.id)">'+t("resendNotif")+'</button>'+
+        '<button data-id="'+hid+'" class="btn btn-orange" style="padding:4px 8px;font-size:11px;margin:2px" onclick="editAndResend(this.dataset.id)">'+t("editResend")+'</button>'+
+      '</td>'+
+      '</tr>';
+  }).join("");
+  c.innerHTML=
+    '<h1 class="page-title">'+t("notifications")+'</h1>'+
+    '<div class="settings-section">'+
+    '<h3>'+t("broadcastSend")+'</h3>'+
+    '<div class="form-group"><label>'+t("broadcastTitle")+' *</label>'+
+    '<input type="text" id="bc-title" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px" placeholder="'+t("broadcastTitle")+'"></div>'+
+    '<div class="form-group"><label>'+t("broadcastMessage")+' *</label>'+
+    '<textarea id="bc-message" rows="4" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;resize:vertical" placeholder="'+t("broadcastMessage")+'"></textarea></div>'+
+    '<div class="form-group"><label>'+t("broadcastAudience")+' *</label>'+
+    '<select id="bc-audience" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px"><option value="">-- '+t("broadcastAudience")+' --</option>'+optHtml+'</select></div>'+
+    '<div id="bc-result" style="display:none;padding:12px;border-radius:8px;margin-bottom:12px"></div>'+
+    '<button id="bc-send-btn" class="btn btn-orange" onclick="confirmBroadcast()">'+t("broadcastSend")+'</button>'+
+    '</div>'+
+    '<div class="settings-section">'+
+    '<h3>'+t("broadcastHistory")+'</h3>'+
+    '<div class="table-wrap"><table>'+
+    '<thead><tr>'+
+    '<th>'+t("date")+'</th>'+
+    '<th>'+t("broadcastTitle")+'</th>'+
+    '<th>'+t("broadcastAudienceLabel")+'</th>'+
+    '<th>'+(lang==="ar"?"\u0627\u0644\u0645\u0631\u0634\u062D\u0629":"Candidates")+'</th>'+
+    '<th>'+t("broadcastTokens")+'</th>'+
+    '<th>'+t("broadcastSentCount")+'</th>'+
+    '<th>'+t("broadcastFailed")+'</th>'+
+    '<th>'+(lang==="ar"?"\u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629/\u0642\u062F\u064A\u0645\u0629":"Invalid/Stale")+'</th>'+
+    '<th>'+(lang==="ar"?"\u0633\u0628\u0628 \u0627\u0644\u0641\u0634\u0644":"Failure reason")+'</th>'+
+    '<th>'+t("actions")+'</th>'+
+    '</tr></thead>'+
+    '<tbody>'+(histRows||'<tr><td colspan="10" class="empty">'+t("noBroadcastHistory")+'</td></tr>')+'</tbody>'+
+    '</table></div>'+
+    '</div>';
+}
+function confirmBroadcast(){
+  var title=document.getElementById("bc-title")?document.getElementById("bc-title").value.trim():"";
+  var message=document.getElementById("bc-message")?document.getElementById("bc-message").value.trim():"";
+  var audience=document.getElementById("bc-audience")?document.getElementById("bc-audience").value:"";
+  var resultEl=document.getElementById("bc-result");
+  if(!title||!message||!audience){
+    if(resultEl){resultEl.style.display="block";resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=t("broadcastTitle")+" / "+t("broadcastMessage")+" / "+t("broadcastAudience");}
+    return;
+  }
+  var audMap={customer:t("audienceCustomers"),provider:t("audienceProviders"),driver:t("audienceDrivers"),all:t("audienceAll")};
+  openModal(
+    '<h3 style="margin-bottom:12px">'+t("broadcastConfirm")+'</h3>'+
+    '<p style="margin-bottom:8px">'+t("broadcastConfirmMsg")+'</p>'+
+    '<p><strong>'+t("broadcastTitle")+':</strong> '+esc(title)+'</p>'+
+    '<p style="margin-bottom:16px"><strong>'+t("broadcastAudienceLabel")+':</strong> '+esc(audMap[audience]||audience)+'</p>'+
+    '<div class="modal-actions">'+
+    '<button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> '+
+    '<button class="btn btn-orange" onclick="doSendBroadcast()">'+t("broadcastSend")+'</button>'+
+    '</div>'
+  );
+}
+async function doSendBroadcast(){
+  closeModal();
+  if(_bcSending)return;
+  _bcSending=true;
+  var sendBtn=document.getElementById("bc-send-btn");
+  if(sendBtn)sendBtn.disabled=true;
+  var title=document.getElementById("bc-title")?document.getElementById("bc-title").value.trim():"";
+  var message=document.getElementById("bc-message")?document.getElementById("bc-message").value.trim():"";
+  var audience=document.getElementById("bc-audience")?document.getElementById("bc-audience").value:"";
+  var resultEl=document.getElementById("bc-result");
+  if(resultEl){resultEl.style.display="block";resultEl.style.background="#eff6ff";resultEl.style.color="var(--info)";resultEl.textContent=t("loading");}
+  var payload={title:title,message:message,audience:audience};
+  if(_bcSourceId){payload.sourceNotificationId=_bcSourceId;payload.resendType="edited";}
+  var data=await api("/broadcast-notifications/send",{method:"POST",body:JSON.stringify(payload)});
+  _bcSending=false;
+  _bcSourceId=null;
+  if(sendBtn){sendBtn.disabled=false;sendBtn.textContent=t("broadcastSend");}
+  if(!data){if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=t("connectionError");}return;}
+  if(data.success){
+    if(resultEl){
+      resultEl.style.background="#f0fdf4";resultEl.style.color="var(--success)";
+      resultEl.innerHTML=
+        '<strong>'+t("broadcastResult")+'</strong><br>'+
+        t("broadcastMatched")+': <strong>'+esc(String(data.totalUsersMatched||0))+'</strong><br>'+
+        (lang==="ar"?"\u0627\u0644\u0631\u0645\u0648\u0632 \u0627\u0644\u0645\u0631\u0634\u062D\u0629":"Candidate tokens")+': <strong>'+esc(String(data.totalCandidateTokens||0))+'</strong><br>'+
+        t("broadcastTokens")+': <strong>'+esc(String(data.validTokensCount||0))+'</strong><br>'+
+        t("broadcastSentCount")+': <strong>'+esc(String(data.sentCount||0))+'</strong><br>'+
+        t("broadcastFailed")+': <strong>'+esc(String(data.failedCount||0))+'</strong><br>'+
+        (lang==="ar"?"\u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629/\u0642\u062F\u064A\u0645\u0629":"Invalid/Stale")+': <strong>'+esc(String((data.invalidTokensCount||0)+(data.staleTokensCount||0)))+'</strong><br>'+
+        formatFailureReasons(data.failureReasons);
+    }
+    if(document.getElementById("bc-title"))document.getElementById("bc-title").value="";
+    if(document.getElementById("bc-message"))document.getElementById("bc-message").value="";
+    if(document.getElementById("bc-audience"))document.getElementById("bc-audience").value="";
+    toast(t("broadcastResult"));
+    setTimeout(function(){navigate("notifications");},600);
+  }else{
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=data.error||t("broadcastFailed");}
+    toast(data.error||t("broadcastFailed"),"error");
+  }
+}
+function formatFailureReasons(reasons){
+  if(!reasons||typeof reasons!=="object"||!Object.keys(reasons).length)return "";
+  return Object.keys(reasons).map(function(code){var item=reasons[code]||{};return '<span style="font-size:12px">'+esc(code)+' ('+esc(String(item.count||0))+')'+(item.message?': '+esc(item.message):"")+'</span>';}).join("<br>");
+}
+function deleteNotification(id){
+  if(_bcSending)return;
+  var h=_bcHistoryData[id];
+  if(!h)return;
+  _bcActionId=id;
+  var audMap={customer:t("audienceCustomers"),provider:t("audienceProviders"),driver:t("audienceDrivers"),all:t("audienceAll")};
+  openModal(
+    '<h3 style="margin-bottom:12px">'+t("confirmDelete")+'</h3>'+
+    '<p style="margin-bottom:8px">'+t("confirmDeleteMsg")+'</p>'+
+    '<p><strong>'+t("broadcastTitle")+':</strong> '+esc(h.title||"-")+'</p>'+
+    '<p style="margin-bottom:16px"><strong>'+t("broadcastAudienceLabel")+':</strong> '+esc(audMap[h.audience]||h.audience||"-")+'</p>'+
+    '<div class="modal-actions">'+
+    '<button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> '+
+    '<button class="btn" style="background:#ef4444;color:#fff;padding:8px 16px" onclick="doDeleteNotification()">'+t("deleteNotif")+'</button>'+
+    '</div>'
+  );
+}
+async function doDeleteNotification(){
+  var id=_bcActionId;
+  closeModal();
+  if(!id)return;
+  _bcSending=true;
+  var data=await api("/broadcast-notifications/"+id,{method:"DELETE"});
+  _bcSending=false;
+  _bcActionId=null;
+  if(!data){toast(t("connectionError"),"error");return;}
+  if(data.success){toast(t("notifDeleted"));setTimeout(function(){navigate("notifications");},400);}
+  else{toast(data.error||t("deleteFailed"),"error");}
+}
+function resendNotification(id){
+  if(_bcSending)return;
+  var h=_bcHistoryData[id];
+  if(!h)return;
+  _bcActionId=id;
+  var audMap={customer:t("audienceCustomers"),provider:t("audienceProviders"),driver:t("audienceDrivers"),all:t("audienceAll")};
+  openModal(
+    '<h3 style="margin-bottom:12px">'+t("confirmResend")+'</h3>'+
+    '<p style="margin-bottom:8px">'+t("confirmResendMsg")+'</p>'+
+    '<p><strong>'+t("broadcastTitle")+':</strong> '+esc(h.title||"-")+'</p>'+
+    '<p style="margin-bottom:16px"><strong>'+t("broadcastAudienceLabel")+':</strong> '+esc(audMap[h.audience]||h.audience||"-")+'</p>'+
+    '<div class="modal-actions">'+
+    '<button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> '+
+    '<button class="btn btn-orange" onclick="doResendNotification()">'+t("resendNotif")+'</button>'+
+    '</div>'
+  );
+}
+async function doResendNotification(){
+  var id=_bcActionId;
+  closeModal();
+  if(!id||_bcSending)return;
+  _bcSending=true;
+  var sendBtn=document.getElementById("bc-send-btn");
+  if(sendBtn)sendBtn.disabled=true;
+  var resultEl=document.getElementById("bc-result");
+  if(resultEl){resultEl.style.display="block";resultEl.style.background="#eff6ff";resultEl.style.color="var(--info)";resultEl.textContent=t("loading");}
+  var data=await api("/broadcast-notifications/"+id+"/resend",{method:"POST",body:JSON.stringify({})});
+  _bcSending=false;
+  _bcActionId=null;
+  if(sendBtn)sendBtn.disabled=false;
+  if(!data){if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=t("connectionError");}return;}
+  if(data.success){
+    if(resultEl){
+      resultEl.style.background="#f0fdf4";resultEl.style.color="var(--success)";
+      resultEl.innerHTML=
+        '<strong>'+t("broadcastResult")+'</strong><br>'+
+        t("broadcastMatched")+': <strong>'+esc(String(data.totalUsersMatched||0))+'</strong><br>'+
+        (lang==="ar"?"\u0627\u0644\u0631\u0645\u0648\u0632 \u0627\u0644\u0645\u0631\u0634\u062D\u0629":"Candidate tokens")+': <strong>'+esc(String(data.totalCandidateTokens||0))+'</strong><br>'+
+        t("broadcastTokens")+': <strong>'+esc(String(data.validTokensCount||0))+'</strong><br>'+
+        t("broadcastSentCount")+': <strong>'+esc(String(data.sentCount||0))+'</strong><br>'+
+        t("broadcastFailed")+': <strong>'+esc(String(data.failedCount||0))+'</strong><br>'+
+        (lang==="ar"?"\u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629/\u0642\u062F\u064A\u0645\u0629":"Invalid/Stale")+': <strong>'+esc(String((data.invalidTokensCount||0)+(data.staleTokensCount||0)))+'</strong><br>'+
+        formatFailureReasons(data.failureReasons);
+    }
+    toast(t("resendSuccess"));
+    setTimeout(function(){navigate("notifications");},600);
+  }else{
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=data.error||t("resendFailed");}
+    toast(data.error||t("resendFailed"),"error");
+  }
+}
+function editAndResend(id){
+  if(_bcSending)return;
+  var h=_bcHistoryData[id];
+  if(!h)return;
+  _bcSourceId=id;
+  var titleEl=document.getElementById("bc-title");
+  var msgEl=document.getElementById("bc-message");
+  var audEl=document.getElementById("bc-audience");
+  var sendBtn=document.getElementById("bc-send-btn");
+  if(titleEl)titleEl.value=h.title||"";
+  if(msgEl)msgEl.value=h.message||"";
+  if(audEl)audEl.value=h.audience||"";
+  if(sendBtn)sendBtn.textContent=t("editResendSend");
+  if(titleEl)titleEl.scrollIntoView({behavior:"smooth",block:"center"});
+}
+
 if(lang==="ar"){document.documentElement.dir="rtl";document.documentElement.lang="ar";}
 else{document.documentElement.dir="ltr";document.documentElement.lang="en";}
 updateStaticLabels();
@@ -2232,703 +3012,902 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
 <\/script>
 </body>
 </html>`;
-  }
-  __name(getAdminHTML, "getAdminHTML");
-  addEventListener("fetch", (event) => {
-    event.respondWith(handleRequest(event.request, event));
-  });
-  async function handleRequest(request) {
-    const env = typeof globalThis !== "undefined" ? globalThis : {};
-    try {
-      if (typeof FIREBASE_CLIENT_EMAIL !== "undefined") env.FIREBASE_CLIENT_EMAIL = FIREBASE_CLIENT_EMAIL;
-    } catch {
     }
-    try {
-      if (typeof FIREBASE_PRIVATE_KEY !== "undefined") env.FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY;
-    } catch {
-    }
-    try {
-      if (typeof API_KEY !== "undefined") env.API_KEY = API_KEY;
-    } catch {
-    }
-    try {
-      if (typeof WATHQ_API_KEY !== "undefined") env.WATHQ_API_KEY = WATHQ_API_KEY;
-    } catch {
-    }
-    try {
-      if (typeof ADMIN_PASSWORD !== "undefined") env.ADMIN_PASSWORD = ADMIN_PASSWORD;
-    } catch {
-    }
-    try {
-      if (typeof ADMIN_TOKEN_SECRET !== "undefined") env.ADMIN_TOKEN_SECRET = ADMIN_TOKEN_SECRET;
-    } catch {
-    }
-    try {
-      if (typeof CLOUDINARY_CLOUD_NAME !== "undefined") env.CLOUDINARY_CLOUD_NAME = CLOUDINARY_CLOUD_NAME;
-    } catch {
-    }
-    try {
-      if (typeof CLOUDINARY_API_KEY !== "undefined") env.CLOUDINARY_API_KEY = CLOUDINARY_API_KEY;
-    } catch {
-    }
-    try {
-      if (typeof CLOUDINARY_API_SECRET !== "undefined") env.CLOUDINARY_API_SECRET = CLOUDINARY_API_SECRET;
-    } catch {
-    }
-    try {
-      if (typeof EMAIL_API_KEY !== "undefined") env.EMAIL_API_KEY = EMAIL_API_KEY;
-    } catch {
-    }
-    try {
-      if (typeof EMAIL_FROM !== "undefined") env.EMAIL_FROM = EMAIL_FROM;
-    } catch {
-    }
-    const url = new URL(request.url);
-    const path = url.pathname;
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, x-api-key, Authorization"
-        }
-      });
-    }
-    if (path === "/" && request.method === "GET") {
-      return Response.json({ status: "ok", service: "tabbakheen-api", version: "2.2.0", admin: true, pdf: true, deliveryPricingAdmin: true });
-    }
-    if (path === "/admin" || path === "/admin/") {
-      return new Response(getAdminHTML(), {
-        headers: { "Content-Type": "text/html;charset=UTF-8" }
-      });
-    }
-    const invoiceViewMatch = path.match(/^\/admin\/invoice\/([^/]+)$/);
-    if (invoiceViewMatch && request.method === "GET") {
-      const invoiceId = invoiceViewMatch[1];
-      const signedToken = url.searchParams.get("token");
-      const valid = await verifySignedInvoiceToken(signedToken, invoiceId, env);
-      if (!valid) {
-        return new Response("Unauthorized - invalid or expired invoice token", { status: 401 });
+    __name(getAdminHTML, "getAdminHTML");
+    __name2(getAdminHTML, "getAdminHTML");
+    addEventListener("fetch", (event) => {
+      event.respondWith(handleRequest(event.request, event));
+    });
+    async function handleRequest(request) {
+      const env = typeof globalThis !== "undefined" ? globalThis : {};
+      try {
+        if (typeof FIREBASE_CLIENT_EMAIL !== "undefined") env.FIREBASE_CLIENT_EMAIL = FIREBASE_CLIENT_EMAIL;
+      } catch {
       }
       try {
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        const invoice = await getFirestoreDoc("invoices", invoiceId, accessToken);
-        if (!invoice) {
-          return new Response("Invoice not found", { status: 404 });
-        }
-        const invoiceLang = url.searchParams.get("lang") || "ar";
-        const html = generateInvoiceHTML(invoice, invoiceLang);
-        return new Response(html, {
+        if (typeof FIREBASE_PRIVATE_KEY !== "undefined") env.FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY;
+      } catch {
+      }
+      try {
+        if (typeof API_KEY !== "undefined") env.API_KEY = API_KEY;
+      } catch {
+      }
+      try {
+        if (typeof WATHQ_API_KEY !== "undefined") env.WATHQ_API_KEY = WATHQ_API_KEY;
+      } catch {
+      }
+      try {
+        if (typeof ADMIN_PASSWORD !== "undefined") env.ADMIN_PASSWORD = ADMIN_PASSWORD;
+      } catch {
+      }
+      try {
+        if (typeof ADMIN_TOKEN_SECRET !== "undefined") env.ADMIN_TOKEN_SECRET = ADMIN_TOKEN_SECRET;
+      } catch {
+      }
+      try {
+        if (typeof CLOUDINARY_CLOUD_NAME !== "undefined") env.CLOUDINARY_CLOUD_NAME = CLOUDINARY_CLOUD_NAME;
+      } catch {
+      }
+      try {
+        if (typeof CLOUDINARY_API_KEY !== "undefined") env.CLOUDINARY_API_KEY = CLOUDINARY_API_KEY;
+      } catch {
+      }
+      try {
+        if (typeof CLOUDINARY_API_SECRET !== "undefined") env.CLOUDINARY_API_SECRET = CLOUDINARY_API_SECRET;
+      } catch {
+      }
+      try {
+        if (typeof EMAIL_API_KEY !== "undefined") env.EMAIL_API_KEY = EMAIL_API_KEY;
+      } catch {
+      }
+      try {
+        if (typeof EMAIL_FROM !== "undefined") env.EMAIL_FROM = EMAIL_FROM;
+      } catch {
+      }
+      const url = new URL(request.url);
+      const path = url.pathname;
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, x-api-key, Authorization"
+          }
+        });
+      }
+      if (path === "/" && request.method === "GET") {
+        return Response.json({ status: "ok", service: "tabbakheen-api", version: "2.2.0", admin: true, pdf: true, deliveryPricingAdmin: true });
+      }
+      if (path === "/admin" || path === "/admin/") {
+        return new Response(getAdminHTML(), {
           headers: { "Content-Type": "text/html;charset=UTF-8" }
         });
-      } catch (e) {
-        return new Response("Error: " + e.message, { status: 500 });
       }
-    }
-    const invoicePdfMatch = path.match(/^\/admin\/invoice\/([^/]+)\/pdf$/);
-    if (invoicePdfMatch && request.method === "GET") {
-      const invoiceId = invoicePdfMatch[1];
-      const signedToken = url.searchParams.get("token");
-      const valid = await verifySignedInvoiceToken(signedToken, invoiceId, env);
-      if (!valid) {
-        return new Response("Unauthorized - invalid or expired invoice token", { status: 401 });
-      }
-      try {
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        const invoice = await getFirestoreDoc("invoices", invoiceId, accessToken);
-        if (!invoice) {
-          return new Response("Invoice not found", { status: 404 });
-        }
-        const invoiceLang = url.searchParams.get("lang") || "ar";
-        const pdfBytes = generatePDFBytes(invoice, invoiceLang);
-        const filename = "invoice-" + (invoice.invoiceNumber || invoiceId) + ".pdf";
-        return new Response(pdfBytes, {
-          headers: {
-            "Content-Type": "application/pdf",
-            "Content-Disposition": 'attachment; filename="' + filename + '"',
-            "Content-Length": String(pdfBytes.length)
-          }
-        });
-      } catch (e) {
-        console.error("[Invoice PDF] Error:", e);
-        return new Response("Error generating PDF: " + e.message, { status: 500 });
-      }
-    }
-    if (path === "/admin/api/login" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        if (!body.password) {
-          return jsonResponse({ error: "Password required" }, 401);
-        }
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        const valid = await verifyAdminPassword(body.password, env, accessToken);
+      const invoiceViewMatch = path.match(/^\/admin\/invoice\/([^/]+)$/);
+      if (invoiceViewMatch && request.method === "GET") {
+        const invoiceId = invoiceViewMatch[1];
+        const signedToken = url.searchParams.get("token");
+        const valid = await verifySignedInvoiceToken(signedToken, invoiceId, env);
         if (!valid) {
-          return jsonResponse({ error: "Invalid password" }, 401);
+          return new Response("Unauthorized - invalid or expired invoice token", { status: 401 });
         }
-        const token = await createAdminToken(env);
-        console.log("[Admin] Login successful");
-        return jsonResponse({ success: true, token });
-      } catch (e) {
-        console.error("[Admin] Login error:", e);
-        return jsonResponse({ error: "Login failed: " + e.message }, 500);
-      }
-    }
-    if (path.startsWith("/admin/api/")) {
-      const token = getTokenFromRequest(request);
-      const valid = await verifyAdminToken(token, env);
-      if (!valid) {
-        return jsonResponse({ error: "Unauthorized" }, 401);
-      }
-      try {
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        if (path === "/admin/api/stats" && request.method === "GET") {
-          const [users, orders, offers] = await Promise.all([
-            listAllUsers(accessToken),
-            listAllOrders(accessToken),
-            listAllOffers(accessToken)
-          ]);
-          const stats = {
-            totalUsers: users.length,
-            customers: users.filter((u) => u.role === "customer").length,
-            providers: users.filter((u) => u.role === "provider").length,
-            drivers: users.filter((u) => u.role === "driver").length,
-            providersInTrial: users.filter((u) => u.role === "provider" && (u.accountStatus === "trial" || u.subscriptionStatus === "trialing")).length,
-            driversInTrial: users.filter((u) => u.role === "driver" && (u.accountStatus === "trial" || u.subscriptionStatus === "trialing")).length,
-            suspendedAccounts: users.filter((u) => u.accountStatus === "suspended" || u.accountStatus === "disabled").length,
-            activeSubscriptions: users.filter((u) => u.subscriptionStatus === "active").length
-          };
-          return jsonResponse({ success: true, stats, users, orders, offers });
-        }
-        if (path === "/admin/api/users" && request.method === "GET") {
-          const users = await listAllUsers(accessToken);
-          return jsonResponse({ success: true, users });
-        }
-        const userUpdateMatch = path.match(/^\/admin\/api\/users\/([^/]+)\/update$/);
-        if (userUpdateMatch && request.method === "POST") {
-          const uid = userUpdateMatch[1];
-          const body = await request.json();
-          const allowed = [
-            "accountStatus",
-            "subscriptionStatus",
-            "subscriptionPlan",
-            "trialEndsAt",
-            "subscriptionEndsAt",
-            "activatedByAdmin",
-            "disabledReason",
-            "approvedByAdmin",
-            "isApproved",
-            "disabledAt",
-            "subscriptionMeta"
-          ];
-          const fields = {};
-          for (const key of allowed) {
-            if (key in body) fields[key] = body[key];
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const invoice = await getFirestoreDoc("invoices", invoiceId, accessToken);
+          if (!invoice) {
+            return new Response("Invoice not found", { status: 404 });
           }
-          if (Object.keys(fields).length === 0) {
-            return jsonResponse({ error: "No valid fields" }, 400);
-          }
-          await updateFirestoreDocument("users", uid, fields, accessToken);
-          return jsonResponse({ success: true, updated: Object.keys(fields) });
+          const invoiceLang = url.searchParams.get("lang") || "ar";
+          const html = generateInvoiceHTML(invoice, invoiceLang);
+          return new Response(html, {
+            headers: { "Content-Type": "text/html;charset=UTF-8" }
+          });
+        } catch (e) {
+          return new Response("Error: " + e.message, { status: 500 });
         }
-        if (path === "/admin/api/verification" && request.method === "GET") {
-          const users = await listAllUsers(accessToken);
-          const providers = users.filter((u) => u.role === "provider");
-          const items = [];
-          for (const u of providers) {
-            let verification = null;
-            try {
-              verification = await getFirestoreDoc("verifications", u._id, accessToken);
-            } catch (e) {
-              verification = null;
+      }
+      const invoicePdfMatch = path.match(/^\/admin\/invoice\/([^/]+)\/pdf$/);
+      if (invoicePdfMatch && request.method === "GET") {
+        const invoiceId = invoicePdfMatch[1];
+        const signedToken = url.searchParams.get("token");
+        const valid = await verifySignedInvoiceToken(signedToken, invoiceId, env);
+        if (!valid) {
+          return new Response("Unauthorized - invalid or expired invoice token", { status: 401 });
+        }
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const invoice = await getFirestoreDoc("invoices", invoiceId, accessToken);
+          if (!invoice) {
+            return new Response("Invoice not found", { status: 404 });
+          }
+          const invoiceLang = url.searchParams.get("lang") || "ar";
+          const pdfBytes = generatePDFBytes(invoice, invoiceLang);
+          const filename = "invoice-" + (invoice.invoiceNumber || invoiceId) + ".pdf";
+          return new Response(pdfBytes, {
+            headers: {
+              "Content-Type": "application/pdf",
+              "Content-Disposition": 'attachment; filename="' + filename + '"',
+              "Content-Length": String(pdfBytes.length)
             }
-            items.push({
-              uid: u._id,
-              displayName: u.displayName || "",
-              email: u.email || "",
-              phone: u.phone || "",
-              verificationStatus: u.verificationStatus || "none",
-              verificationSource: u.verificationSource || "",
-              verifiedAt: u.verifiedAt || "",
-              verification
-            });
+          });
+        } catch (e) {
+          console.error("[Invoice PDF] Error:", e);
+          return new Response("Error generating PDF: " + e.message, { status: 500 });
+        }
+      }
+      if (path === "/admin/api/login" && request.method === "POST") {
+        try {
+          const body = await request.json();
+          if (!body.password) {
+            return jsonResponse({ error: "Password required" }, 401);
           }
-          return jsonResponse({ success: true, items });
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const valid = await verifyAdminPassword(body.password, env, accessToken);
+          if (!valid) {
+            return jsonResponse({ error: "Invalid password" }, 401);
+          }
+          const token = await createAdminToken(env);
+          console.log("[Admin] Login successful");
+          return jsonResponse({ success: true, token });
+        } catch (e) {
+          console.error("[Admin] Login error:", e);
+          return jsonResponse({ error: "Login failed: " + e.message }, 500);
         }
-        const flApproveMatch = path.match(/^\/admin\/api\/verification\/freelance\/([^/]+)\/approve$/);
-        if (flApproveMatch && request.method === "POST") {
-          const uid = flApproveMatch[1];
-          const now = (/* @__PURE__ */ new Date()).toISOString();
-          const vdoc = await getFirestoreDoc("verifications", uid, accessToken);
-          const fc = vdoc && vdoc.freelanceCertificate ? vdoc.freelanceCertificate : {};
-          fc.reviewStatus = "approved";
-          fc.reviewedAt = now;
-          await updateFirestoreDocument("verifications", uid, { freelanceCertificate: fc }, accessToken);
-          await updateFirestoreDocument("users", uid, {
-            verificationStatus: "verified",
-            verificationSource: "freelance_certificate",
-            verifiedAt: now
-          }, accessToken);
-          return jsonResponse({ success: true });
+      }
+      if (path.startsWith("/admin/api/")) {
+        const token = getTokenFromRequest(request);
+        const valid = await verifyAdminToken(token, env);
+        if (!valid) {
+          return jsonResponse({ error: "Unauthorized" }, 401);
         }
-        const flRejectMatch = path.match(/^\/admin\/api\/verification\/freelance\/([^/]+)\/reject$/);
-        if (flRejectMatch && request.method === "POST") {
-          const uid = flRejectMatch[1];
-          const now = (/* @__PURE__ */ new Date()).toISOString();
-          let note = "";
-          try {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (path === "/admin/api/stats" && request.method === "GET") {
+            const [users, orders, offers] = await Promise.all([
+              listAllUsers(accessToken),
+              listAllOrders(accessToken),
+              listAllOffers(accessToken)
+            ]);
+            const stats = {
+              totalUsers: users.length,
+              customers: users.filter((u) => u.role === "customer").length,
+              providers: users.filter((u) => u.role === "provider").length,
+              drivers: users.filter((u) => u.role === "driver").length,
+              providersInTrial: users.filter((u) => u.role === "provider" && (u.accountStatus === "trial" || u.subscriptionStatus === "trialing")).length,
+              driversInTrial: users.filter((u) => u.role === "driver" && (u.accountStatus === "trial" || u.subscriptionStatus === "trialing")).length,
+              suspendedAccounts: users.filter((u) => u.accountStatus === "suspended" || u.accountStatus === "disabled").length,
+              activeSubscriptions: users.filter((u) => u.subscriptionStatus === "active").length
+            };
+            return jsonResponse({ success: true, stats, users, orders, offers });
+          }
+          if (path === "/admin/api/users" && request.method === "GET") {
+            const users = await listAllUsers(accessToken);
+            return jsonResponse({ success: true, users });
+          }
+          if (path === "/admin/api/complaints" && request.method === "GET") {
+            const complaints = await listAllComplaints(accessToken);
+            const users = await listAllUsers(accessToken);
+            const userMap = {};
+            for (const user of users) {
+              if (user && user._id) userMap[user._id] = {
+                uid: user._id,
+                displayName: user.displayName || "",
+                email: user.email || "",
+                phone: user.phone || ""
+              };
+            }
+            const enriched = complaints.map((complaint) => {
+              const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
+              return {
+                ...complaint,
+                customer: person(complaint.customerUid),
+                provider: person(complaint.providerUid),
+                driver: person(complaint.driverUid),
+                id: complaint._id || complaint.id
+              };
+            }).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+            return jsonResponse({ success: true, complaints: enriched });
+          }
+          const complaintDetailMatch = path.match(/^\/admin\/api\/complaints\/([^/]+)$/);
+          if (complaintDetailMatch && request.method === "GET") {
+            const complaintId = decodeURIComponent(complaintDetailMatch[1]);
+            const complaint = await getFirestoreDoc("delivery_complaints", complaintId, accessToken);
+            if (!complaint) return jsonResponse({ error: "Complaint not found" }, 404);
+            const users = await listAllUsers(accessToken);
+            const userMap = {};
+            for (const user of users) {
+              if (user && user._id) userMap[user._id] = { uid: user._id, displayName: user.displayName || "", email: user.email || "", phone: user.phone || "" };
+            }
+            const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
+            return jsonResponse({ success: true, complaint: {
+              ...complaint,
+              id: complaint._id || complaint.id || complaintId,
+              customer: person(complaint.customerUid),
+              provider: person(complaint.providerUid),
+              driver: person(complaint.driverUid)
+            } });
+          }
+          const complaintUpdateMatch = path.match(/^\/admin\/api\/complaints\/([^/]+)\/update$/);
+          if (complaintUpdateMatch && request.method === "POST") {
+            const complaintId = decodeURIComponent(complaintUpdateMatch[1]);
             const body = await request.json();
-            note = String(body && body.note ? body.note : "").slice(0, 500);
-          } catch (e) {
-            note = "";
+            const fields = {};
+            if ("complaintStatus" in body) {
+              const complaintStatus = String(body.complaintStatus || "");
+              if (!["pending", "resolved", "closed"].includes(complaintStatus)) return jsonResponse({ error: "Invalid complaint status" }, 400);
+              fields.complaintStatus = complaintStatus;
+            }
+            if ("adminNote" in body) fields.adminNote = String(body.adminNote || "").slice(0, 4e3);
+            if (Object.keys(fields).length === 0) return jsonResponse({ error: "No valid complaint fields" }, 400);
+            fields.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+            await updateFirestoreDocument("delivery_complaints", complaintId, fields, accessToken);
+            return jsonResponse({ success: true, updated: Object.keys(fields) });
           }
-          const vdoc = await getFirestoreDoc("verifications", uid, accessToken);
-          const fc = vdoc && vdoc.freelanceCertificate ? vdoc.freelanceCertificate : {};
-          fc.reviewStatus = "rejected";
-          fc.reviewedAt = now;
-          fc.internalReviewNote = note;
-          await updateFirestoreDocument("verifications", uid, { freelanceCertificate: fc }, accessToken);
-          const udoc = await getFirestoreDoc("users", uid, accessToken);
-          const curSource = udoc && udoc.verificationSource ? udoc.verificationSource : "";
-          const curStatus = udoc && udoc.verificationStatus ? udoc.verificationStatus : "";
-          if (curSource === "freelance_certificate" || curStatus === "pending_review") {
+          const userUpdateMatch = path.match(/^\/admin\/api\/users\/([^/]+)\/update$/);
+          if (userUpdateMatch && request.method === "POST") {
+            const uid = userUpdateMatch[1];
+            const body = await request.json();
+            const allowed = [
+              "accountStatus",
+              "subscriptionStatus",
+              "subscriptionPlan",
+              "trialEndsAt",
+              "subscriptionEndsAt",
+              "activatedByAdmin",
+              "disabledReason",
+              "approvedByAdmin",
+              "isApproved",
+              "disabledAt",
+              "subscriptionMeta"
+            ];
+            const fields = {};
+            for (const key of allowed) {
+              if (key in body) fields[key] = body[key];
+            }
+            if (Object.keys(fields).length === 0) {
+              return jsonResponse({ error: "No valid fields" }, 400);
+            }
+            await updateFirestoreDocument("users", uid, fields, accessToken);
+            return jsonResponse({ success: true, updated: Object.keys(fields) });
+          }
+          if (path === "/admin/api/verification" && request.method === "GET") {
+            const users = await listAllUsers(accessToken);
+            const providers = users.filter((u) => u.role === "provider");
+            const items = [];
+            for (const u of providers) {
+              let verification = null;
+              try {
+                verification = await getFirestoreDoc("verifications", u._id, accessToken);
+              } catch (e) {
+                verification = null;
+              }
+              items.push({
+                uid: u._id,
+                displayName: u.displayName || "",
+                email: u.email || "",
+                phone: u.phone || "",
+                verificationStatus: u.verificationStatus || "none",
+                verificationSource: u.verificationSource || "",
+                verifiedAt: u.verifiedAt || "",
+                verification
+              });
+            }
+            return jsonResponse({ success: true, items });
+          }
+          const flApproveMatch = path.match(/^\/admin\/api\/verification\/freelance\/([^/]+)\/approve$/);
+          if (flApproveMatch && request.method === "POST") {
+            const uid = flApproveMatch[1];
+            const now = (/* @__PURE__ */ new Date()).toISOString();
+            const vdoc = await getFirestoreDoc("verifications", uid, accessToken);
+            const fc = vdoc && vdoc.freelanceCertificate ? vdoc.freelanceCertificate : {};
+            fc.reviewStatus = "approved";
+            fc.reviewedAt = now;
+            await updateFirestoreDocument("verifications", uid, { freelanceCertificate: fc }, accessToken);
             await updateFirestoreDocument("users", uid, {
-              verificationStatus: "unverified",
-              verificationSource: ""
-            }, accessToken);
-          }
-          return jsonResponse({ success: true });
-        }
-        if (path === "/admin/api/settings" && request.method === "GET") {
-          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-          return jsonResponse({ success: true, settings: settings || {} });
-        }
-        if (path === "/admin/api/settings" && request.method === "POST") {
-          const body = await request.json();
-          const allowedSettings = [
-            "bannerImageUrl",
-            "bannerEnabled",
-            "supportEmail",
-            "supportWhatsapp",
-            "deliveryPricing",
-            "defaultLanguage",
-            "subscriptionWarningDays",
-            "notifyOnNewUser",
-            "notifyOnNewProvider",
-            "notifyOnNewDriver",
-            "notifyOnCrVerification",
-            "notifyOnFreelanceRequest"
-          ];
-          const fields = {};
-          for (const key of allowedSettings) {
-            if (key in body) fields[key] = body[key];
-          }
-          if (Object.keys(fields).length === 0) {
-            return jsonResponse({ error: "No valid settings fields" }, 400);
-          }
-          await updateFirestoreDocument("app_settings", "main", fields, accessToken);
-          return jsonResponse({ success: true, updated: Object.keys(fields) });
-        }
-        if (path === "/admin/api/upload-banner" && request.method === "POST") {
-          try {
-            const body = await request.json();
-            if (!body.image) {
-              return jsonResponse({ error: "No image data provided" }, 400);
-            }
-            const result = await uploadToCloudinary(body.image, "tabbakheen/banners", env);
-            await updateFirestoreDocument("app_settings", "main", {
-              bannerImageUrl: result.secure_url
-            }, accessToken);
-            return jsonResponse({ success: true, url: result.secure_url });
-          } catch (e) {
-            console.error("[Admin] Banner upload error:", e);
-            return jsonResponse({ error: e.message || "Upload failed" }, 500);
-          }
-        }
-        if (path === "/admin/api/change-password" && request.method === "POST") {
-          try {
-            const body = await request.json();
-            if (!body.currentPassword || !body.newPassword) {
-              return jsonResponse({ error: "Current and new password required" }, 400);
-            }
-            const validPw = await verifyAdminPassword(body.currentPassword, env, accessToken);
-            if (!validPw) {
-              return jsonResponse({ error: "Current password is incorrect" }, 401);
-            }
-            const newHash = await hashPassword(body.newPassword);
-            await updateFirestoreDocument("app_config", "admin", {
-              passwordHash: newHash,
-              updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+              verificationStatus: "verified",
+              verificationSource: "freelance_certificate",
+              verifiedAt: now
             }, accessToken);
             return jsonResponse({ success: true });
-          } catch (e) {
-            return jsonResponse({ error: e.message || "Failed" }, 500);
           }
-        }
-        if (path === "/admin/api/invoices" && request.method === "GET") {
-          const invoices = await listAllInvoices(accessToken);
-          return jsonResponse({ success: true, invoices });
-        }
-        if (path === "/admin/api/invoices" && request.method === "POST") {
-          try {
-            const invoice = await request.json();
-            const invoiceId = "inv_" + Date.now();
-            invoice.status = "issued";
-            await createFirestoreDocument("invoices", invoiceId, invoice, accessToken);
-            console.log("[Admin] Invoice created:", invoiceId);
-            return jsonResponse({ success: true, invoiceId });
-          } catch (e) {
-            return jsonResponse({ error: e.message }, 500);
-          }
-        }
-        const invoiceTokenMatch = path.match(/^\/admin\/api\/invoices\/([^/]+)\/token$/);
-        if (invoiceTokenMatch && request.method === "GET") {
-          const invoiceId = invoiceTokenMatch[1];
-          const signedToken = await createSignedInvoiceToken(invoiceId, env);
-          return jsonResponse({ success: true, token: signedToken });
-        }
-        const invoiceEmailMatch = path.match(/^\/admin\/api\/invoices\/([^/]+)\/email$/);
-        if (invoiceEmailMatch && request.method === "POST") {
-          try {
-            const invoiceId = invoiceEmailMatch[1];
-            const body = await request.json();
-            const invoiceLang = body.lang || "ar";
-            const invoice = await getFirestoreDoc("invoices", invoiceId, accessToken);
-            if (!invoice) {
-              return jsonResponse({ error: "Invoice not found" }, 404);
+          const flRejectMatch = path.match(/^\/admin\/api\/verification\/freelance\/([^/]+)\/reject$/);
+          if (flRejectMatch && request.method === "POST") {
+            const uid = flRejectMatch[1];
+            const now = (/* @__PURE__ */ new Date()).toISOString();
+            let note = "";
+            try {
+              const body = await request.json();
+              note = String(body && body.note ? body.note : "").slice(0, 500);
+            } catch (e) {
+              note = "";
             }
-            if (!invoice.userEmail) {
-              return jsonResponse({ error: "No email address for this invoice recipient" }, 400);
-            }
-            const isAr = invoiceLang === "ar";
-            const subject = isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 - \u0637\u0628\u0627\u062E\u064A\u0646 #" + (invoice.invoiceNumber || invoiceId) : "Subscription Invoice - Tabbakheen #" + (invoice.invoiceNumber || invoiceId);
-            const emailHtml = generateInvoiceEmailHTML(invoice, invoiceLang);
-            const result = await sendEmail(invoice.userEmail, subject, emailHtml, env);
-            if (result.sent) {
-              await updateFirestoreDocument("invoices", invoiceId, {
-                emailSentAt: (/* @__PURE__ */ new Date()).toISOString(),
-                emailSentTo: invoice.userEmail
+            const vdoc = await getFirestoreDoc("verifications", uid, accessToken);
+            const fc = vdoc && vdoc.freelanceCertificate ? vdoc.freelanceCertificate : {};
+            fc.reviewStatus = "rejected";
+            fc.reviewedAt = now;
+            fc.internalReviewNote = note;
+            await updateFirestoreDocument("verifications", uid, { freelanceCertificate: fc }, accessToken);
+            const udoc = await getFirestoreDoc("users", uid, accessToken);
+            const curSource = udoc && udoc.verificationSource ? udoc.verificationSource : "";
+            const curStatus = udoc && udoc.verificationStatus ? udoc.verificationStatus : "";
+            if (curSource === "freelance_certificate" || curStatus === "pending_review") {
+              await updateFirestoreDocument("users", uid, {
+                verificationStatus: "unverified",
+                verificationSource: ""
               }, accessToken);
             }
-            return jsonResponse({ success: result.sent, emailId: result.id, reason: result.reason });
-          } catch (e) {
-            return jsonResponse({ error: e.message }, 500);
+            return jsonResponse({ success: true });
           }
-        }
-        if (path === "/admin/api/send-reminder" && request.method === "POST") {
-          try {
+          if (path === "/admin/api/settings" && request.method === "GET") {
+            const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+            return jsonResponse({ success: true, settings: settings || {} });
+          }
+          if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
-            const uid = body.uid;
-            if (!uid) return jsonResponse({ error: "Missing uid" }, 400);
-            const user = await getFirestoreDoc("users", uid, accessToken);
-            if (!user) return jsonResponse({ error: "User not found" }, 404);
-            const endDate = user.subscriptionEndsAt || user.trialEndsAt;
-            const daysLeft = endDate ? Math.ceil((new Date(endDate) - Date.now()) / (1e3 * 60 * 60 * 24)) : 0;
-            const name = user.displayName || "";
-            const pushToken = user.expoPushToken;
-            if (pushToken && isExpoPushToken(pushToken)) {
-              await sendExpoPush([{
-                to: pushToken,
-                title: "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
-                body: "\u0647\u0644\u0627 " + name + "\n\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F " + daysLeft + " \u0623\u064A\u0627\u0645",
-                data: { type: "subscription_reminder" },
-                sound: "default"
-              }]);
+            if ("supportWhatsapp" in body) {
+              const normalizedWhatsapp = normalizeSaudiWhatsApp(body.supportWhatsapp);
+              if (normalizedWhatsapp === null) {
+                return jsonResponse({ error: "Support WhatsApp must be a Saudi number such as 9665XXXXXXXX or +9665XXXXXXXX" }, 400);
+              }
+              body.supportWhatsapp = normalizedWhatsapp;
             }
-            if (user.email) {
-              const emailHtml = '<div dir="rtl" style="font-family:sans-serif;padding:20px;max-width:500px;margin:0 auto"><h2 style="color:#e8722a">\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643</h2><p>\u0647\u0644\u0627 ' + name + "</p><p>\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F <strong>" + daysLeft + '</strong> \u0623\u064A\u0627\u0645.</p><p>\u062C\u062F\u062F \u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u062D\u062A\u0649 \u064A\u0633\u062A\u0645\u0631 \u0638\u0647\u0648\u0631 \u062D\u0633\u0627\u0628\u0643 \u0648\u0627\u0633\u062A\u0642\u0628\u0627\u0644 \u0627\u0644\u0637\u0644\u0628\u0627\u062A / \u0627\u0644\u062A\u0648\u0635\u064A\u0644\u0627\u062A.</p><p style="margin-top:20px;color:#666">\u0641\u0631\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646</p></div>';
-              await sendEmail(user.email, "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643", emailHtml, env);
+            const allowedSettings = [
+              "bannerImageUrl",
+              "bannerEnabled",
+              "supportEmail",
+              "supportWhatsapp",
+              "deliveryPricing",
+              "defaultLanguage",
+              "subscriptionWarningDays",
+              "notifyOnNewUser",
+              "notifyOnNewProvider",
+              "notifyOnNewDriver",
+              "notifyOnCrVerification",
+              "notifyOnFreelanceRequest",
+              "providerSubscription",
+              "driverSubscription"
+            ];
+            const fields = {};
+            for (const key of allowedSettings) {
+              if (key in body) fields[key] = body[key];
             }
-            return jsonResponse({ success: true, push: !!pushToken, email: !!user.email });
-          } catch (e) {
-            return jsonResponse({ error: e.message }, 500);
+            if (Object.keys(fields).length === 0) {
+              return jsonResponse({ error: "No valid settings fields" }, 400);
+            }
+            await updateFirestoreDocument("app_settings", "main", fields, accessToken);
+            return jsonResponse({ success: true, updated: Object.keys(fields) });
           }
-        }
-        if (path === "/admin/api/send-completion-email" && request.method === "POST") {
-          try {
-            const body = await request.json();
-            const { orderId } = body;
-            if (!orderId) return jsonResponse({ error: "Missing orderId" }, 400);
-            const order = await getFirestoreDoc("orders", orderId, accessToken);
-            if (!order) return jsonResponse({ error: "Order not found" }, 404);
-            const customer = await getFirestoreDoc("users", order.customerUid, accessToken);
-            if (!customer || !customer.email) return jsonResponse({ error: "Customer email not found" }, 404);
-            const provider = order.providerUid ? await getFirestoreDoc("users", order.providerUid, accessToken) : null;
-            const driver = order.driverUid ? await getFirestoreDoc("users", order.driverUid, accessToken) : null;
-            const customerName = customer.displayName || "";
-            const providerName = provider ? provider.displayName || "" : "";
-            const driverName = driver ? driver.displayName || "" : "";
-            let emailBody = '<div dir="rtl" style="font-family:sans-serif;padding:20px;max-width:500px;margin:0 auto;background:#fff"><div style="text-align:center;margin-bottom:20px"><h1 style="color:#e8722a;font-size:24px">\u0637\u0628\u0627\u062E\u064A\u0646</h1></div><h2 style="color:#333">\u0637\u0644\u0628\u0643 \u0648\u0635\u0644 \u0628\u0627\u0644\u0639\u0627\u0641\u064A\u0629 \u{1F60B}</h2><p>\u0628\u0627\u0644\u0639\u0627\u0641\u064A\u0629 \u0639\u0644\u064A\u0643 ' + customerName + " \u{1F31F}</p><p>\u0637\u0644\u0628\u0643 \u0645\u0646 \u0637\u0628\u0627\u062E\u0646\u0627 \u0627\u0644\u0645\u0645\u064A\u0632<br><strong>" + providerName + "</strong></p><p>\u062A\u0645 \u062A\u062D\u0636\u064A\u0631\u0647 \u0628\u0643\u0644 \u062D\u0628 \u0648\u0639\u0646\u0627\u064A\u0629.</p>";
-            if (driverName) {
-              emailBody += "<p>\u0648\u0648\u0635\u0644 \u0644\u0643 \u0639\u0646 \u0637\u0631\u064A\u0642 \u0645\u0646\u062F\u0648\u0628\u0646\u0627<br><strong>" + driverName + "</strong></p>";
+          if (path === "/admin/api/upload-banner" && request.method === "POST") {
+            try {
+              const body = await request.json();
+              if (!body.image) {
+                return jsonResponse({ error: "No image data provided" }, 400);
+              }
+              const result = await uploadToCloudinary(body.image, "tabbakheen/banners", env);
+              await updateFirestoreDocument("app_settings", "main", {
+                bannerImageUrl: result.secure_url
+              }, accessToken);
+              return jsonResponse({ success: true, url: result.secure_url });
+            } catch (e) {
+              console.error("[Admin] Banner upload error:", e);
+              return jsonResponse({ error: e.message || "Upload failed" }, 500);
             }
-            emailBody += '<p style="margin-top:20px">\u0646\u062A\u0645\u0646\u0649 \u0644\u0643 \u062A\u062C\u0631\u0628\u0629 \u0645\u0645\u064A\u0632\u0629! \u0644\u0627 \u062A\u0646\u0633\u0649 \u062A\u0642\u064A\u064A\u0645 \u0627\u0644\u0637\u0644\u0628 \u0644\u062A\u0633\u0627\u0639\u062F\u0646\u0627 \u0646\u0642\u062F\u0645 \u0644\u0643 \u0627\u0644\u0623\u0641\u0636\u0644 \u062F\u0627\u0626\u0645\u0627\u064B \u{1F64F}</p><div style="margin-top:30px;padding-top:20px;border-top:1px solid #eee;text-align:center;color:#888;font-size:12px"><p>\u0641\u0631\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646</p></div></div>';
-            const emailResult = await sendEmail(
-              customer.email,
-              "\u0637\u0644\u0628\u0643 \u0648\u0635\u0644 \u0628\u0627\u0644\u0639\u0627\u0641\u064A\u0629 \u{1F60B}",
-              emailBody,
-              env
-            );
-            return jsonResponse({ success: true, emailSent: emailResult.sent });
-          } catch (e) {
-            return jsonResponse({ error: e.message }, 500);
           }
-        }
-        return jsonResponse({ error: "Admin endpoint not found" }, 404);
-      } catch (e) {
-        console.error("[Admin] API error:", e);
-        return jsonResponse({ error: e.message || "Internal error" }, 500);
-      }
-    }
-    const apiKey = request.headers.get("x-api-key");
-    if (!apiKey || apiKey !== env.API_KEY) {
-      return Response.json({ success: false, error: "Unauthorized" }, { status: 401, headers: { "Access-Control-Allow-Origin": "*" } });
-    }
-    if (path === "/verify-cr" && request.method === "POST") {
-      try {
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        return await handleVerifyCr(request, env, accessToken);
-      } catch (e) {
-        console.error("[Wathq] Verify CR error:", e && e.message ? e.message : e);
-        return jsonResponse({ success: false, verificationStatus: "pending_review", error: "Internal error" }, 500);
-      }
-    }
-    if (path === "/submit-freelance-cert" && request.method === "POST") {
-      try {
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        return await handleSubmitFreelanceCert(request, env, accessToken);
-      } catch (e) {
-        console.error("[Freelance] Submit cert error:", e && e.message ? e.message : e);
-        return jsonResponse({ success: false, error: "Internal error" }, 500);
-      }
-    }
-    if (path === "/notify" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        const { event, orderId } = body;
-        if (!event || !orderId) {
-          return Response.json({ success: false, error: "Missing event or orderId" }, { status: 400 });
-        }
-        console.log("[Worker] Processing event: " + event + " for order: " + orderId);
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        const result = await handleEvent(event, orderId, accessToken);
-        return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*" } });
-      } catch (e) {
-        console.error("[Worker] Error:", e);
-        return Response.json({ success: false, error: e.message || "Internal error" }, {
-          status: 500,
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
-      }
-    }
-    if (path === "/aggregate-rating" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        const { type, uid } = body;
-        if (!type || !uid || !["provider", "driver"].includes(type)) {
-          return Response.json({ success: false, error: "Missing or invalid type/uid" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
-        }
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        const collectionPath = type === "provider" ? "provider_ratings" : "driver_ratings";
-        const ratingsUrl = FIRESTORE_BASE + "/" + collectionPath + "/" + uid + "/ratings";
-        const ratingsResponse = await fetch(ratingsUrl, {
-          headers: { "Authorization": "Bearer " + accessToken }
-        });
-        let ratings = [];
-        if (ratingsResponse.ok) {
-          const ratingsData = await ratingsResponse.json();
-          if (ratingsData.documents) {
-            ratings = ratingsData.documents.map((doc) => parseFirestoreDoc(doc)).filter(Boolean);
-          }
-        }
-        const count = ratings.length;
-        const avg = count > 0 ? ratings.reduce((sum, r) => sum + (r.stars || 0), 0) / count : 0;
-        const roundedAvg = Math.round(avg * 10) / 10;
-        const updateUrl = FIRESTORE_BASE + "/users/" + uid + "?updateMask.fieldPaths=ratingAverage&updateMask.fieldPaths=ratingCount";
-        const updateResponse = await fetch(updateUrl, {
-          method: "PATCH",
-          headers: {
-            "Authorization": "Bearer " + accessToken,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            fields: {
-              ratingAverage: { doubleValue: roundedAvg },
-              ratingCount: { integerValue: String(count) }
+          if (path === "/admin/api/change-password" && request.method === "POST") {
+            try {
+              const body = await request.json();
+              if (!body.currentPassword || !body.newPassword) {
+                return jsonResponse({ error: "Current and new password required" }, 400);
+              }
+              const validPw = await verifyAdminPassword(body.currentPassword, env, accessToken);
+              if (!validPw) {
+                return jsonResponse({ error: "Current password is incorrect" }, 401);
+              }
+              const newHash = await hashPassword(body.newPassword);
+              await updateFirestoreDocument("app_config", "admin", {
+                passwordHash: newHash,
+                updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+              }, accessToken);
+              return jsonResponse({ success: true });
+            } catch (e) {
+              return jsonResponse({ error: e.message || "Failed" }, 500);
             }
-          })
-        });
-        if (!updateResponse.ok) {
-          await updateResponse.text();
-          return Response.json({ success: false, error: "Failed to update user rating" }, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          if (path === "/admin/api/invoices" && request.method === "GET") {
+            const invoices = await listAllInvoices(accessToken);
+            return jsonResponse({ success: true, invoices });
+          }
+          if (path === "/admin/api/invoices" && request.method === "POST") {
+            try {
+              const invoice = await request.json();
+              const invoiceId = "inv_" + Date.now();
+              invoice.status = "issued";
+              await createFirestoreDocument("invoices", invoiceId, invoice, accessToken);
+              console.log("[Admin] Invoice created:", invoiceId);
+              return jsonResponse({ success: true, invoiceId });
+            } catch (e) {
+              return jsonResponse({ error: e.message }, 500);
+            }
+          }
+          const invoiceTokenMatch = path.match(/^\/admin\/api\/invoices\/([^/]+)\/token$/);
+          if (invoiceTokenMatch && request.method === "GET") {
+            const invoiceId = invoiceTokenMatch[1];
+            const signedToken = await createSignedInvoiceToken(invoiceId, env);
+            return jsonResponse({ success: true, token: signedToken });
+          }
+          const invoiceEmailMatch = path.match(/^\/admin\/api\/invoices\/([^/]+)\/email$/);
+          if (invoiceEmailMatch && request.method === "POST") {
+            try {
+              const invoiceId = invoiceEmailMatch[1];
+              const body = await request.json();
+              const invoiceLang = body.lang || "ar";
+              const invoice = await getFirestoreDoc("invoices", invoiceId, accessToken);
+              if (!invoice) {
+                return jsonResponse({ error: "Invoice not found" }, 404);
+              }
+              if (!invoice.userEmail) {
+                return jsonResponse({ error: "No email address for this invoice recipient" }, 400);
+              }
+              const isAr = invoiceLang === "ar";
+              const subject = isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629 \u0627\u0634\u062A\u0631\u0627\u0643 - \u0637\u0628\u0627\u062E\u064A\u0646 #" + (invoice.invoiceNumber || invoiceId) : "Subscription Invoice - Tabbakheen #" + (invoice.invoiceNumber || invoiceId);
+              const emailHtml = generateInvoiceEmailHTML(invoice, invoiceLang);
+              const result = await sendEmail(invoice.userEmail, subject, emailHtml, env);
+              if (result.sent) {
+                await updateFirestoreDocument("invoices", invoiceId, {
+                  emailSentAt: (/* @__PURE__ */ new Date()).toISOString(),
+                  emailSentTo: invoice.userEmail
+                }, accessToken);
+              }
+              return jsonResponse({ success: result.sent, emailId: result.id, reason: result.reason });
+            } catch (e) {
+              return jsonResponse({ error: e.message }, 500);
+            }
+          }
+          if (path === "/admin/api/send-reminder" && request.method === "POST") {
+            try {
+              const body = await request.json();
+              const uid = body.uid;
+              if (!uid) return jsonResponse({ error: "Missing uid" }, 400);
+              const user = await getFirestoreDoc("users", uid, accessToken);
+              if (!user) return jsonResponse({ error: "User not found" }, 404);
+              const endDate = user.subscriptionEndsAt || user.trialEndsAt;
+              const daysLeft = endDate ? Math.ceil((new Date(endDate) - Date.now()) / (1e3 * 60 * 60 * 24)) : 0;
+              const name = user.displayName || "";
+              const pushToken = user.expoPushToken;
+              if (pushToken && isExpoPushToken(pushToken)) {
+                await sendExpoPush([{
+                  to: pushToken,
+                  title: "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
+                  body: "\u0647\u0644\u0627 " + name + "\n\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F " + daysLeft + " \u0623\u064A\u0627\u0645",
+                  data: { type: "subscription_reminder" },
+                  sound: "default"
+                }]);
+              }
+              if (user.email) {
+                const emailHtml = '<div dir="rtl" style="font-family:sans-serif;padding:20px;max-width:500px;margin:0 auto"><h2 style="color:#e8722a">\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643</h2><p>\u0647\u0644\u0627 ' + name + "</p><p>\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F <strong>" + daysLeft + '</strong> \u0623\u064A\u0627\u0645.</p><p>\u062C\u062F\u062F \u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u062D\u062A\u0649 \u064A\u0633\u062A\u0645\u0631 \u0638\u0647\u0648\u0631 \u062D\u0633\u0627\u0628\u0643 \u0648\u0627\u0633\u062A\u0642\u0628\u0627\u0644 \u0627\u0644\u0637\u0644\u0628\u0627\u062A / \u0627\u0644\u062A\u0648\u0635\u064A\u0644\u0627\u062A.</p><p style="margin-top:20px;color:#666">\u0641\u0631\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646</p></div>';
+                await sendEmail(user.email, "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643", emailHtml, env);
+              }
+              return jsonResponse({ success: true, push: !!pushToken, email: !!user.email });
+            } catch (e) {
+              return jsonResponse({ error: e.message }, 500);
+            }
+          }
+          if (path === "/admin/api/send-completion-email" && request.method === "POST") {
+            try {
+              const body = await request.json();
+              const { orderId } = body;
+              if (!orderId) return jsonResponse({ error: "Missing orderId" }, 400);
+              const order = await getFirestoreDoc("orders", orderId, accessToken);
+              if (!order) return jsonResponse({ error: "Order not found" }, 404);
+              const customer = await getFirestoreDoc("users", order.customerUid, accessToken);
+              if (!customer || !customer.email) return jsonResponse({ error: "Customer email not found" }, 404);
+              const provider = order.providerUid ? await getFirestoreDoc("users", order.providerUid, accessToken) : null;
+              const driver = order.driverUid ? await getFirestoreDoc("users", order.driverUid, accessToken) : null;
+              const customerName = customer.displayName || "";
+              const providerName = provider ? provider.displayName || "" : "";
+              const driverName = driver ? driver.displayName || "" : "";
+              let emailBody = '<div dir="rtl" style="font-family:sans-serif;padding:20px;max-width:500px;margin:0 auto;background:#fff"><div style="text-align:center;margin-bottom:20px"><h1 style="color:#e8722a;font-size:24px">\u0637\u0628\u0627\u062E\u064A\u0646</h1></div><h2 style="color:#333">\u0637\u0644\u0628\u0643 \u0648\u0635\u0644 \u0628\u0627\u0644\u0639\u0627\u0641\u064A\u0629 \u{1F60B}</h2><p>\u0628\u0627\u0644\u0639\u0627\u0641\u064A\u0629 \u0639\u0644\u064A\u0643 ' + customerName + " \u{1F31F}</p><p>\u0637\u0644\u0628\u0643 \u0645\u0646 \u0637\u0628\u0627\u062E\u0646\u0627 \u0627\u0644\u0645\u0645\u064A\u0632<br><strong>" + providerName + "</strong></p><p>\u062A\u0645 \u062A\u062D\u0636\u064A\u0631\u0647 \u0628\u0643\u0644 \u062D\u0628 \u0648\u0639\u0646\u0627\u064A\u0629.</p>";
+              if (driverName) {
+                emailBody += "<p>\u0648\u0648\u0635\u0644 \u0644\u0643 \u0639\u0646 \u0637\u0631\u064A\u0642 \u0645\u0646\u062F\u0648\u0628\u0646\u0627<br><strong>" + driverName + "</strong></p>";
+              }
+              emailBody += '<p style="margin-top:20px">\u0646\u062A\u0645\u0646\u0649 \u0644\u0643 \u062A\u062C\u0631\u0628\u0629 \u0645\u0645\u064A\u0632\u0629! \u0644\u0627 \u062A\u0646\u0633\u0649 \u062A\u0642\u064A\u064A\u0645 \u0627\u0644\u0637\u0644\u0628 \u0644\u062A\u0633\u0627\u0639\u062F\u0646\u0627 \u0646\u0642\u062F\u0645 \u0644\u0643 \u0627\u0644\u0623\u0641\u0636\u0644 \u062F\u0627\u0626\u0645\u0627\u064B \u{1F64F}</p><div style="margin-top:30px;padding-top:20px;border-top:1px solid #eee;text-align:center;color:#888;font-size:12px"><p>\u0641\u0631\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646</p></div></div>';
+              const emailResult = await sendEmail(
+                customer.email,
+                "\u0637\u0644\u0628\u0643 \u0648\u0635\u0644 \u0628\u0627\u0644\u0639\u0627\u0641\u064A\u0629 \u{1F60B}",
+                emailBody,
+                env
+              );
+              return jsonResponse({ success: true, emailSent: emailResult.sent });
+            } catch (e) {
+              return jsonResponse({ error: e.message }, 500);
+            }
+          }
+          if (path === "/admin/api/broadcast-notifications/history" && request.method === "GET") {
+            try {
+              const histUrl = FIRESTORE_BASE + "/admin_broadcast_notifications?pageSize=50";
+              const histResp = await fetch(histUrl, { headers: { "Authorization": "Bearer " + accessToken } });
+              let history = [];
+              if (histResp.ok) {
+                const histData = await histResp.json();
+                if (histData.documents) {
+                  history = histData.documents.map((doc) => parseFirestoreDoc(doc)).filter(Boolean);
+                  history.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+                }
+              } else {
+                const errText = await histResp.text();
+                console.error("[Admin] History Firestore error:", histResp.status, errText);
+                return jsonResponse({ error: "History fetch failed: " + histResp.status }, 500);
+              }
+              return jsonResponse({ success: true, history });
+            } catch (e) {
+              return jsonResponse({ error: e.message }, 500);
+            }
+          }
+          if (path === "/admin/api/broadcast-notifications/send" && request.method === "POST") {
+            try {
+              const body = await request.json();
+              const { title, message, audience, sourceNotificationId, resendType } = body;
+              if (!title || !message || !audience) {
+                return jsonResponse({ error: "title, message, and audience are required" }, 400);
+              }
+              const validAudiences = ["customer", "provider", "driver", "all"];
+              if (!validAudiences.includes(audience)) {
+                return jsonResponse({ error: "Invalid audience. Must be customer, provider, driver, or all" }, 400);
+              }
+              const rolesToQuery = audience === "all" ? ["customer", "provider", "driver"] : [audience];
+              let allMatchedUsers = [];
+              for (const role of rolesToQuery) {
+                const users = await queryFirestore("users", "role", "EQUAL", role, accessToken);
+                allMatchedUsers = allMatchedUsers.concat(users || []);
+              }
+              const totalUsersMatched = allMatchedUsers.length;
+              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
+              const now = (/* @__PURE__ */ new Date()).toISOString();
+              const histId = "broadcast_" + Date.now();
+              const histFields = {
+                title,
+                message,
+                audience,
+                totalUsersMatched,
+                ...delivery,
+                createdAt: now,
+                createdBy: "admin"
+              };
+              if (sourceNotificationId) {
+                histFields.sourceNotificationId = sourceNotificationId;
+                histFields.resendType = resendType || "edited";
+              }
+              await createFirestoreDocument("admin_broadcast_notifications", histId, histFields, accessToken);
+              return jsonResponse({ success: true, totalUsersMatched, ...delivery });
+            } catch (e) {
+              console.error("[Admin] Broadcast send error:", e);
+              return jsonResponse({ error: e.message || "Failed to send broadcast" }, 500);
+            }
+          }
+          const bcDeleteMatch = path.match(/^\/admin\/api\/broadcast-notifications\/([^\/]+)$/);
+          if (bcDeleteMatch && request.method === "DELETE") {
+            try {
+              const notifId = bcDeleteMatch[1];
+              if (!notifId) return jsonResponse({ error: "Missing notification id" }, 400);
+              await deleteFirestoreDocument("admin_broadcast_notifications", notifId, accessToken);
+              return jsonResponse({ success: true });
+            } catch (e) {
+              console.error("[Admin] Delete notification error:", e);
+              return jsonResponse({ error: e.message || "Failed to delete" }, 500);
+            }
+          }
+          const bcResendMatch = path.match(/^\/admin\/api\/broadcast-notifications\/([^\/]+)\/resend$/);
+          if (bcResendMatch && request.method === "POST") {
+            try {
+              const notifId = bcResendMatch[1];
+              const original = await getFirestoreDoc("admin_broadcast_notifications", notifId, accessToken);
+              if (!original) return jsonResponse({ error: "Notification record not found" }, 404);
+              const { title, message, audience } = original;
+              if (!title || !message || !audience) return jsonResponse({ error: "Original record missing required fields" }, 400);
+              const validAudiences = ["customer", "provider", "driver", "all"];
+              if (!validAudiences.includes(audience)) return jsonResponse({ error: "Invalid audience in original record" }, 400);
+              const rolesToQuery = audience === "all" ? ["customer", "provider", "driver"] : [audience];
+              let allMatchedUsers = [];
+              for (const role of rolesToQuery) {
+                const users = await queryFirestore("users", "role", "EQUAL", role, accessToken);
+                allMatchedUsers = allMatchedUsers.concat(users || []);
+              }
+              const totalUsersMatched = allMatchedUsers.length;
+              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
+              const now = (/* @__PURE__ */ new Date()).toISOString();
+              const newHistId = "broadcast_" + Date.now();
+              await createFirestoreDocument("admin_broadcast_notifications", newHistId, {
+                title,
+                message,
+                audience,
+                totalUsersMatched,
+                ...delivery,
+                createdAt: now,
+                createdBy: "admin",
+                sourceNotificationId: notifId,
+                resendType: "resend"
+              }, accessToken);
+              return jsonResponse({ success: true, totalUsersMatched, ...delivery });
+            } catch (e) {
+              console.error("[Admin] Resend notification error:", e);
+              return jsonResponse({ error: e.message || "Failed to resend" }, 500);
+            }
+          }
+          return jsonResponse({ error: "Admin endpoint not found" }, 404);
+        } catch (e) {
+          console.error("[Admin] API error:", e);
+          return jsonResponse({ error: e.message || "Internal error" }, 500);
         }
-        return Response.json({ success: true, ratingAverage: roundedAvg, ratingCount: count }, {
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
-      } catch (e) {
-        return Response.json({ success: false, error: e.message || "Internal error" }, {
-          status: 500,
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
       }
-    }
-    if (path === "/finalize-delivery" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        const { orderId, method } = body;
-        if (!orderId || !method || !["self_pickup", "driver"].includes(method)) {
-          return Response.json({ success: false, error: "Missing or invalid orderId/method" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
+      const apiKey = request.headers.get("x-api-key");
+      const hasServiceKey = !!apiKey && !!env.API_KEY && apiKey === env.API_KEY;
+      let callerUid = "";
+      if (!hasServiceKey) {
+        try {
+          callerUid = await verifyFirebaseIdToken(getTokenFromRequest(request));
+        } catch (e) {
+          console.log("[Auth] Rejected app request:", e && e.message ? e.message : e);
+          return Response.json({ success: false, error: "Unauthorized" }, { status: 401, headers: { "Access-Control-Allow-Origin": "*" } });
         }
-        console.log("[Worker] Finalize delivery: orderId=" + orderId + " method=" + method);
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        const order = await getFirestoreDoc("orders", orderId, accessToken);
-        if (!order) {
-          return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
+      }
+      if (path === "/verify-cr" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleVerifyCr(request, env, accessToken);
+        } catch (e) {
+          console.error("[Wathq] Verify CR error:", e && e.message ? e.message : e);
+          return jsonResponse({ success: false, verificationStatus: "pending_review", error: "Internal error" }, 500);
         }
-        if (method === "self_pickup") {
-          const fields2 = {
-            deliveryMethod: "self_pickup",
-            deliveryStatus: "self_pickup_selected",
-            deliveryFee: 0,
-            totalAmount: order.priceSnapshot || 0,
-            deliveryDistanceKm: 0,
-            deliveryPricingVersion: "v1"
-          };
-          await updateFirestoreDocument("orders", orderId, fields2, accessToken);
-          console.log("[Worker] Self pickup finalized for order:", orderId);
-          await handleEvent("self_pickup_selected", orderId, accessToken);
-          return Response.json({ success: true, deliveryFee: 0, totalAmount: fields2.totalAmount, deliveryDistanceKm: 0 }, {
+      }
+      if (path === "/submit-freelance-cert" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleSubmitFreelanceCert(request, env, accessToken);
+        } catch (e) {
+          console.error("[Freelance] Submit cert error:", e && e.message ? e.message : e);
+          return jsonResponse({ success: false, error: "Internal error" }, 500);
+        }
+      }
+      if (path === "/notify" && request.method === "POST") {
+        try {
+          const body = await request.json();
+          const { event, orderId } = body;
+          if (!event || !orderId) {
+            return Response.json({ success: false, error: "Missing event or orderId" }, { status: 400 });
+          }
+          console.log("[Worker] Processing event: " + event + " for order: " + orderId);
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (!hasServiceKey) {
+            const authOrder = await getFirestoreDoc("orders", orderId, accessToken);
+            if (!authOrder) {
+              return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
+            }
+            if (callerUid !== authOrder.customerUid && callerUid !== authOrder.providerUid && callerUid !== authOrder.driverUid) {
+              console.log("[Worker] Forbidden: caller is not a party to order " + orderId);
+              return Response.json({ success: false, error: "Forbidden" }, { status: 403, headers: { "Access-Control-Allow-Origin": "*" } });
+            }
+          }
+          const result = await handleEvent(event, orderId, accessToken);
+          return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*" } });
+        } catch (e) {
+          console.error("[Worker] Error:", e);
+          return Response.json({ success: false, error: e.message || "Internal error" }, {
+            status: 500,
             headers: { "Access-Control-Allow-Origin": "*" }
           });
         }
-        const providerLat = order.providerLat;
-        const providerLng = order.providerLng;
-        const customerLat = order.customerLat;
-        const customerLng = order.customerLng;
-        let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
-        try {
-          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-          if (settings && settings.deliveryPricing) {
-            pricing = { ...pricing, ...settings.deliveryPricing };
-          }
-        } catch (e) {
-          console.log("[Worker] Could not load delivery pricing, using defaults:", e.message);
-        }
-        let distanceKm = 0;
-        let deliveryFee = pricing.baseFee || 5;
-        if (providerLat && providerLng && customerLat && customerLng) {
-          const R = 6371;
-          const dLat = (customerLat - providerLat) * Math.PI / 180;
-          const dLng = (customerLng - providerLng) * Math.PI / 180;
-          const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-          distanceKm = R * c;
-          distanceKm = Math.round(distanceKm * 10) / 10;
-          const perKm = pricing.perKmInsideCity || 2;
-          deliveryFee = (pricing.baseFee || 5) + distanceKm * perKm;
-          deliveryFee = Math.round(deliveryFee);
-          if (pricing.minFee && deliveryFee < pricing.minFee) {
-            deliveryFee = pricing.minFee;
-          }
-          if (pricing.maxFee && deliveryFee > pricing.maxFee) {
-            deliveryFee = pricing.maxFee;
-          }
-        }
-        console.log("[Worker] Pricing: baseFee=" + pricing.baseFee + " perKm=" + pricing.perKmInsideCity + " minFee=" + pricing.minFee + " maxFee=" + pricing.maxFee + " dist=" + distanceKm + " fee=" + deliveryFee);
-        const priceSnapshot = order.priceSnapshot || 0;
-        const totalAmount = priceSnapshot + deliveryFee;
-        const quoteId = "dq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
-        const fields = {
-          deliveryMethod: "driver",
-          deliveryStatus: "ready_for_driver",
-          deliveryFee,
-          totalAmount,
-          deliveryDistanceKm: distanceKm,
-          deliveryQuoteId: quoteId,
-          deliveryPricingVersion: "v1"
-        };
-        await updateFirestoreDocument("orders", orderId, fields, accessToken);
-        console.log("[Worker] Driver delivery finalized: orderId=" + orderId + " fee=" + deliveryFee + " dist=" + distanceKm + "km total=" + totalAmount);
-        await handleEvent("driver_delivery_requested", orderId, accessToken);
-        return Response.json({
-          success: true,
-          deliveryFee,
-          totalAmount,
-          deliveryDistanceKm: distanceKm,
-          deliveryQuoteId: quoteId
-        }, {
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
-      } catch (e) {
-        console.error("[Worker] Finalize delivery error:", e);
-        return Response.json({ success: false, error: e.message || "Internal error" }, {
-          status: 500,
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
       }
-    }
-    if (path === "/delivery-quote" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        const { orderId } = body;
-        if (!orderId) {
-          return Response.json({ success: false, error: "Missing orderId" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
-        }
-        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-        const order = await getFirestoreDoc("orders", orderId, accessToken);
-        if (!order) {
-          return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
-        }
-        let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
+      if (path === "/aggregate-rating" && request.method === "POST") {
         try {
-          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-          if (settings && settings.deliveryPricing) {
-            pricing = { ...pricing, ...settings.deliveryPricing };
+          const body = await request.json();
+          const { type, uid } = body;
+          if (!type || !uid || !["provider", "driver"].includes(type)) {
+            return Response.json({ success: false, error: "Missing or invalid type/uid" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
           }
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const collectionPath = type === "provider" ? "provider_ratings" : "driver_ratings";
+          const ratingsUrl = FIRESTORE_BASE + "/" + collectionPath + "/" + uid + "/ratings";
+          const ratingsResponse = await fetch(ratingsUrl, {
+            headers: { "Authorization": "Bearer " + accessToken }
+          });
+          let ratings = [];
+          if (ratingsResponse.ok) {
+            const ratingsData = await ratingsResponse.json();
+            if (ratingsData.documents) {
+              ratings = ratingsData.documents.map((doc) => parseFirestoreDoc(doc)).filter(Boolean);
+            }
+          }
+          const count = ratings.length;
+          const avg = count > 0 ? ratings.reduce((sum, r) => sum + (r.stars || 0), 0) / count : 0;
+          const roundedAvg = Math.round(avg * 10) / 10;
+          const updateUrl = FIRESTORE_BASE + "/users/" + uid + "?updateMask.fieldPaths=ratingAverage&updateMask.fieldPaths=ratingCount";
+          const updateResponse = await fetch(updateUrl, {
+            method: "PATCH",
+            headers: {
+              "Authorization": "Bearer " + accessToken,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              fields: {
+                ratingAverage: { doubleValue: roundedAvg },
+                ratingCount: { integerValue: String(count) }
+              }
+            })
+          });
+          if (!updateResponse.ok) {
+            await updateResponse.text();
+            return Response.json({ success: false, error: "Failed to update user rating" }, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          return Response.json({ success: true, ratingAverage: roundedAvg, ratingCount: count }, {
+            headers: { "Access-Control-Allow-Origin": "*" }
+          });
         } catch (e) {
-          console.log("[Worker] Could not load pricing for quote:", e.message);
+          return Response.json({ success: false, error: e.message || "Internal error" }, {
+            status: 500,
+            headers: { "Access-Control-Allow-Origin": "*" }
+          });
         }
-        const providerLat = order.providerLat;
-        const providerLng = order.providerLng;
-        const customerLat = order.customerLat;
-        const customerLng = order.customerLng;
-        let distanceKm = 0;
-        let deliveryFee = pricing.baseFee || 5;
-        if (providerLat && providerLng && customerLat && customerLng) {
-          const R = 6371;
-          const dLat = (customerLat - providerLat) * Math.PI / 180;
-          const dLng = (customerLng - providerLng) * Math.PI / 180;
-          const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-          distanceKm = Math.round(R * c * 10) / 10;
-          const perKm = pricing.perKmInsideCity || 2;
-          deliveryFee = (pricing.baseFee || 5) + distanceKm * perKm;
-          deliveryFee = Math.round(deliveryFee);
-          if (pricing.minFee && deliveryFee < pricing.minFee) {
-            deliveryFee = pricing.minFee;
-          }
-          if (pricing.maxFee && deliveryFee > pricing.maxFee) {
-            deliveryFee = pricing.maxFee;
-          }
-        }
-        const priceSnapshot = order.priceSnapshot || 0;
-        return Response.json({
-          success: true,
-          deliveryFee,
-          totalAmount: priceSnapshot + deliveryFee,
-          deliveryDistanceKm: distanceKm,
-          subtotal: priceSnapshot
-        }, {
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
-      } catch (e) {
-        return Response.json({ success: false, error: e.message || "Internal error" }, {
-          status: 500,
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
       }
+      if (path === "/finalize-delivery" && request.method === "POST") {
+        try {
+          const body = await request.json();
+          const { orderId, method } = body;
+          if (!orderId || !method || !["self_pickup", "driver"].includes(method)) {
+            return Response.json({ success: false, error: "Missing or invalid orderId/method" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          console.log("[Worker] Finalize delivery: orderId=" + orderId + " method=" + method);
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const order = await getFirestoreDoc("orders", orderId, accessToken);
+          if (!order) {
+            return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          if (method === "self_pickup") {
+            const fields2 = {
+              deliveryMethod: "self_pickup",
+              deliveryStatus: "self_pickup_selected",
+              deliveryFee: 0,
+              totalAmount: order.priceSnapshot || 0,
+              deliveryDistanceKm: 0,
+              deliveryPricingVersion: "v1"
+            };
+            await updateFirestoreDocument("orders", orderId, fields2, accessToken);
+            console.log("[Worker] Self pickup finalized for order:", orderId);
+            await handleEvent("self_pickup_selected", orderId, accessToken);
+            return Response.json({ success: true, deliveryFee: 0, totalAmount: fields2.totalAmount, deliveryDistanceKm: 0 }, {
+              headers: { "Access-Control-Allow-Origin": "*" }
+            });
+          }
+          const providerLat = order.providerLat;
+          const providerLng = order.providerLng;
+          const customerLat = order.customerLat;
+          const customerLng = order.customerLng;
+          let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
+          try {
+            const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+            if (settings && settings.deliveryPricing) {
+              pricing = { ...pricing, ...settings.deliveryPricing };
+            }
+          } catch (e) {
+            console.log("[Worker] Could not load delivery pricing, using defaults:", e.message);
+          }
+          let distanceKm = 0;
+          let deliveryFee = pricing.baseFee || 5;
+          if (providerLat && providerLng && customerLat && customerLng) {
+            const R = 6371;
+            const dLat = (customerLat - providerLat) * Math.PI / 180;
+            const dLng = (customerLng - providerLng) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            distanceKm = R * c;
+            distanceKm = Math.round(distanceKm * 10) / 10;
+            const perKm = pricing.perKmInsideCity || 2;
+            deliveryFee = (pricing.baseFee || 5) + distanceKm * perKm;
+            deliveryFee = Math.round(deliveryFee);
+            if (pricing.minFee && deliveryFee < pricing.minFee) {
+              deliveryFee = pricing.minFee;
+            }
+            if (pricing.maxFee && deliveryFee > pricing.maxFee) {
+              deliveryFee = pricing.maxFee;
+            }
+          }
+          console.log("[Worker] Pricing: baseFee=" + pricing.baseFee + " perKm=" + pricing.perKmInsideCity + " minFee=" + pricing.minFee + " maxFee=" + pricing.maxFee + " dist=" + distanceKm + " fee=" + deliveryFee);
+          const priceSnapshot = order.priceSnapshot || 0;
+          const totalAmount = priceSnapshot + deliveryFee;
+          const quoteId = "dq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+          const fields = {
+            deliveryMethod: "driver",
+            deliveryStatus: "ready_for_driver",
+            deliveryFee,
+            totalAmount,
+            deliveryDistanceKm: distanceKm,
+            deliveryQuoteId: quoteId,
+            deliveryPricingVersion: "v1"
+          };
+          await updateFirestoreDocument("orders", orderId, fields, accessToken);
+          console.log("[Worker] Driver delivery finalized: orderId=" + orderId + " fee=" + deliveryFee + " dist=" + distanceKm + "km total=" + totalAmount);
+          await handleEvent("driver_delivery_requested", orderId, accessToken);
+          return Response.json({
+            success: true,
+            deliveryFee,
+            totalAmount,
+            deliveryDistanceKm: distanceKm,
+            deliveryQuoteId: quoteId
+          }, {
+            headers: { "Access-Control-Allow-Origin": "*" }
+          });
+        } catch (e) {
+          console.error("[Worker] Finalize delivery error:", e);
+          return Response.json({ success: false, error: e.message || "Internal error" }, {
+            status: 500,
+            headers: { "Access-Control-Allow-Origin": "*" }
+          });
+        }
+      }
+      if (path === "/delivery-quote" && request.method === "POST") {
+        try {
+          const body = await request.json();
+          const { orderId } = body;
+          if (!orderId) {
+            return Response.json({ success: false, error: "Missing orderId" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const order = await getFirestoreDoc("orders", orderId, accessToken);
+          if (!order) {
+            return Response.json({ success: false, error: "Order not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
+          try {
+            const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+            if (settings && settings.deliveryPricing) {
+              pricing = { ...pricing, ...settings.deliveryPricing };
+            }
+          } catch (e) {
+            console.log("[Worker] Could not load pricing for quote:", e.message);
+          }
+          const providerLat = order.providerLat;
+          const providerLng = order.providerLng;
+          const customerLat = order.customerLat;
+          const customerLng = order.customerLng;
+          let distanceKm = 0;
+          let deliveryFee = pricing.baseFee || 5;
+          if (providerLat && providerLng && customerLat && customerLng) {
+            const R = 6371;
+            const dLat = (customerLat - providerLat) * Math.PI / 180;
+            const dLng = (customerLng - providerLng) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            distanceKm = Math.round(R * c * 10) / 10;
+            const perKm = pricing.perKmInsideCity || 2;
+            deliveryFee = (pricing.baseFee || 5) + distanceKm * perKm;
+            deliveryFee = Math.round(deliveryFee);
+            if (pricing.minFee && deliveryFee < pricing.minFee) {
+              deliveryFee = pricing.minFee;
+            }
+            if (pricing.maxFee && deliveryFee > pricing.maxFee) {
+              deliveryFee = pricing.maxFee;
+            }
+          }
+          const priceSnapshot = order.priceSnapshot || 0;
+          return Response.json({
+            success: true,
+            deliveryFee,
+            totalAmount: priceSnapshot + deliveryFee,
+            deliveryDistanceKm: distanceKm,
+            subtotal: priceSnapshot
+          }, {
+            headers: { "Access-Control-Allow-Origin": "*" }
+          });
+        } catch (e) {
+          return Response.json({ success: false, error: e.message || "Internal error" }, {
+            status: 500,
+            headers: { "Access-Control-Allow-Origin": "*" }
+          });
+        }
+      }
+      return Response.json({ success: false, error: "Not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
     }
-    return Response.json({ success: false, error: "Not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
-  }
-  __name(handleRequest, "handleRequest");
+    __name(handleRequest, "handleRequest");
+    __name2(handleRequest, "handleRequest");
+  })();
 })();
 //# sourceMappingURL=worker.js.map
