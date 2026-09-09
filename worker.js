@@ -396,31 +396,73 @@
     }
     __name(isDriverProgressEligible, "isDriverProgressEligible");
     __name2(isDriverProgressEligible, "isDriverProgressEligible");
-    function isDriverAccountAllowed(user) {
-      if (!user || user.role !== "driver") return false;
-      if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return false;
-      if (user.activatedByAdmin === true) return true;
-      const now = Date.now();
-      if (user.subscriptionStatus === "active") {
-        const end = user.subscriptionEndsAt ? new Date(user.subscriptionEndsAt).getTime() : NaN;
-        return !Number.isFinite(end) || end > now;
+    function entitlementTime(value) {
+      if (typeof value !== "string" && !(value instanceof Date)) return NaN;
+      const time = new Date(value).getTime();
+      return Number.isFinite(time) ? time : NaN;
+    }
+    function evaluateSubscriptionEntitlement(user, now = Date.now()) {
+      const nowMs = now instanceof Date ? now.getTime() : Number(now);
+      const role = user && user.role;
+      if (!user || !Number.isFinite(nowMs)) return { eligible: false, reason: "unknown_invalid", role: role || null, source: null, endsAt: null };
+      if (role === "customer") return { eligible: true, reason: "customer_unrestricted", role, source: "customer", endsAt: null };
+      if (role !== "provider" && role !== "driver") return { eligible: false, reason: "unknown_invalid", role: role || null, source: null, endsAt: null };
+      if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return { eligible: false, reason: "account_inactive", role, source: null, endsAt: null };
+      if (user.subscriptionPlatform === "apple" && user.subscriptionEnvironment === "Sandbox" && user.activatedByAdmin !== true) return { eligible: false, reason: "apple_sandbox_forbidden", role, source: "apple", endsAt: null };
+      const createdAt = entitlementTime(user.createdAt);
+      // Admin activation is an explicit, current override and may bypass
+      // missing commercial dates. Normal trial/paid access never does.
+      if (user.activatedByAdmin === true) return { eligible: true, reason: "admin_override", role, source: "admin", endsAt: null };
+      if (!Number.isFinite(createdAt) || createdAt > nowMs + 5 * 60 * 1e3) return { eligible: false, reason: "unknown_invalid", role, source: null, endsAt: null };
+      // Protected mutations use this synchronous evaluator. Apple is
+      // revalidated on entitlement reads; between reads, fail closed after
+      // 24h rather than making every mutation perform a network round trip.
+      if (user.subscriptionPlatform === "apple") {
+        const verifiedAt = entitlementTime(user.subscriptionLastVerifiedAt);
+        if (!Number.isFinite(verifiedAt) || nowMs - verifiedAt > 24 * 60 * 60 * 1e3) return { eligible: false, reason: "apple_verification_stale", role, source: "apple", endsAt: null };
       }
-      if (user.trialEndsAt) return new Date(user.trialEndsAt).getTime() > now;
-      if (user.createdAt) return new Date(user.createdAt).getTime() + 30 * 864e5 > now;
-      return true;
+      if (user.subscriptionStatus === "active") {
+        const end = entitlementTime(user.subscriptionEndsAt);
+        if (!Number.isFinite(end)) return { eligible: false, reason: "unknown_invalid", role, source: "subscription", endsAt: null };
+        return { eligible: end > nowMs, reason: end > nowMs ? "active_paid" : "expired", role, source: "subscription", endsAt: new Date(end).toISOString() };
+      }
+      if (user.subscriptionStatus === "trialing") {
+        const end = entitlementTime(user.trialEndsAt);
+        if (!Number.isFinite(end)) return { eligible: false, reason: "unknown_invalid", role, source: "trial", endsAt: null };
+        return { eligible: end > nowMs, reason: end > nowMs ? "active_trial" : "expired", role, source: "trial", endsAt: new Date(end).toISOString() };
+      }
+      return { eligible: false, reason: user.subscriptionStatus == null ? "unknown_invalid" : "inactive", role, source: null, endsAt: null };
+    }
+    function commercialAccessFields(entitlement, now = new Date().toISOString()) {
+      return {
+        commercialAccessAllowed: entitlement.eligible,
+        commercialAccessStatus: entitlement.eligible ? "active" : "inactive",
+        commercialAccessReason: entitlement.reason,
+        commercialAccessEndsAt: entitlement.endsAt,
+        commercialAccessUpdatedAt: now
+      };
+    }
+    async function normalizeCommercialAccess(uid, user, entitlement, accessToken) {
+      if (!uid || !user || user.role === "customer") return;
+      const fields = commercialAccessFields(entitlement);
+      if (user.role === "driver" && !entitlement.eligible) fields.isAvailable = false;
+      try {
+        await updateFirestoreDocument("users", uid, fields, accessToken);
+      } catch (error) {
+        // Entitlement decisions never fail open merely because denormalization failed.
+        console.error("[Entitlement] Best-effort normalization failed:", uid, error && error.message ? error.message : error);
+      }
+    }
+    function isDriverAccountAllowed(user) {
+      return !!user && user.role === "driver" && evaluateSubscriptionEntitlement(user).eligible;
     }
     __name(isDriverAccountAllowed, "isDriverAccountAllowed");
     __name2(isDriverAccountAllowed, "isDriverAccountAllowed");
     function isProviderAccountAllowed(user) {
-      if (!user || user.role !== "provider") return false;
-      if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return false;
-      if (user.activatedByAdmin === true) return true;
-      if (user.subscriptionStatus === "active") {
-        const end = user.subscriptionEndsAt ? new Date(user.subscriptionEndsAt).getTime() : NaN;
-        if (!Number.isFinite(end) || end > Date.now()) return true;
-      }
-      if (user.trialEndsAt && new Date(user.trialEndsAt).getTime() > Date.now()) return true;
-      return !!user.createdAt && new Date(user.createdAt).getTime() + 30 * 864e5 > Date.now();
+      return !!user && user.role === "provider" && evaluateSubscriptionEntitlement(user).eligible;
+    }
+    function selectEligibleNotificationDrivers(drivers, cap = 50) {
+      return (Array.isArray(drivers) ? drivers : []).filter((driver) => driver && driver.role === "driver" && driver.isAvailable === true && isDriverAccountAllowed(driver)).slice(0, Math.max(0, Math.min(50, Number(cap) || 0)));
     }
     __name(isProviderAccountAllowed, "isProviderAccountAllowed");
     __name2(isProviderAccountAllowed, "isProviderAccountAllowed");
@@ -448,8 +490,13 @@
       if (event === "order_created") values.push(order.providerUid);
       if (event === "driver_assigned_by_provider") values.push(order.driverUid, order.customerUid);
       if (event === "driver_delivery_requested") {
-        const drivers = await queryFirestore("users", "role", "EQUAL", "driver", accessToken);
-        values.push(...drivers.filter(isDriverAccountAllowed).map((driver) => driver._id));
+        // Bounded fan-out: over-fetch up to 200 candidates from the
+        // single-field index, then return at most 50 eligible drivers. This
+        // prevents stale/ineligible records at the head from starving later
+        // drivers. A future paged/leased fan-out worker is the next scaling
+        // step; this request never scans beyond the hard 200-record cap.
+        const drivers = await queryFirestoreLimited("users", "isAvailable", "EQUAL", true, 200, accessToken);
+        values.push(...selectEligibleNotificationDrivers(drivers).map((driver) => driver._id));
       }
       return [...new Set(values.filter((value) => typeof value === "string" && value))];
     }
@@ -628,6 +675,13 @@
         const ownsAsCustomer = actor && actor.role === "customer" && order.customerUid === uid;
         const ownsAsProvider = actor && actor.role === "provider" && order.providerUid === uid;
         if (!ownsAsCustomer && !ownsAsProvider) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+        if (ownsAsProvider) {
+          const providerEntitlement = evaluateSubscriptionEntitlement(actor);
+          if (!providerEntitlement.eligible) {
+            await normalizeCommercialAccess(uid, actor, providerEntitlement, accessToken);
+            return jsonResponse({ success: false, code: "account_not_allowed", error: "Provider account is not active", entitlement: providerEntitlement }, 403);
+          }
+        }
         if (order.deliveryMethod === "self_pickup" && order.deliveryStatus === "delivered" && order.status === "delivered") {
           return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
         }
@@ -667,7 +721,17 @@
         notificationEvent = "delivered";
       } else {
         if (!actor || actor.role !== "driver") return jsonResponse({ success: false, code: "forbidden", error: "Driver role required" }, 403);
-        if (!isDriverAccountAllowed(actor)) return jsonResponse({ success: false, code: "account_not_allowed", error: "Driver account is not active" }, 403);
+        const driverEntitlement = evaluateSubscriptionEntitlement(actor);
+        // Expiry policy: accepting is a new commercial assignment and requires
+        // entitlement. Once assigned, reject/pickup/arrival/completion remain
+        // available after expiry so an in-flight delivery is never stranded.
+        if (action === "accept" && order.driverUid === uid && order.deliveryStatus === "driver_assigned") {
+          return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: uid });
+        }
+        if (action === "accept" && !driverEntitlement.eligible) {
+          await normalizeCommercialAccess(uid, actor, driverEntitlement, accessToken);
+          return jsonResponse({ success: false, code: "account_not_allowed", error: "Driver account is not active", entitlement: driverEntitlement }, 403);
+        }
         if (action === "accept") {
           if (order.driverUid === uid && order.deliveryStatus === "driver_assigned") {
             return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: uid });
@@ -812,7 +876,11 @@
         event = "customer_cancelled";
       } else {
         if (!actor || actor.role !== "provider" || order.providerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Provider ownership required" }, 403);
-        if (!isProviderAccountAllowed(actor)) return jsonResponse({ success: false, code: "account_not_allowed", error: "Provider account is not active" }, 403);
+        const providerEntitlement = evaluateSubscriptionEntitlement(actor);
+        if (!providerEntitlement.eligible) {
+          await normalizeCommercialAccess(uid, actor, providerEntitlement, accessToken);
+          return jsonResponse({ success: false, code: "account_not_allowed", error: "Provider account is not active", entitlement: providerEntitlement }, 403);
+        }
         const spec = {
           provider_accept: ["pending", "accepted", "order_accepted"],
           provider_reject: ["pending", "rejected", "order_rejected"],
@@ -907,19 +975,9 @@
       return { verify: "projects/tabbakheen-99883/databases/(default)/documents/account_deletion_requests/" + uid, currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
     }
     function phase4aProviderAccess(user) {
-      if (!user || user.role !== "provider" || user.accountStatus === "suspended" || user.accountStatus === "disabled") return { ok: false, code: "FORBIDDEN" };
-      if (user.activatedByAdmin === true) return { ok: true };
-      if (user.subscriptionStatus === "active") {
-        if (!Object.prototype.hasOwnProperty.call(user, "subscriptionEndsAt")) return { ok: true };
-        const subscriptionEnd = new Date(user.subscriptionEndsAt).getTime();
-        return Number.isFinite(subscriptionEnd) && subscriptionEnd > Date.now() ? { ok: true } : { ok: false, code: "SUBSCRIPTION_REQUIRED" };
-      }
-      if (Object.prototype.hasOwnProperty.call(user, "trialEndsAt")) {
-        const trialEnd = new Date(user.trialEndsAt).getTime();
-        return Number.isFinite(trialEnd) && trialEnd > Date.now() ? { ok: true } : { ok: false, code: "SUBSCRIPTION_REQUIRED" };
-      }
-      if (!user.createdAt || new Date(user.createdAt).getTime() + 30 * 864e5 > Date.now()) return { ok: true };
-      return { ok: false, code: "SUBSCRIPTION_REQUIRED" };
+      if (!user || user.role !== "provider") return { ok: false, code: "FORBIDDEN", entitlement: evaluateSubscriptionEntitlement(user) };
+      const entitlement = evaluateSubscriptionEntitlement(user);
+      return entitlement.eligible ? { ok: true, entitlement } : { ok: false, code: entitlement.reason === "account_inactive" ? "FORBIDDEN" : "SUBSCRIPTION_REQUIRED", entitlement };
     }
     function phase4aOfferInput(body) {
       if (!phase4aKeysOnly(body, ["requestId", "title", "description", "price", "category", "imageUrl", "availabilityType", "preparationTimeMinutes", "isAvailable"])) return null;
@@ -970,6 +1028,156 @@
       const out = {}; for (const [key, value] of Object.entries(fields)) out[key] = toFirestoreValue(value);
       return { name: "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id, fields: out };
     }
+    function addUtcCalendarMonths(value, months) {
+      const date = new Date(value);
+      if (!Number.isFinite(date.getTime()) || !Number.isInteger(months)) throw new Error("Invalid calendar date");
+      const day = date.getUTCDate();
+      const result = new Date(date.getTime());
+      result.setUTCDate(1);
+      result.setUTCMonth(result.getUTCMonth() + months);
+      const lastDay = new Date(Date.UTC(result.getUTCFullYear(), result.getUTCMonth() + 1, 0)).getUTCDate();
+      result.setUTCDate(Math.min(day, lastDay));
+      return result;
+    }
+    function phase4cProfileInput(body) {
+      const allowed = ["role", "displayName", "phone", "address", "city", "bio", "profileImageUrl", "location", "latitude", "longitude", "cuisineTypes", "vehicleType", "vehiclePlate"];
+      if (!phase4aKeysOnly(body, allowed) || !["customer", "provider", "driver"].includes(body.role)) return null;
+      const out = { role: body.role };
+      const strings = { displayName: 120, phone: 40, address: 500, city: 120, bio: 1000, profileImageUrl: 2048, vehicleType: 80, vehiclePlate: 40 };
+      for (const [key, max] of Object.entries(strings)) {
+        if (body[key] === undefined) continue;
+        if (typeof body[key] !== "string" || body[key].trim().length > max) return null;
+        out[key] = body[key].trim();
+      }
+      if (!out.displayName) return null;
+      for (const key of ["latitude", "longitude"]) {
+        if (body[key] !== undefined) {
+          if (typeof body[key] !== "number" || !Number.isFinite(body[key]) || (key === "latitude" ? Math.abs(body[key]) > 90 : Math.abs(body[key]) > 180)) return null;
+          out[key] = body[key];
+        }
+      }
+      if (body.location !== undefined) {
+        if (!body.location || typeof body.location !== "object" || Array.isArray(body.location) || !phase4aKeysOnly(body.location, ["lat", "lng"]) || typeof body.location.lat !== "number" || typeof body.location.lng !== "number" || !Number.isFinite(body.location.lat) || !Number.isFinite(body.location.lng) || Math.abs(body.location.lat) > 90 || Math.abs(body.location.lng) > 180) return null;
+        out.location = { lat: body.location.lat, lng: body.location.lng };
+      }
+      if (body.cuisineTypes !== undefined) {
+        if (!Array.isArray(body.cuisineTypes) || body.cuisineTypes.length > 20 || body.cuisineTypes.some((item) => typeof item !== "string" || !item.trim() || item.trim().length > 80)) return null;
+        out.cuisineTypes = [...new Set(body.cuisineTypes.map((item) => item.trim()))];
+      }
+      return out;
+    }
+    function profileMatchesExisting(existing, requested, uid, email) {
+      if (!existing || existing._id !== uid || existing.email !== email) return false;
+      return Object.entries(requested).every(([key, value]) => JSON.stringify(existing[key]) === JSON.stringify(value));
+    }
+    async function batchGetUsers(uids, accessToken) {
+      const response = await fetch(FIRESTORE_BASE + ":batchGet", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ documents: uids.map((uid) => "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid) })
+      });
+      if (!response.ok) throw new Error("Firestore batch-get failed: " + response.status);
+      const text = await response.text();
+      let entries;
+      try {
+        const parsed = JSON.parse(text);
+        entries = Array.isArray(parsed) ? parsed : [parsed];
+      } catch {
+        entries = text.split("\n").map((line) => line.trim().replace(/^,\s*|\s*,$/g, "")).filter((line) => line && line !== "[" && line !== "]").map((line) => JSON.parse(line));
+      }
+      return entries.filter((entry) => entry.found).map((entry) => parseFirestoreDoc(entry.found));
+    }
+    async function queryFirestoreLimited(collectionId, fieldPath, op, value, limit, accessToken) {
+      const firestoreValue = typeof value === "string" ? { stringValue: value } : typeof value === "boolean" ? { booleanValue: value } : { integerValue: String(value) };
+      const response = await fetch(FIRESTORE_BASE + ":runQuery", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ structuredQuery: { from: [{ collectionId }], where: { fieldFilter: { field: { fieldPath }, op, value: firestoreValue } }, limit } })
+      });
+      if (!response.ok) throw new Error("Firestore bounded query failed: " + response.status);
+      return (await response.json()).filter((entry) => entry.document).map((entry) => parseFirestoreDoc(entry.document));
+    }
+    function driverAvailableDeliveryDto(order) {
+      const dto = {
+        id: order && (order._id || order.id),
+        offerTitleSnapshot: order && typeof order.offerTitleSnapshot === "string" ? order.offerTitleSnapshot : "",
+        providerUid: order && order.providerUid,
+        deliveryFee: order && typeof order.deliveryFee === "number" ? order.deliveryFee : 0,
+        deliveryDistanceKm: order && typeof order.deliveryDistanceKm === "number" ? order.deliveryDistanceKm : 0,
+        createdAt: order && order.createdAt,
+        deliveryMethod: order && order.deliveryMethod,
+        deliveryStatus: order && order.deliveryStatus,
+        status: order && order.status
+      };
+      // These are pickup-side fields already persisted for customer/provider
+      // delivery display. Never copy customer identity, address, coordinates,
+      // payment fields, notes, or internal state/version fields.
+      if (order && typeof order.pickupAddress === "string" && order.pickupAddress) dto.pickupAddress = order.pickupAddress;
+      if (order && Number.isFinite(order.providerLat) && Number.isFinite(order.providerLng)) dto.pickupLocation = { lat: order.providerLat, lng: order.providerLng };
+      return dto;
+    }
+    function parseAppleSubscriptionStatusPayload(payload) {
+      if (!payload || typeof payload !== "object") return null;
+      const candidate = payload.signedTransactionInfo ? payload.signedTransactionInfo : payload;
+      let transaction = candidate;
+      if (typeof candidate === "string") {
+        const parts = candidate.split(".");
+        if (parts.length !== 3) return null;
+        try { transaction = base64urlDecodeJson(parts[1]); } catch { return null; }
+      }
+      if (!transaction || typeof transaction !== "object") return null;
+      const expiry = Number(transaction.expiresDate);
+      return {
+        status: Number.isInteger(Number(payload.status)) ? Number(payload.status) : NaN,
+        productId: typeof transaction.productId === "string" ? transaction.productId : "",
+        originalTransactionId: String(transaction.originalTransactionId || ""),
+        transactionId: String(transaction.transactionId || ""),
+        appAccountToken: String(transaction.appAccountToken || ""),
+        environment: String(transaction.environment || ""),
+        expiresDate: Number.isFinite(expiry) ? expiry : NaN,
+        revocationDate: transaction.revocationDate == null ? null : Number(transaction.revocationDate)
+      };
+    }
+    function parseAppleSubscriptionStatusResponse(data, fallbackEnvironment) {
+      if (!data || typeof data !== "object") return null;
+      if (data.bundleId != null && data.bundleId !== "com.tabbakheen.app") return null;
+      const environment = data.environment || fallbackEnvironment;
+      if (environment !== fallbackEnvironment || !["Production", "Sandbox"].includes(environment)) return null;
+      const groups = Array.isArray(data.data) ? data.data : [];
+      return {
+        environment,
+        transactions: groups.flatMap((group) => Array.isArray(group && group.lastTransactions) ? group.lastTransactions : []).map((item) => parseAppleSubscriptionStatusPayload(item)).filter(Boolean)
+      };
+    }
+    async function handlePhase4cProfileRegistration(request, accessToken) {
+      let claims;
+      try { claims = await verifyFirebaseIdToken(getTokenFromRequest(request), true); } catch { return phase4aError("UNAUTHORIZED", "Unauthorized", 401); }
+      let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid profile"); }
+      const input = phase4cProfileInput(body);
+      const email = typeof claims.email === "string" ? claims.email.trim().toLowerCase() : "";
+      if (!input || !email) return phase4aError("INVALID_PROFILE", "A Firebase email and valid profile are required");
+      const existing = await getFirestoreDoc("users", claims.sub, accessToken);
+      if (existing) {
+        if (!profileMatchesExisting(existing, input, claims.sub, email)) return phase4aError("PROFILE_CONFLICT", "A conflicting profile already exists", 409);
+        return jsonResponse({ success: true, idempotent: true, profile: existing, entitlement: evaluateSubscriptionEntitlement(existing) });
+      }
+      const now = new Date();
+      const fields = { ...input, uid: claims.sub, email, createdAt: now.toISOString() };
+      if (input.role === "provider" || input.role === "driver") {
+        fields.trialStartedAt = now.toISOString();
+        fields.trialEndsAt = addUtcCalendarMonths(now, 3).toISOString();
+        fields.subscriptionStatus = "trialing";
+        Object.assign(fields, commercialAccessFields(evaluateSubscriptionEntitlement(fields, now)));
+        if (input.role === "driver") fields.isAvailable = false;
+      }
+      const ok = await phase4aCommit([{ update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } }], accessToken);
+      if (!ok) {
+        const raced = await getFirestoreDoc("users", claims.sub, accessToken);
+        if (profileMatchesExisting(raced, input, claims.sub, email)) return jsonResponse({ success: true, idempotent: true, profile: raced, entitlement: evaluateSubscriptionEntitlement(raced) });
+        return phase4aError("PROFILE_CONFLICT", "A conflicting profile already exists", 409);
+      }
+      return jsonResponse({ success: true, profile: fields, entitlement: evaluateSubscriptionEntitlement(fields) }, 201);
+    }
     async function phase4aAppleJwt(env) {
       if (!env.ASC_ISSUER_ID || !env.ASC_KEY_ID || !env.ASC_KEY_P8) throw new Error("Apple credentials unavailable");
       const now = Math.floor(Date.now() / 1e3);
@@ -988,6 +1196,48 @@
       const signed = (await response.json()).signedTransactionInfo;
       if (!signed || signed.split(".").length !== 3) throw new Error("APPLE_TRANSACTION_INVALID");
       return base64urlDecodeJson(signed.split(".")[1]);
+    }
+    async function phase4aAppleSubscriptionStatus(originalTransactionId, env) {
+      if (!phase4aSafeSegment(originalTransactionId)) throw new Error("APPLE_TRANSACTION_INVALID");
+      const bearer = await phase4aAppleJwt(env);
+      const call = (base) => fetch(base + "/inApps/v1/subscriptions/" + encodeURIComponent(originalTransactionId), { headers: { Authorization: "Bearer " + bearer } });
+      let response = await call("https://api.storekit.itunes.apple.com");
+      let environment = "Production";
+      if (response.status === 404 || response.status === 401) {
+        response = await call("https://api.storekit-sandbox.itunes.apple.com");
+        environment = "Sandbox";
+      }
+      if (!response.ok) throw new Error("APPLE_STATUS_UNAVAILABLE");
+      const data = await response.json();
+      const parsed = parseAppleSubscriptionStatusResponse(data, environment);
+      if (!parsed) throw new Error("APPLE_STATUS_SCHEMA_INVALID");
+      return parsed;
+    }
+    async function phase4aReconcileApple(uid, user, env, accessToken) {
+      const original = String(user && user.subscriptionOriginalTransactionId || "");
+      if (!original) throw new Error("APPLE_TRANSACTION_INVALID");
+      const status = await phase4aAppleSubscriptionStatus(original, env);
+      const expectedToken = await phase4aAppleAccountToken(uid);
+      const expectedRole = { tabbakheen_providers_monthly: "provider", tabbakheen_drivers_monthly: "driver" };
+      // Apple status 1 is the only eligible state. 2=expired, 3=billing
+      // retry, 4=grace period, and 5=revoked all fail closed.
+      const transaction = status.transactions.filter((item) => item.status === 1 && item.originalTransactionId === original && item.appAccountToken === expectedToken && expectedRole[item.productId] === user.role && item.environment === status.environment).sort((a, b) => (b.expiresDate || 0) - (a.expiresDate || 0))[0];
+      const now = new Date().toISOString();
+      const allowedEnvironment = status.environment === "Production" || user.activatedByAdmin === true;
+      const active = !!transaction && allowedEnvironment && transaction.expiresDate > Date.now() && transaction.revocationDate == null;
+      const candidate = { ...user, subscriptionStatus: active ? "active" : "expired", subscriptionEndsAt: transaction && Number.isFinite(transaction.expiresDate) ? new Date(transaction.expiresDate).toISOString() : user.subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionEnvironment: status.environment, subscriptionLastVerifiedAt: now };
+      const fields = {
+        subscriptionStatus: candidate.subscriptionStatus,
+        subscriptionPlatform: "apple",
+        subscriptionEnvironment: status.environment,
+        subscriptionLastVerifiedAt: now,
+        ...commercialAccessFields(evaluateSubscriptionEntitlement(candidate))
+      };
+      if (candidate.subscriptionEndsAt) fields.subscriptionEndsAt = candidate.subscriptionEndsAt;
+      const snap = await getFirestoreSnapshot("users", uid, accessToken);
+      if (!snap) throw new Error("PROFILE_NOT_FOUND");
+      if (!(await phase4aCommit([{ update: phase4aDoc("users", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }], accessToken))) throw new Error("STATE_CONFLICT");
+      return { ...candidate, ...fields };
     }
     async function phase4aAppleAccountToken(uid) {
       const hex = await sha256Hex("tabbakheen-apple-account:" + uid);
@@ -1010,7 +1260,10 @@
         return jsonResponse({ success: true, offerId: prior.offerId, offer: offer && { ...offer, id: prior.offerId }, idempotent: true });
       }
       const providerAccess = phase4aProviderAccess(auth.user);
-      if (!providerAccess.ok) return phase4aError(providerAccess.code, "Provider subscription required", 403);
+      if (!providerAccess.ok) {
+        await normalizeCommercialAccess(auth.uid, auth.user, providerAccess.entitlement, accessToken);
+        return phase4aError(providerAccess.code, "Provider subscription required", 403);
+      }
       const offerId = crypto.randomUUID(), now = new Date().toISOString();
       const offer = { id: offerId, ...input, providerUid: auth.uid, providerId: auth.uid, createdAt: now, updatedAt: now, rating: 0, ratingCount: 0, successfulOrders: 0 };
       const ok = await phase4aCommit([
@@ -1042,7 +1295,10 @@
       const offerProvider = await getFirestoreDoc("users", offer.providerUid || offer.providerId, accessToken);
       if (offer.providerUid === auth.uid || offer.providerId === auth.uid) return phase4aError("invalid_offer", "Offer provider is not eligible");
       const offerAccess = phase4aProviderAccess(offerProvider);
-      if (!offerAccess.ok) return phase4aError(offerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403);
+      if (!offerAccess.ok) {
+        await normalizeCommercialAccess(offer.providerUid || offer.providerId, offerProvider, offerAccess.entitlement, accessToken);
+        return phase4aError(offerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403);
+      }
       const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
       if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return phase4aError("invalid_offer", "Offer is malformed");
       const providerUid = offer.providerUid || offer.providerId, now = new Date().toISOString(), orderId = crypto.randomUUID();
@@ -4216,6 +4472,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name(resumeAccountDeletions, "resumeAccountDeletions");
     __name2(resumeAccountDeletions, "resumeAccountDeletions");
     async function handleScheduledOutbox(env) {
+      // Commercial entitlement reconciliation is intentionally event-driven
+      // (entitlement reads and denied mutations). A minute-cron sweep would
+      // require scanning users/offers or new index assumptions, so none is run.
       const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
       const [pending, failed, sent, pendingOrders] = await Promise.all([
         queryFirestore("order_transition_events", "status", "EQUAL", "pending", accessToken),
@@ -4296,6 +4555,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof EMAIL_FROM !== "undefined") env.EMAIL_FROM = EMAIL_FROM;
       } catch {
       }
+      try {
+        if (typeof ASC_ISSUER_ID !== "undefined") env.ASC_ISSUER_ID = ASC_ISSUER_ID;
+      } catch {
+      }
+      try {
+        if (typeof ASC_KEY_ID !== "undefined") env.ASC_KEY_ID = ASC_KEY_ID;
+      } catch {
+      }
+      try {
+        if (typeof ASC_KEY_P8 !== "undefined") env.ASC_KEY_P8 = ASC_KEY_P8;
+      } catch {
+      }
       const url = new URL(request.url);
       const path = url.pathname;
       if (request.method === "OPTIONS") {
@@ -4310,7 +4581,88 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/" && request.method === "GET") {
         return Response.json({ status: "ok", service: "tabbakheen-api", version: "2.2.0", admin: true, pdf: true, deliveryPricingAdmin: true });
       }
+      // Phase 4C commercial access API. These routes are server-authoritative;
+      // deployed Firestore Rules still permit some legacy direct writes, so
+      // Worker enforcement cannot close that separate path until a Rules release.
+      if (path === "/profiles/register" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handlePhase4cProfileRegistration(request, accessToken);
+        } catch (error) {
+          console.error("[ProfileRegistration] Error:", error && error.message ? error.message : error);
+          return phase4aError("INTERNAL_ERROR", "Profile registration failed", 500);
+        }
+      }
+      if (path === "/profiles/me" && request.method === "GET") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        let uid;
+        try { uid = await verifyFirebaseIdToken(getTokenFromRequest(request)); } catch { return phase4aError("UNAUTHORIZED", "Unauthorized", 401); }
+        const profile = await getFirestoreDoc("users", uid, accessToken);
+        return profile ? jsonResponse({ success: true, profile }) : phase4aError("NOT_FOUND", "Profile not found", 404);
+      }
+      if (path === "/subscriptions/entitlement" && request.method === "GET") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        let currentUser = auth.user;
+        if (currentUser.subscriptionPlatform === "apple") {
+          try { currentUser = await phase4aReconcileApple(auth.uid, currentUser, env, accessToken); } catch (error) {
+            console.error("[Apple] On-demand reconciliation failed:", error && error.message ? error.message : error);
+            const entitlement = { eligible: false, reason: "apple_verification_unavailable", role: currentUser.role, source: "apple", endsAt: null };
+            await normalizeCommercialAccess(auth.uid, currentUser, entitlement, accessToken);
+            return jsonResponse({ success: true, entitlement });
+          }
+        }
+        const entitlement = evaluateSubscriptionEntitlement(currentUser);
+        if (url.searchParams.get("normalize") === "true") await normalizeCommercialAccess(auth.uid, currentUser, entitlement, accessToken);
+        return jsonResponse({ success: true, entitlement });
+      }
+      if (path === "/commercial/eligibility" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid UID list"); }
+        if (!phase4aKeysOnly(body, ["uids"]) || !Array.isArray(body.uids) || body.uids.length > 100 || body.uids.some((uid) => !phase4aSafeSegment(uid))) return phase4aError("INVALID_REQUEST", "Up to 100 valid UIDs are accepted");
+        const uids = [...new Set(body.uids)];
+        const users = uids.length ? await batchGetUsers(uids, accessToken) : [];
+        const eligibleUids = users.filter((user) => (user.role === "provider" || user.role === "driver") && evaluateSubscriptionEntitlement(user).eligible).map((user) => user._id);
+        return jsonResponse({ success: true, eligibleUids });
+      }
+      if (path === "/drivers/availability" && request.method === "POST") {
+        let uid;
+        try { uid = await verifyFirebaseIdToken(getTokenFromRequest(request)); } catch { return phase4aError("UNAUTHORIZED", "Unauthorized", 401); }
+        let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid availability"); }
+        if (!phase4aKeysOnly(body, ["isAvailable"]) || typeof body.isAvailable !== "boolean") return phase4aError("INVALID_REQUEST", "Only isAvailable is accepted");
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const user = await getFirestoreDoc("users", uid, accessToken);
+        if (!user || user.role !== "driver") return phase4aError("FORBIDDEN", "Driver account required", 403);
+        const entitlement = evaluateSubscriptionEntitlement(user);
+        if (body.isAvailable && !entitlement.eligible) {
+          await normalizeCommercialAccess(uid, user, entitlement, accessToken);
+          return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
+        }
+        await updateFirestoreDocument("users", uid, { isAvailable: body.isAvailable, ...commercialAccessFields(entitlement) }, accessToken);
+        return jsonResponse({ success: true, isAvailable: body.isAvailable, entitlement });
+      }
+      if (path === "/deliveries/available" && request.method === "GET") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        if (auth.user.role !== "driver") return phase4aError("FORBIDDEN", "Driver account required", 403);
+        const entitlement = evaluateSubscriptionEntitlement(auth.user);
+        if (!entitlement.eligible) {
+          await normalizeCommercialAccess(auth.uid, auth.user, entitlement, accessToken);
+          return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
+        }
+        if (auth.user.isAvailable !== true) return jsonResponse({ success: true, deliveries: [] });
+        const requestedLimit = Number(url.searchParams.get("limit") || 25);
+        if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 50) return phase4aError("INVALID_REQUEST", "limit must be from 1 to 50");
+        // Single-field equality + limit is bounded and uses Firestore's built-in
+        // field index; no collection scan or composite index is required.
+        const deliveries = (await queryFirestoreLimited("orders", "deliveryStatus", "EQUAL", "ready_for_driver", requestedLimit, accessToken)).filter((order) => !order.driverUid && isFulfillmentEligible(order) && isDriverDeliveryMethod(order.deliveryMethod)).map(driverAvailableDeliveryDto);
+        return jsonResponse({ success: true, deliveries });
+      }
       // Authenticated Phase 4A mutation surface.
+      // Google Play has no verified product catalog in this deployment. No
+      // purchase-verification endpoint is exposed and no product IDs are
+      // invented; add one only after the catalog and server verifier exist.
       if (path === "/subscriptions/apple/account-token" && request.method === "POST") {
         const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
         const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
@@ -4337,8 +4689,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (claim && claim.uid !== auth.uid) return phase4aError("APPLE_TRANSACTION_CLAIMED", "Transaction belongs to another account", 409);
           const userSnap = await getFirestoreSnapshot("users", auth.uid, accessToken);
           const currentExpiry = userSnap.data.subscriptionEndsAt ? new Date(userSnap.data.subscriptionEndsAt).getTime() : 0;
-          if (userSnap.data.subscriptionStatus === "active" && currentExpiry >= Number(transaction.expiresDate)) return jsonResponse({ success: true, idempotent: true, subscription: { subscriptionStatus: "active", subscriptionEndsAt: userSnap.data.subscriptionEndsAt } });
-          const fields = { subscriptionStatus: "active", subscriptionProductId: transaction.productId, subscriptionTransactionId: String(transaction.transactionId), subscriptionOriginalTransactionId: originalTransactionId, subscriptionEndsAt: new Date(Number(transaction.expiresDate)).toISOString(), subscriptionPlatform: "apple", subscriptionSyncedAt: new Date().toISOString() };
+          if (userSnap.data.subscriptionStatus === "active" && currentExpiry >= Number(transaction.expiresDate) && currentExpiry > Date.now()) {
+            const existingEntitlement = evaluateSubscriptionEntitlement(userSnap.data);
+            await normalizeCommercialAccess(auth.uid, userSnap.data, existingEntitlement, accessToken);
+            return jsonResponse({ success: true, idempotent: true, subscription: { subscriptionStatus: "active", subscriptionEndsAt: userSnap.data.subscriptionEndsAt, ...commercialAccessFields(existingEntitlement) } });
+          }
+          const subscriptionEndsAt = new Date(Number(transaction.expiresDate)).toISOString();
+          const subscriptionLastVerifiedAt = new Date().toISOString();
+          const activeEntitlement = evaluateSubscriptionEntitlement({ ...userSnap.data, subscriptionStatus: "active", subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionLastVerifiedAt });
+          const fields = { subscriptionStatus: "active", subscriptionProductId: transaction.productId, subscriptionTransactionId: String(transaction.transactionId), subscriptionOriginalTransactionId: originalTransactionId, subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionEnvironment: transaction.environment || "Production", subscriptionLastVerifiedAt, subscriptionSyncedAt: subscriptionLastVerifiedAt, ...commercialAccessFields(activeEntitlement) };
           const writes = [{ update: phase4aDoc("users", auth.uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: userSnap.updateTime } }, auth.deletionFence];
           if (!claim) writes.push({ update: phase4aDoc("apple_transaction_claims", originalTransactionId, { uid: auth.uid, createdAt: new Date().toISOString() }), updateMask: { fieldPaths: ["uid", "createdAt"] }, currentDocument: { exists: false } });
           else writes.push({ verify: "projects/tabbakheen-99883/databases/(default)/documents/apple_transaction_claims/" + originalTransactionId, currentDocument: { updateTime: claimSnap.updateTime } });
@@ -4346,6 +4705,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: true, subscription: fields });
         } catch (error) {
           return phase4aError(error && error.message === "APPLE_TRANSACTION_INVALID" ? "APPLE_TRANSACTION_INVALID" : "APPLE_SYNC_FAILED", "Apple subscription sync failed", 502);
+        }
+      }
+      if (path === "/subscriptions/apple/reconcile" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          if (auth.user.role !== "provider" && auth.user.role !== "driver") return phase4aError("APPLE_PRODUCT_FORBIDDEN", "Apple subscription is not available for this role", 403);
+          const user = await phase4aReconcileApple(auth.uid, auth.user, env, accessToken);
+          return jsonResponse({ success: true, entitlement: evaluateSubscriptionEntitlement(user), subscription: { subscriptionStatus: user.subscriptionStatus, subscriptionEndsAt: user.subscriptionEndsAt || null, subscriptionEnvironment: user.subscriptionEnvironment } });
+        } catch (error) {
+          return phase4aError("APPLE_RECONCILIATION_FAILED", "Apple subscription reconciliation failed", 502);
         }
       }
       if (path === "/ratings/submit" && request.method === "POST") {
@@ -4382,7 +4752,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
           if (path === "/offers/update") {
             if (auth.user.role !== "provider" || !phase4aSafeSegment(body.offerId)) return phase4aError("forbidden", "Provider ownership required", 403);
-            const updateAccess = phase4aProviderAccess(auth.user); if (!updateAccess.ok) return phase4aError(updateAccess.code, "Provider subscription required", 403);
+            const updateAccess = phase4aProviderAccess(auth.user); if (!updateAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, updateAccess.entitlement, accessToken); return phase4aError(updateAccess.code, "Provider subscription required", 403); }
             const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
             if (!offerSnap) return phase4aError("offer_not_found", "Offer not found", 404);
             if (offerSnap.data.providerUid !== auth.uid && offerSnap.data.providerId !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
@@ -4413,6 +4783,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const snap = await getFirestoreSnapshot("orders", body.orderId, accessToken); if (!snap) return phase4aError("not_found", "Order not found", 404);
             const order = snap.data;
             if (auth.user.role !== "provider" || order.providerUid !== auth.uid || order.paymentStatus !== "PROOF_SENT" || !["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status)) return phase4aError("forbidden", "Payment confirmation is not allowed", 403);
+            const providerAccess = phase4aProviderAccess(auth.user);
+            if (!providerAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, providerAccess.entitlement, accessToken); return phase4aError(providerAccess.code, "Provider subscription required", 403); }
             const fields = { paymentStatus: "PAID_CONFIRMED", paymentConfirmedBy: auth.uid, paymentConfirmedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
             if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
             return jsonResponse({ success: true, orderId: body.orderId, paymentStatus: "PAID_CONFIRMED" });
@@ -4421,6 +4793,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if (!phase4aKeysOnly(body, ["orderId", "reason"]) || !phase4aSafeSegment(body.orderId)) return phase4aError("invalid_request", "Invalid payment rejection");
             const snap = await getFirestoreSnapshot("orders", body.orderId, accessToken); if (!snap) return phase4aError("not_found", "Order not found", 404);
             if (auth.user.role !== "provider" || snap.data.providerUid !== auth.uid || snap.data.paymentStatus !== "PROOF_SENT" || !["pending", "accepted", "preparing", "ready_for_pickup"].includes(snap.data.status) || (body.reason != null && (typeof body.reason !== "string" || body.reason.length > 500))) return phase4aError("forbidden", "Payment rejection is not allowed", 403);
+            const providerAccess = phase4aProviderAccess(auth.user);
+            if (!providerAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, providerAccess.entitlement, accessToken); return phase4aError(providerAccess.code, "Provider subscription required", 403); }
             const fields = { paymentStatus: "PAYMENT_REJECTED", paymentRejectionReason: String(body.reason || "").trim(), paymentRejectedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
             if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
             return jsonResponse({ success: true, orderId: body.orderId, paymentStatus: "PAYMENT_REJECTED" });
@@ -4434,13 +4808,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
           if (auth.user.role !== "provider") return phase4aError("forbidden", "Provider account required", 403);
-          const mutationAccess = phase4aProviderAccess(auth.user); if (!mutationAccess.ok) return phase4aError(mutationAccess.code, "Provider subscription required", 403);
           const offerId = decodeURIComponent((offerAvailabilityMatch || offerDeleteMatch)[1]);
           if (!phase4aSafeSegment(offerId)) return phase4aError("INVALID_REQUEST", "Invalid offer id", 400);
           const snap = await getFirestoreSnapshot("offers", offerId, accessToken);
           if (!snap) return phase4aError("offer_not_found", "Offer not found", 404);
           if (snap.data.providerUid !== auth.uid && snap.data.providerId !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
           let body = {}; try { body = await request.json(); } catch {}
+          const mutationAccess = phase4aProviderAccess(auth.user);
+          const turningOff = !!offerAvailabilityMatch && body.isAvailable === false;
+          if (!turningOff && !mutationAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, mutationAccess.entitlement, accessToken); return phase4aError(mutationAccess.code, "Provider subscription required", 403); }
           if (offerAvailabilityMatch) {
             if (!phase4aKeysOnly(body, ["isAvailable"]) || typeof body.isAvailable !== "boolean") return phase4aError("invalid_request", "Only isAvailable is accepted");
             const fields = { isAvailable: body.isAvailable, updatedAt: new Date().toISOString() };
