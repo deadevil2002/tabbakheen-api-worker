@@ -36,7 +36,7 @@
     }
     __name(importPrivateKey, "importPrivateKey");
     __name2(importPrivateKey, "importPrivateKey");
-    async function createJWT(clientEmail, privateKey) {
+    async function createJWT(clientEmail, privateKey, scope = "https://www.googleapis.com/auth/datastore") {
       const now = Math.floor(Date.now() / 1e3);
       const header = { alg: "RS256", typ: "JWT" };
       const payload = {
@@ -45,7 +45,7 @@
         aud: TOKEN_URL,
         iat: now,
         exp: now + 3600,
-        scope: "https://www.googleapis.com/auth/datastore"
+         scope
       };
       const encodedHeader = base64urlStr(JSON.stringify(header));
       const encodedPayload = base64urlStr(JSON.stringify(payload));
@@ -60,8 +60,8 @@
     }
     __name(createJWT, "createJWT");
     __name2(createJWT, "createJWT");
-    async function getAccessToken(clientEmail, privateKey) {
-      const jwt = await createJWT(clientEmail, privateKey);
+    async function getAccessToken(clientEmail, privateKey, scope = "https://www.googleapis.com/auth/datastore") {
+      const jwt = await createJWT(clientEmail, privateKey, scope);
       const response = await fetch(TOKEN_URL, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1748,7 +1748,7 @@
     }
     __name(getFirebaseJwks, "getFirebaseJwks");
     __name2(getFirebaseJwks, "getFirebaseJwks");
-    async function verifyFirebaseIdToken(idToken) {
+    async function verifyFirebaseIdToken(idToken, includeClaims = false) {
       if (!idToken || typeof idToken !== "string") throw new Error("Missing Firebase ID token");
       const parts = idToken.split(".");
       if (parts.length !== 3) throw new Error("Invalid Firebase ID token");
@@ -1781,7 +1781,7 @@
         new TextEncoder().encode(encodedHeader + "." + encodedPayload)
       );
       if (!valid) throw new Error("Invalid Firebase token signature");
-      return payload.sub;
+       return includeClaims ? payload : payload.sub;
     }
     __name(verifyFirebaseIdToken, "verifyFirebaseIdToken");
     __name2(verifyFirebaseIdToken, "verifyFirebaseIdToken");
@@ -3731,6 +3731,316 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(pollOutboxReceipts, "pollOutboxReceipts");
     __name2(pollOutboxReceipts, "pollOutboxReceipts");
+    const ACCOUNT_DELETION_STATUSES = ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed", "failed"];
+    const ACCOUNT_DELETION_BLOCKED_STATUSES = ["in_progress", "auth_deleted", "cleanup_pending", "completed"];
+    const ACCOUNT_DELETE_CODES = ["ACTIVE_ORDERS", "ADMIN_REQUIRED", "REAUTH_REQUIRED", "INVALID_REQUEST", "ACCOUNT_DELETE_FAILED"];
+    const ACCOUNT_DELETION_ACTIVE_ORDER_STATUSES = ["pending", "accepted", "preparing", "ready_for_pickup", "searching_driver", "assigned_to_driver", "picked_up"];
+    const ACCOUNT_DELETION_ACTIVE_DELIVERY_STATUSES = ["ready_for_driver", "driver_assigned", "picked_up", "arrived", "delivered_pending_confirmation", "self_pickup_selected", "pending_driver", "in_transit"];
+    async function deleteFirebaseAuthUser(uid, env) {
+      let response;
+      try {
+        const token = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY, "https://www.googleapis.com/auth/identitytoolkit");
+        response = await fetch("https://identitytoolkit.googleapis.com/v1/projects/tabbakheen-99883/accounts:delete", {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+          body: JSON.stringify({ localId: uid })
+        });
+      } catch {
+        return { outcome: "uncertain" };
+      }
+      if (response.ok) return { outcome: "success" };
+      let data = {};
+      try { data = await response.json(); } catch {}
+      if (String(data.error?.message || "").startsWith("USER_NOT_FOUND") || data.error?.status === "NOT_FOUND") return { outcome: "success" };
+      if ([400, 401, 403].includes(response.status)) return { outcome: "permanent" };
+      return { outcome: "uncertain" };
+    }
+    __name(deleteFirebaseAuthUser, "deleteFirebaseAuthUser");
+    __name2(deleteFirebaseAuthUser, "deleteFirebaseAuthUser");
+    function cloudinaryPublicIdFromVerification(verification) {
+      const candidate = verification?.freelanceCertificate?.publicId || verification?.freelanceCertificate?.public_id;
+      return typeof candidate === "string" && /^tabbakheen\/freelance_certificates\/[A-Za-z0-9_-]+$/.test(candidate) ? candidate : null;
+    }
+    __name(cloudinaryPublicIdFromVerification, "cloudinaryPublicIdFromVerification");
+    __name2(cloudinaryPublicIdFromVerification, "cloudinaryPublicIdFromVerification");
+    async function destroyFreelanceCertificate(publicId, env) {
+      if (!publicId) return false;
+      if (!env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) throw new Error("Cloudinary credentials unavailable");
+      const cloudName = env.CLOUDINARY_CLOUD_NAME || "dv6n9vnly";
+      const timestamp = Math.floor(Date.now() / 1e3);
+      const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode("public_id=" + publicId + "&timestamp=" + timestamp + env.CLOUDINARY_API_SECRET));
+      const signature = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      const form = new FormData();
+      form.append("public_id", publicId);
+      form.append("timestamp", String(timestamp));
+      form.append("api_key", env.CLOUDINARY_API_KEY);
+      form.append("signature", signature);
+      const response = await fetch("https://api.cloudinary.com/v1_1/" + cloudName + "/image/destroy", { method: "POST", body: form });
+      if (!response.ok) throw new Error("Certificate cleanup failed");
+      return true;
+    }
+    __name(destroyFreelanceCertificate, "destroyFreelanceCertificate");
+    __name2(destroyFreelanceCertificate, "destroyFreelanceCertificate");
+    function orderIsActive(order) {
+      return ACCOUNT_DELETION_ACTIVE_ORDER_STATUSES.includes(order?.status) || ACCOUNT_DELETION_ACTIVE_DELIVERY_STATUSES.includes(order?.deliveryStatus);
+    }
+    __name(orderIsActive, "orderIsActive");
+    __name2(orderIsActive, "orderIsActive");
+    async function accountDeletionActiveOrders(uid, role, accessToken) {
+      const matches = [];
+      const roleField = { customer: "customerUid", provider: "providerUid", driver: "driverUid" }[role];
+      if (!roleField) return matches;
+      const orders = await queryFirestore("orders", roleField, "EQUAL", uid, accessToken);
+      for (const order of orders) if (orderIsActive(order)) matches.push(order);
+      return matches;
+    }
+    __name(accountDeletionActiveOrders, "accountDeletionActiveOrders");
+    __name2(accountDeletionActiveOrders, "accountDeletionActiveOrders");
+    const ACCOUNT_DELETION_LEASE_MS = 12e4;
+    function deletionTransitionAllowed(current, next) {
+      if (current === "completed") return next === "completed";
+      if (current === "cleanup_pending") return next === "cleanup_pending" || next === "completed";
+      if (current === "auth_deleted") return next === "auth_deleted" || next === "cleanup_pending" || next === "completed";
+      return true;
+    }
+    __name(deletionTransitionAllowed, "deletionTransitionAllowed");
+    __name2(deletionTransitionAllowed, "deletionTransitionAllowed");
+    async function claimAccountDeletion(uid, accessToken) {
+      const owner = crypto.randomUUID();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const snapshot = await getFirestoreSnapshot("account_deletion_requests", uid, accessToken);
+        if (!snapshot) return { claimed: false, state: null };
+        const now = Date.now();
+        if (snapshot.data.status === "completed") return { claimed: false, state: snapshot.data };
+        if (snapshot.data.executionLeaseOwner && new Date(snapshot.data.executionLeaseUntil || 0).getTime() > now) return { claimed: false, state: snapshot.data };
+        const executionLeaseUntil = new Date(now + ACCOUNT_DELETION_LEASE_MS).toISOString();
+        const claimed = await compareAndSetFirestoreDocument("account_deletion_requests", uid, {
+          executionLeaseOwner: owner,
+          executionLeaseUntil,
+          updatedAt: new Date(now).toISOString()
+        }, snapshot.updateTime, accessToken);
+        if (claimed.ok) return { claimed: true, owner, state: { ...snapshot.data, executionLeaseOwner: owner, executionLeaseUntil } };
+      }
+      const latest = await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+      return { claimed: false, state: latest };
+    }
+    __name(claimAccountDeletion, "claimAccountDeletion");
+    __name2(claimAccountDeletion, "claimAccountDeletion");
+    async function writeDeletionState(uid, owner, fields, accessToken, releaseLease = false) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const snapshot = await getFirestoreSnapshot("account_deletion_requests", uid, accessToken);
+        if (!snapshot) return null;
+        const now = Date.now();
+        if (snapshot.data.executionLeaseOwner !== owner || new Date(snapshot.data.executionLeaseUntil || 0).getTime() <= now) return null;
+        const nextStatus = fields.status || snapshot.data.status;
+        if (!deletionTransitionAllowed(snapshot.data.status, nextStatus)) return null;
+        const nextFields = {
+          ...fields,
+          executionLeaseOwner: releaseLease ? null : owner,
+          executionLeaseUntil: releaseLease ? null : new Date(now + ACCOUNT_DELETION_LEASE_MS).toISOString(),
+          updatedAt: new Date(now).toISOString()
+        };
+        const written = await compareAndSetFirestoreDocument("account_deletion_requests", uid, nextFields, snapshot.updateTime, accessToken);
+        if (written.ok) return { ...snapshot.data, ...nextFields };
+      }
+      return null;
+    }
+    __name(writeDeletionState, "writeDeletionState");
+    __name2(writeDeletionState, "writeDeletionState");
+    function cleanupLimitationsFrom(value, label, result = []) {
+      if (!value || typeof value !== "object") return result;
+      const entries = Object.entries(value);
+      const hasSiblingPublicId = entries.some(([key, item]) => typeof item === "string" && item && /public[_-]?id/i.test(key));
+      for (const [key, item] of entries) {
+        if (typeof item === "string" && /url/i.test(key) && item && !hasSiblingPublicId && !/(public[_-]?id|cloudinary)/i.test(key)) result.push(label + "." + key + "_has_no_public_id");
+        else if (item && typeof item === "object") cleanupLimitationsFrom(item, label + "." + key, result);
+      }
+      return result;
+    }
+    __name(cleanupLimitationsFrom, "cleanupLimitationsFrom");
+    __name2(cleanupLimitationsFrom, "cleanupLimitationsFrom");
+    async function buildAccountDeletionManifest(uid, user, accessToken) {
+      const verification = await getFirestoreDoc("verifications", uid, accessToken);
+      const certificatePublicId = cloudinaryPublicIdFromVerification(verification);
+      const offers = user.role === "provider" ? await queryFirestore("offers", "providerId", "EQUAL", uid, accessToken) : [];
+      if (user.role === "provider") {
+        const legacyOffers = await queryFirestore("offers", "providerUid", "EQUAL", uid, accessToken);
+        for (const offer of legacyOffers) if (!offers.some((item) => item._id === offer._id)) offers.push(offer);
+      }
+      const cleanupLimitations = cleanupLimitationsFrom(user, "profile");
+      const verificationLimitations = cleanupLimitationsFrom(verification, "verification");
+      cleanupLimitations.push(...(certificatePublicId ? verificationLimitations.filter((item) => !item.startsWith("verification.freelanceCertificate.fileUrl_has_no_public_id")) : verificationLimitations));
+      cleanupLimitations.push(...offers.flatMap((offer) => cleanupLimitationsFrom(offer, "offer")));
+      if (!certificatePublicId && verification?.freelanceCertificate?.fileUrl) cleanupLimitations.push("certificate_url_has_no_public_id");
+      return {
+        role: user.role,
+        certificatePublicId,
+        certificateDeleted: !certificatePublicId,
+        remainingOfferIds: [...new Set(offers.map((offer) => offer?._id).filter(Boolean))],
+        userDeleted: false,
+        verificationDeleted: false,
+        cleanupLimitations: [...new Set(cleanupLimitations)]
+      };
+    }
+    __name(buildAccountDeletionManifest, "buildAccountDeletionManifest");
+    __name2(buildAccountDeletionManifest, "buildAccountDeletionManifest");
+    async function createAccountDeletionRequestIfAbsent(uid, record, accessToken) {
+      const fields = {};
+      for (const [key, value] of Object.entries(record)) fields[key] = toFirestoreValue(value);
+      const response = await fetch(FIRESTORE_BASE + "/account_deletion_requests?documentId=" + encodeURIComponent(uid), {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields })
+      });
+      if (response.ok) return true;
+      let status = "";
+      try { status = (await response.json()).error?.status || ""; } catch {}
+      if (response.status === 409 || response.status === 412 || status === "ALREADY_EXISTS") return false;
+      throw new Error("Deletion request creation failed");
+    }
+    __name(createAccountDeletionRequestIfAbsent, "createAccountDeletionRequestIfAbsent");
+    __name2(createAccountDeletionRequestIfAbsent, "createAccountDeletionRequestIfAbsent");
+    async function executeAccountDeletionCleanup(uid, env, accessToken, record, owner) {
+      const manifest = { ...(record.cleanupManifest || {}) };
+      manifest.remainingOfferIds = Array.isArray(manifest.remainingOfferIds) ? manifest.remainingOfferIds : [];
+      manifest.cleanupLimitations = Array.isArray(manifest.cleanupLimitations) ? manifest.cleanupLimitations : [];
+      const failures = [];
+      // Known media is optional infrastructure, isolated from all critical deletes.
+      if (manifest.certificatePublicId && manifest.certificateDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await destroyFreelanceCertificate(manifest.certificatePublicId, env);
+          manifest.certificateDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch {
+          failures.push("certificate_delete_failed");
+        }
+      }
+      for (const offerId of [...manifest.remainingOfferIds]) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument("offers", offerId, accessToken);
+          manifest.remainingOfferIds = manifest.remainingOfferIds.filter((id) => id !== offerId);
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch {
+          failures.push("offer_delete_failed");
+        }
+      }
+      if (manifest.userDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument("users", uid, accessToken);
+          manifest.userDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("user_delete_failed"); }
+      }
+      if (manifest.verificationDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument("verifications", uid, accessToken);
+          manifest.verificationDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("verification_delete_failed"); }
+      }
+      const complete = manifest.remainingOfferIds.length === 0 && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
+      const final = await writeDeletionState(uid, owner, {
+        status: complete ? "completed" : "cleanup_pending",
+        cleanupManifest: manifest,
+        cleanupFailures: [...new Set(failures)],
+        failureCode: complete ? "" : "cleanup_failed",
+        code: complete ? null : "ACCOUNT_DELETE_FAILED",
+        completedAt: complete ? new Date().toISOString() : null
+      }, accessToken, true);
+      return final || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+    }
+    __name(executeAccountDeletionCleanup, "executeAccountDeletionCleanup");
+    __name2(executeAccountDeletionCleanup, "executeAccountDeletionCleanup");
+    async function processAccountDeletion(uid, env, accessToken, existing, user) {
+      const claim = await claimAccountDeletion(uid, accessToken);
+      if (!claim.claimed) return { ...(claim.state || existing || {}), claimLost: true };
+      const owner = claim.owner;
+      let record = claim.state;
+      if (record.status === "requested" || record.status === "failed") {
+        user = user || await getFirestoreDoc("users", uid, accessToken);
+        if (!user || !["customer", "provider", "driver"].includes(user.role) || user.isOwner === true || user.privileged === true) {
+          return await writeDeletionState(uid, owner, { status: "failed", code: "ADMIN_REQUIRED", failureCode: "ineligible" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        }
+        const active = await accountDeletionActiveOrders(uid, user.role, accessToken);
+        if (active.length) {
+          return await writeDeletionState(uid, owner, { status: "failed", code: "ACTIVE_ORDERS", failureCode: "active_orders" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        }
+        const cleanupManifest = await buildAccountDeletionManifest(uid, user, accessToken);
+        record = await writeDeletionState(uid, owner, { uid, role: user.role, status: "in_progress", cleanupManifest, code: null, failureCode: "" }, accessToken);
+        if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+      }
+      if (record.status === "in_progress") {
+        if (!record.cleanupManifest) throw new Error("Cleanup manifest unavailable");
+        record = await writeDeletionState(uid, owner, { status: "in_progress" }, accessToken);
+        if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        const authResult = await deleteFirebaseAuthUser(uid, env);
+        if (authResult.outcome === "uncertain") {
+          return await writeDeletionState(uid, owner, { status: "in_progress", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_uncertain" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        }
+        if (authResult.outcome === "permanent") {
+          return await writeDeletionState(uid, owner, { status: "failed", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_rejected" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        }
+        record = await writeDeletionState(uid, owner, { status: "auth_deleted", authDeletedAt: new Date().toISOString(), code: null, failureCode: "" }, accessToken);
+        if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+      }
+      if (record.status === "auth_deleted" || record.status === "cleanup_pending") {
+        if (record.status === "auth_deleted") {
+          record = await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken);
+          if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        }
+        // Orders, complaints, ratings, and audit records are intentionally preserved.
+        return await executeAccountDeletionCleanup(uid, env, accessToken, record, owner);
+      }
+      return record;
+    }
+    __name(processAccountDeletion, "processAccountDeletion");
+    __name2(processAccountDeletion, "processAccountDeletion");
+    async function handleAccountDeletion(request, env, accessToken, uid, claims) {
+      if (request.method === "GET") {
+        const record = await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        return jsonResponse({ success: true, status: record?.status || "none", code: record?.code || null });
+      }
+      if (request.method !== "POST") return jsonResponse({ success: false, error: "Method not allowed" }, 405);
+      if (!claims.auth_time || Math.floor(Date.now() / 1e3) - Number(claims.auth_time) > 300 || Number(claims.auth_time) > Math.floor(Date.now() / 1e3) + 30) return jsonResponse({ success: false, code: "REAUTH_REQUIRED", error: "Recent authentication required" }, 401);
+      let body;
+      try { body = await request.json(); } catch { return jsonResponse({ success: false, code: "INVALID_REQUEST", error: "Valid JSON required" }, 400); }
+      if (!body || body.confirm !== true || Object.keys(body).some((key) => !["confirm"].includes(key))) return jsonResponse({ success: false, code: "INVALID_REQUEST", error: "confirm:true is required" }, 400);
+      const existing = await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+      if (existing?.status === "completed") return jsonResponse({ success: true, status: "completed", code: null, idempotent: true });
+      if (existing?.status && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(existing.status)) return jsonResponse({ success: true, status: existing.status, code: existing.code || null, idempotent: true });
+      const user = await getFirestoreDoc("users", uid, accessToken);
+      if (!user || !["customer", "provider", "driver"].includes(user.role) || user.isOwner === true || user.privileged === true) return jsonResponse({ success: false, code: "ADMIN_REQUIRED", error: "Account is not eligible" }, 403);
+      const record = existing || { uid, role: user.role, status: "requested", requestedAt: new Date().toISOString() };
+      if (!existing) await createAccountDeletionRequestIfAbsent(uid, record, accessToken);
+      try {
+        const result = await processAccountDeletion(uid, env, accessToken, record, user);
+        return jsonResponse({ success: result.status === "completed", status: result.status, code: result.code || null, idempotent: !!existing });
+      } catch {
+        let persisted = null;
+        try { persisted = await getFirestoreDoc("account_deletion_requests", uid, accessToken); } catch {}
+        return jsonResponse({ success: false, status: persisted?.status || "failed", code: "ACCOUNT_DELETE_FAILED", error: "Account deletion could not be completed" }, 500);
+      }
+    }
+    __name(handleAccountDeletion, "handleAccountDeletion");
+    __name2(handleAccountDeletion, "handleAccountDeletion");
+    async function resumeAccountDeletions(env) {
+      const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      const records = [];
+      for (const status of ["requested", "in_progress", "auth_deleted", "cleanup_pending"]) records.push(...await queryFirestore("account_deletion_requests", "status", "EQUAL", status, accessToken));
+      for (const record of records.slice(0, 10)) {
+        try { await processAccountDeletion(record.uid, env, accessToken, record); } catch {}
+      }
+    }
+    __name(resumeAccountDeletions, "resumeAccountDeletions");
+    __name2(resumeAccountDeletions, "resumeAccountDeletions");
     async function handleScheduledOutbox(env) {
       const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
       const [pending, failed, sent, pendingOrders] = await Promise.all([
@@ -3761,7 +4071,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
     addEventListener("scheduled", (event) => {
       const env = typeof globalThis !== "undefined" ? globalThis : {};
-      event.waitUntil(handleScheduledOutbox(env));
+       event.waitUntil(Promise.all([handleScheduledOutbox(env), resumeAccountDeletions(env)]));
     });
     addEventListener("fetch", (event) => {
       event.respondWith(handleRequest(event.request, event));
@@ -4395,6 +4705,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ error: e.message || "Internal error" }, 500);
         }
       }
+      if ((path === "/account/delete" && request.method === "POST") || (path === "/account/delete/status" && request.method === "GET")) {
+        let claims;
+        try { claims = await verifyFirebaseIdToken(getTokenFromRequest(request), true); }
+        catch { return jsonResponse({ success: false, error: "Unauthorized" }, 401); }
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        return await handleAccountDeletion(request, env, accessToken, claims.sub, claims);
+      }
       const apiKey = request.headers.get("x-api-key");
       const hasServiceKey = !!apiKey && !!env.API_KEY && apiKey === env.API_KEY;
       let callerUid = "";
@@ -4404,6 +4721,16 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch (e) {
           console.log("[Auth] Rejected app request:", e && e.message ? e.message : e);
           return Response.json({ success: false, error: "Unauthorized" }, { status: 401, headers: { "Access-Control-Allow-Origin": "*" } });
+        }
+      }
+      if (!hasServiceKey && callerUid) {
+        // Residual constraint: this Worker gate cannot revoke a stale token used
+        // directly against Firestore; that boundary remains governed by deployed Rules.
+        try {
+          const deletion = await getFirestoreDoc("account_deletion_requests", callerUid, await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY));
+          if (deletion && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(deletion.status)) return jsonResponse({ success: false, error: "Account deletion in progress" }, 403);
+        } catch {
+          return jsonResponse({ success: false, error: "Authorization unavailable" }, 503);
         }
       }
       if (path === "/verify-cr" && request.method === "POST") {
