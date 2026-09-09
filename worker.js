@@ -414,10 +414,13 @@
     function isProviderAccountAllowed(user) {
       if (!user || user.role !== "provider") return false;
       if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return false;
-      // Provider subscription fields have historically not been mirrored on
-      // every user document. Ownership plus an account that is not disabled is
-      // the established transition convention; do not create a new gate here.
-      return true;
+      if (user.activatedByAdmin === true) return true;
+      if (user.subscriptionStatus === "active") {
+        const end = user.subscriptionEndsAt ? new Date(user.subscriptionEndsAt).getTime() : NaN;
+        if (!Number.isFinite(end) || end > Date.now()) return true;
+      }
+      if (user.trialEndsAt && new Date(user.trialEndsAt).getTime() > Date.now()) return true;
+      return !!user.createdAt && new Date(user.createdAt).getTime() + 30 * 864e5 > Date.now();
     }
     __name(isProviderAccountAllowed, "isProviderAccountAllowed");
     __name2(isProviderAccountAllowed, "isProviderAccountAllowed");
@@ -884,6 +887,177 @@
     }
     __name(deleteFirestoreDocument, "deleteFirestoreDocument");
     __name2(deleteFirestoreDocument, "deleteFirestoreDocument");
+    // Phase 4A server-owned offer/order writes.  These handlers deliberately
+    // construct documents from small allowlists; request bodies are never
+    // spread into Firestore.
+    const PHASE4A_ACTIVE_ORDER_STATES = ["pending", "accepted", "preparing", "ready_for_pickup", "searching_driver", "assigned_to_driver", "picked_up"];
+    const order_idempotency = "order_creation_requests";
+    const offer_idempotency = "offer_creation_requests";
+    const PHASE4A_ERROR_CODES = ["UNAUTHORIZED", "FORBIDDEN", "OFFER_NOT_FOUND", "OFFER_UNAVAILABLE", "INVALID_OFFER", "INVALID_PRICE", "INVALID_QUANTITY", "ACTIVE_ORDER_CONFLICT", "SUBSCRIPTION_REQUIRED", "ACCOUNT_SUSPENDED", "PAYMENT_REJECTED"];
+    function phase4aError(code, error, status = 400) {
+      return jsonResponse({ success: false, code: String(code).toUpperCase(), error }, status);
+    }
+    function phase4aKeysOnly(body, keys) {
+      return body && typeof body === "object" && !Array.isArray(body) && Object.keys(body).every((key) => keys.includes(key));
+    }
+    function phase4aSafeSegment(value) {
+      return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+    }
+    function phase4aDeletionFence(uid, snapshot) {
+      return { verify: "projects/tabbakheen-99883/databases/(default)/documents/account_deletion_requests/" + uid, currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
+    }
+    function phase4aProviderAccess(user) {
+      if (!user || user.role !== "provider" || user.accountStatus === "suspended" || user.accountStatus === "disabled") return { ok: false, code: "FORBIDDEN" };
+      if (user.activatedByAdmin === true) return { ok: true };
+      if (user.subscriptionStatus === "active") {
+        if (!Object.prototype.hasOwnProperty.call(user, "subscriptionEndsAt")) return { ok: true };
+        const subscriptionEnd = new Date(user.subscriptionEndsAt).getTime();
+        return Number.isFinite(subscriptionEnd) && subscriptionEnd > Date.now() ? { ok: true } : { ok: false, code: "SUBSCRIPTION_REQUIRED" };
+      }
+      if (Object.prototype.hasOwnProperty.call(user, "trialEndsAt")) {
+        const trialEnd = new Date(user.trialEndsAt).getTime();
+        return Number.isFinite(trialEnd) && trialEnd > Date.now() ? { ok: true } : { ok: false, code: "SUBSCRIPTION_REQUIRED" };
+      }
+      if (!user.createdAt || new Date(user.createdAt).getTime() + 30 * 864e5 > Date.now()) return { ok: true };
+      return { ok: false, code: "SUBSCRIPTION_REQUIRED" };
+    }
+    function phase4aOfferInput(body) {
+      if (!phase4aKeysOnly(body, ["requestId", "title", "description", "price", "category", "imageUrl", "availabilityType", "preparationTimeMinutes", "isAvailable"])) return null;
+      const title = typeof body.title === "string" ? body.title.trim() : "";
+      const description = typeof body.description === "string" ? body.description.trim() : "";
+      const category = typeof body.category === "string" ? body.category.trim() : "";
+      const price = body.price;
+      const availabilityType = body.availabilityType;
+      if (!title || title.length > 120 || description.length < 10 || description.length > 500 || !category || category.length > 80) return null;
+      if (typeof price !== "number" || !Number.isFinite(price) || price <= 0 || price > 1000000) return null;
+      if (!["immediate", "preorder"].includes(availabilityType)) return null;
+      let preparationTimeMinutes = null;
+      if (availabilityType === "preorder") {
+        if (!Number.isInteger(body.preparationTimeMinutes) || body.preparationTimeMinutes < 15 || body.preparationTimeMinutes > 1440) return null;
+        preparationTimeMinutes = body.preparationTimeMinutes;
+      }
+      let imageUrl = "";
+      if (body.imageUrl != null) {
+        if (typeof body.imageUrl !== "string" || body.imageUrl.length > 2048 || !/^https:\/\/(res\.cloudinary\.com\/|images\.unsplash\.com\/)/i.test(body.imageUrl)) return null;
+        imageUrl = body.imageUrl;
+      }
+      if (body.isAvailable !== undefined && typeof body.isAvailable !== "boolean") return null;
+      return { title, description, price, category, imageUrl, availabilityType, preparationTimeMinutes, isAvailable: body.isAvailable === undefined ? true : body.isAvailable };
+    }
+    async function phase4aAuth(request, accessToken) {
+      let uid;
+      try { uid = await verifyFirebaseIdToken(getTokenFromRequest(request)); } catch { return { response: phase4aError("unauthorized", "Unauthorized", 401) }; }
+      const user = await getFirestoreDoc("users", uid, accessToken);
+      if (!user) return { response: phase4aError("forbidden", "Account not found", 403) };
+      const deletionSnapshot = await getFirestoreSnapshot("account_deletion_requests", uid, accessToken);
+      const deletion = deletionSnapshot?.data;
+      if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.status)) return { response: phase4aError("account_deletion_blocked", "Account deletion is in progress", 403) };
+      if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return { response: phase4aError("account_suspended", "Account is not active", 403) };
+      return { uid, user, deletionFence: phase4aDeletionFence(uid, deletionSnapshot) };
+    }
+    async function phase4aCommit(writes, accessToken) {
+      const response = await fetch(FIRESTORE_BASE + ":commit", {
+        method: "POST", headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ writes })
+      });
+      if (response.ok) return true;
+      const text = await response.text();
+      let status = ""; try { status = JSON.parse(text).error?.status || ""; } catch {}
+      if ([409, 412].includes(response.status) || ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(status)) return false;
+      throw new Error("Firestore Phase 4A commit failed: " + response.status);
+    }
+    function phase4aDoc(collection, id, fields) {
+      const out = {}; for (const [key, value] of Object.entries(fields)) out[key] = toFirestoreValue(value);
+      return { name: "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id, fields: out };
+    }
+    async function phase4aAppleJwt(env) {
+      if (!env.ASC_ISSUER_ID || !env.ASC_KEY_ID || !env.ASC_KEY_P8) throw new Error("Apple credentials unavailable");
+      const now = Math.floor(Date.now() / 1e3);
+      const header = base64urlStr(JSON.stringify({ alg: "ES256", kid: env.ASC_KEY_ID, typ: "JWT" }));
+      const payload = base64urlStr(JSON.stringify({ iss: env.ASC_ISSUER_ID, iat: now, exp: now + 300, aud: "appstoreconnect-v1", bid: "com.tabbakheen.app" }));
+      const pem = env.ASC_KEY_P8.replace(/\\n/g, "\n").replace(/-----[^-]+-----/g, "").replace(/\s/g, "");
+      const key = await crypto.subtle.importKey("pkcs8", Uint8Array.from(atob(pem), (c) => c.charCodeAt(0)), { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+      return header + "." + payload + "." + base64url(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(header + "." + payload)));
+    }
+    async function phase4aAppleTransaction(transactionId, env) {
+      const bearer = await phase4aAppleJwt(env);
+      const call = (base) => fetch(base + "/inApps/v1/transactions/" + encodeURIComponent(transactionId), { headers: { Authorization: "Bearer " + bearer } });
+      let response = await call("https://api.storekit.itunes.apple.com");
+      if (response.status === 404) response = await call("https://api.storekit-sandbox.itunes.apple.com");
+      if (!response.ok) throw new Error("APPLE_TRANSACTION_INVALID");
+      const signed = (await response.json()).signedTransactionInfo;
+      if (!signed || signed.split(".").length !== 3) throw new Error("APPLE_TRANSACTION_INVALID");
+      return base64urlDecodeJson(signed.split(".")[1]);
+    }
+    async function phase4aAppleAccountToken(uid) {
+      const hex = await sha256Hex("tabbakheen-apple-account:" + uid);
+      const chars = hex.slice(0, 32).split("");
+      chars[12] = "4";
+      chars[16] = (8 + parseInt(chars[16], 16) % 4).toString(16);
+      return chars.slice(0, 8).join("") + "-" + chars.slice(8, 12).join("") + "-" + chars.slice(12, 16).join("") + "-" + chars.slice(16, 20).join("") + "-" + chars.slice(20).join("");
+    }
+    async function handlePhase4aOfferCreate(request, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
+      const input = phase4aOfferInput(body); if (!input || typeof body.requestId !== "string" || !body.requestId.trim()) return phase4aError("invalid_offer", "Invalid offer");
+      const requestId = body.requestId.trim();
+      if (!phase4aSafeSegment(requestId)) return phase4aError("invalid_request", "Invalid request id");
+      const idemPath = "offer_creation_requests", idemId = auth.uid + "_" + requestId;
+      const prior = await getFirestoreDoc(idemPath, idemId, accessToken);
+      if (prior) {
+        if (prior.intentHash !== JSON.stringify(input)) return phase4aError("idempotency_conflict", "Request id already used", 409);
+        const offer = await getFirestoreDoc("offers", prior.offerId, accessToken);
+        return jsonResponse({ success: true, offerId: prior.offerId, offer: offer && { ...offer, id: prior.offerId }, idempotent: true });
+      }
+      const providerAccess = phase4aProviderAccess(auth.user);
+      if (!providerAccess.ok) return phase4aError(providerAccess.code, "Provider subscription required", 403);
+      const offerId = crypto.randomUUID(), now = new Date().toISOString();
+      const offer = { id: offerId, ...input, providerUid: auth.uid, providerId: auth.uid, createdAt: now, updatedAt: now, rating: 0, ratingCount: 0, successfulOrders: 0 };
+      const ok = await phase4aCommit([
+        { update: phase4aDoc("offers", offerId, offer), currentDocument: { exists: false } },
+        { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, offerId, intentHash: JSON.stringify(input), createdAt: now }), currentDocument: { exists: false } },
+        auth.deletionFence
+      ], accessToken);
+      if (!ok) { const retry = await getFirestoreDoc(idemPath, idemId, accessToken); if (retry && retry.intentHash === JSON.stringify(input)) { const replayOffer = await getFirestoreDoc("offers", retry.offerId, accessToken); return jsonResponse({ success: true, offerId: retry.offerId, offer: replayOffer && { ...replayOffer, id: retry.offerId }, idempotent: true }); } return phase4aError("state_conflict", "Request conflicted; retry", 409); }
+      return jsonResponse({ success: true, offerId, offer });
+    }
+    async function handlePhase4aOrderCreate(request, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (auth.user.role !== "customer") return phase4aError("forbidden", "Customer account required", 403);
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
+      if (!phase4aKeysOnly(body, ["requestId", "offerId", "quantity", "paymentMethod", "note"]) || !phase4aSafeSegment(body.requestId) || !phase4aSafeSegment(body.offerId)) return phase4aError("invalid_request", "Invalid order request");
+      const quantity = body.quantity, paymentMethod = String(body.paymentMethod || "");
+      if (typeof quantity !== "number" || !Number.isInteger(quantity) || quantity !== 1) return phase4aError("invalid_quantity", "Quantity must be one");
+      if (!["cash", "cod", "bank_transfer", "stc", "stc_pay"].includes(paymentMethod)) return phase4aError("invalid_payment_method", "Unsupported payment method");
+      const canonicalPaymentMethod = { cash: "CASH", cod: "CASH", bank_transfer: "BANK_TRANSFER", stc: "STC_PAY", stc_pay: "STC_PAY" }[paymentMethod];
+      const input = { offerId: body.offerId, quantity, paymentMethod: canonicalPaymentMethod, note: typeof body.note === "string" ? body.note.trim().slice(0, 1000) : "" };
+      const idemPath = "order_creation_requests", idemId = auth.uid + "_" + body.requestId.trim();
+      const prior = await getFirestoreDoc(idemPath, idemId, accessToken);
+      if (prior) { if (prior.intentHash !== JSON.stringify(input)) return phase4aError("idempotency_conflict", "Request id already used", 409); const replayOrder = await getFirestoreDoc("orders", prior.orderId, accessToken); return jsonResponse({ success: true, orderId: prior.orderId, order: replayOrder && { ...replayOrder, id: prior.orderId }, idempotent: true }); }
+      const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
+      const offer = offerSnap?.data;
+      if (!offer) return phase4aError("offer_not_found", "Offer not found", 404);
+      if (offer.isAvailable !== undefined && typeof offer.isAvailable !== "boolean") return phase4aError("invalid_offer", "Offer availability is malformed");
+      if (offer.isAvailable === false) return phase4aError("offer_unavailable", "Offer unavailable", 409);
+      const offerProvider = await getFirestoreDoc("users", offer.providerUid || offer.providerId, accessToken);
+      if (offer.providerUid === auth.uid || offer.providerId === auth.uid) return phase4aError("invalid_offer", "Offer provider is not eligible");
+      const offerAccess = phase4aProviderAccess(offerProvider);
+      if (!offerAccess.ok) return phase4aError(offerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403);
+      const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
+      if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return phase4aError("invalid_offer", "Offer is malformed");
+      const providerUid = offer.providerUid || offer.providerId, now = new Date().toISOString(), orderId = crypto.randomUUID();
+      const orderNumber = "TB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 8).toUpperCase();
+      const customer = auth.user, provider = await getFirestoreDoc("users", providerUid, accessToken);
+      const orderRef = "TAB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 12).toUpperCase();
+      const order = { id: orderId, orderNumber, orderRef, customerUid: auth.uid, providerUid, offerId: body.offerId, offerTitleSnapshot: offer.title.trim(), offerAvailabilityType: normalizedAvailability, offerPreparationTimeMinutes: normalizedAvailability === "preorder" ? offer.preparationTimeMinutes : null, title: offer.title.trim(), priceSnapshot: offer.price, unitPrice: offer.price, quantity, totalAmount: offer.price, paymentMethod: canonicalPaymentMethod, paymentStatus: "PENDING", status: "pending", driverUid: null, deliveryFee: 0, deliveryMethod: null, deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "", providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null, providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null, customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null, customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null, pickupAddress: provider && typeof provider.address === "string" ? provider.address : "", dropoffAddress: typeof customer.address === "string" ? customer.address : "", note: input.note, createdAt: now, updatedAt: now, stateVersion: 1, transactionalNotificationVersion: 1 };
+      const eventId = notificationEventId(orderId, "order_created", 1);
+      const event = { orderId, transition: "order_created", stateVersion: 1, status: "pending", createdAt: now };
+      const providerDeletion = await getFirestoreSnapshot("account_deletion_requests", providerUid, accessToken);
+      if (providerDeletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(providerDeletion.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Provider deletion is active", 409);
+      const ok = await phase4aCommit([{ update: phase4aDoc("offers", body.offerId, { lastOrderCreatedAt: now }), updateMask: { fieldPaths: ["lastOrderCreatedAt"] }, currentDocument: { updateTime: offerSnap.updateTime } }, { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } }, { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } }, { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash: JSON.stringify(input), createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } }, { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } }, auth.deletionFence, phase4aDeletionFence(providerUid, providerDeletion)], accessToken);
+      if (!ok) { const retry = await getFirestoreDoc(idemPath, idemId, accessToken); if (retry && retry.intentHash === JSON.stringify(input)) { const replayOrder = await getFirestoreDoc("orders", retry.orderId, accessToken); return jsonResponse({ success: true, orderId: retry.orderId, order: replayOrder && { ...replayOrder, id: retry.orderId }, idempotent: true }); } return phase4aError("state_conflict", "Request conflicted; retry", 409); }
+      return jsonResponse({ success: true, orderId, order });
+    }
     async function sha1Hex(str) {
       const data = new TextEncoder().encode(str);
       const hash = await crypto.subtle.digest("SHA-1", data);
@@ -4136,6 +4310,150 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/" && request.method === "GET") {
         return Response.json({ status: "ok", service: "tabbakheen-api", version: "2.2.0", admin: true, pdf: true, deliveryPricingAdmin: true });
       }
+      // Authenticated Phase 4A mutation surface.
+      if (path === "/subscriptions/apple/account-token" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        let body = {}; try { body = await request.json(); } catch {}
+        if (!phase4aKeysOnly(body, [])) return phase4aError("INVALID_REQUEST", "No body fields accepted");
+        return jsonResponse({ success: true, appAccountToken: await phase4aAppleAccountToken(auth.uid) });
+      }
+      if (path === "/subscriptions/apple/sync" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid request"); }
+          if (!phase4aKeysOnly(body, ["transactionId", "productId"]) || !phase4aSafeSegment(body.transactionId) || typeof body.productId !== "string" || body.productId.length > 200) return phase4aError("INVALID_REQUEST", "Invalid Apple transaction");
+          const transaction = await phase4aAppleTransaction(body.transactionId, env);
+          const expectedAccountToken = await phase4aAppleAccountToken(auth.uid);
+          if (transaction.bundleId !== "com.tabbakheen.app" || String(transaction.transactionId) !== body.transactionId || transaction.productId !== body.productId || transaction.appAccountToken !== expectedAccountToken || transaction.inAppOwnershipType !== "PURCHASED" || transaction.revocationDate || !Number.isFinite(Number(transaction.expiresDate)) || Number(transaction.expiresDate) <= Date.now()) return phase4aError("APPLE_TRANSACTION_INVALID", "Apple transaction is invalid", 400);
+          if (transaction.environment !== "Production" && !(transaction.environment === "Sandbox" && auth.user.activatedByAdmin === true)) return phase4aError("APPLE_ENVIRONMENT_FORBIDDEN", "Sandbox transaction not allowed", 403);
+          const expectedRole = { tabbakheen_providers_monthly: "provider", tabbakheen_drivers_monthly: "driver" }[body.productId] || "";
+          if (!expectedRole || auth.user.role !== expectedRole) return phase4aError("APPLE_PRODUCT_FORBIDDEN", "Product does not match account role", 403);
+          const originalTransactionId = String(transaction.originalTransactionId || transaction.transactionId);
+          if (!phase4aSafeSegment(originalTransactionId)) return phase4aError("APPLE_TRANSACTION_INVALID", "Invalid original transaction", 400);
+          const claimSnap = await getFirestoreSnapshot("apple_transaction_claims", originalTransactionId, accessToken);
+          const claim = claimSnap?.data;
+          if (claim && claim.uid !== auth.uid) return phase4aError("APPLE_TRANSACTION_CLAIMED", "Transaction belongs to another account", 409);
+          const userSnap = await getFirestoreSnapshot("users", auth.uid, accessToken);
+          const currentExpiry = userSnap.data.subscriptionEndsAt ? new Date(userSnap.data.subscriptionEndsAt).getTime() : 0;
+          if (userSnap.data.subscriptionStatus === "active" && currentExpiry >= Number(transaction.expiresDate)) return jsonResponse({ success: true, idempotent: true, subscription: { subscriptionStatus: "active", subscriptionEndsAt: userSnap.data.subscriptionEndsAt } });
+          const fields = { subscriptionStatus: "active", subscriptionProductId: transaction.productId, subscriptionTransactionId: String(transaction.transactionId), subscriptionOriginalTransactionId: originalTransactionId, subscriptionEndsAt: new Date(Number(transaction.expiresDate)).toISOString(), subscriptionPlatform: "apple", subscriptionSyncedAt: new Date().toISOString() };
+          const writes = [{ update: phase4aDoc("users", auth.uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: userSnap.updateTime } }, auth.deletionFence];
+          if (!claim) writes.push({ update: phase4aDoc("apple_transaction_claims", originalTransactionId, { uid: auth.uid, createdAt: new Date().toISOString() }), updateMask: { fieldPaths: ["uid", "createdAt"] }, currentDocument: { exists: false } });
+          else writes.push({ verify: "projects/tabbakheen-99883/databases/(default)/documents/apple_transaction_claims/" + originalTransactionId, currentDocument: { updateTime: claimSnap.updateTime } });
+          if (!(await phase4aCommit(writes, accessToken))) return phase4aError("STATE_CONFLICT", "Subscription changed; retry", 409);
+          return jsonResponse({ success: true, subscription: fields });
+        } catch (error) {
+          return phase4aError(error && error.message === "APPLE_TRANSACTION_INVALID" ? "APPLE_TRANSACTION_INVALID" : "APPLE_SYNC_FAILED", "Apple subscription sync failed", 502);
+        }
+      }
+      if (path === "/ratings/submit" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid rating"); }
+        if (auth.user.role !== "customer" || !phase4aKeysOnly(body, ["orderId", "type", "stars", "comment"]) || !phase4aSafeSegment(body.orderId) || !["provider", "driver"].includes(body.type) || !Number.isInteger(body.stars) || body.stars < 1 || body.stars > 5) return phase4aError("invalid_request", "Invalid rating");
+        const snap = await getFirestoreSnapshot("orders", body.orderId, accessToken); if (!snap || snap.data.customerUid !== auth.uid || !["delivered", "completed"].includes(snap.data.status)) return phase4aError("forbidden", "Rating is not allowed", 403);
+        const targetUid = body.type === "provider" ? snap.data.providerUid : snap.data.driverUid;
+        if (!phase4aSafeSegment(targetUid) || targetUid === auth.uid) return phase4aError("forbidden", "Invalid rating target", 403);
+        const ratingCollection = body.type === "provider" ? "provider_ratings/" + targetUid + "/ratings" : "driver_ratings/" + targetUid + "/ratings";
+        const ratingId = body.orderId, rating = { orderId: body.orderId, customerUid: auth.uid, targetUid, targetRole: body.type, ...(body.type === "provider" ? { providerUid: targetUid } : { driverUid: targetUid }), stars: body.stars, comment: typeof body.comment === "string" ? body.comment.trim().slice(0, 500) : "", createdAt: new Date().toISOString() };
+        const existing = await getFirestoreDoc(ratingCollection, ratingId, accessToken);
+        if (existing) {
+          const sameRating = existing.customerUid === rating.customerUid && existing.targetUid === rating.targetUid && existing.stars === rating.stars && existing.comment === rating.comment;
+          return sameRating ? jsonResponse({ success: true, idempotent: true, rating: existing }) : phase4aError("IDEMPOTENCY_CONFLICT", "Rating already exists", 409);
+        }
+        const targetSnap = await getFirestoreSnapshot("users", targetUid, accessToken);
+        const targetDeletion = await getFirestoreSnapshot("account_deletion_requests", targetUid, accessToken);
+        if (!targetSnap || targetSnap.data.role !== body.type || targetDeletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(targetDeletion.data.status)) return phase4aError("FORBIDDEN", "Rating target unavailable", 403);
+        const oldCount = Number.isInteger(targetSnap.data.ratingCount) && targetSnap.data.ratingCount >= 0 && targetSnap.data.ratingCount < 1e7 ? targetSnap.data.ratingCount : 0;
+        const oldAverage = typeof targetSnap.data.ratingAverage === "number" && Number.isFinite(targetSnap.data.ratingAverage) && targetSnap.data.ratingAverage >= 0 && targetSnap.data.ratingAverage <= 5 ? targetSnap.data.ratingAverage : 0;
+        const aggregateFields = { ratingCount: oldCount + 1, ratingAverage: (oldAverage * oldCount + body.stars) / (oldCount + 1) };
+        const fields = body.type === "provider" ? { providerHasRating: true, ratingSubmitted: true, providerRatingStars: body.stars, providerRatingComment: rating.comment, updatedAt: new Date().toISOString() } : { driverHasRating: true, driverRatingSubmitted: true, driverRatingStars: body.stars, driverRatingComment: rating.comment, updatedAt: new Date().toISOString() };
+        if (!(await phase4aCommit([{ update: phase4aDoc(ratingCollection, ratingId, rating), updateMask: { fieldPaths: Object.keys(rating) }, currentDocument: { exists: false } }, { update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, { update: phase4aDoc("users", targetUid, aggregateFields), updateMask: { fieldPaths: Object.keys(aggregateFields) }, currentDocument: { updateTime: targetSnap.updateTime } }, auth.deletionFence, phase4aDeletionFence(targetUid, targetDeletion)], accessToken))) return phase4aError("state_conflict", "Rating changed; retry", 409);
+        return jsonResponse({ success: true, ratingId, rating });
+      }
+      if (["/orders/create", "/offers/create", "/offers/update", "/orders/payment-proof", "/orders/payment-confirm", "/orders/payment-reject"].includes(path) && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (path === "/orders/create") return await handlePhase4aOrderCreate(request, env, accessToken);
+          if (path === "/offers/create") return await handlePhase4aOfferCreate(request, env, accessToken);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
+          if (path === "/offers/update") {
+            if (auth.user.role !== "provider" || !phase4aSafeSegment(body.offerId)) return phase4aError("forbidden", "Provider ownership required", 403);
+            const updateAccess = phase4aProviderAccess(auth.user); if (!updateAccess.ok) return phase4aError(updateAccess.code, "Provider subscription required", 403);
+            const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
+            if (!offerSnap) return phase4aError("offer_not_found", "Offer not found", 404);
+            if (offerSnap.data.providerUid !== auth.uid && offerSnap.data.providerId !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
+            const allowed = ["offerId", "title", "description", "price", "category", "imageUrl", "availabilityType", "preparationTimeMinutes", "isAvailable"];
+            if (!phase4aKeysOnly(body, allowed)) return phase4aError("invalid_offer", "Invalid offer fields");
+            const merged = { requestId: undefined, title: body.title ?? offerSnap.data.title, description: body.description ?? offerSnap.data.description, price: body.price ?? offerSnap.data.price, category: body.category ?? offerSnap.data.category, imageUrl: body.imageUrl ?? offerSnap.data.imageUrl, availabilityType: body.availabilityType ?? offerSnap.data.availabilityType, preparationTimeMinutes: body.preparationTimeMinutes ?? offerSnap.data.preparationTimeMinutes, isAvailable: offerSnap.data.isAvailable };
+            if ("isAvailable" in body) merged.isAvailable = body.isAvailable;
+            if (merged.availabilityType === "immediate") merged.preparationTimeMinutes = undefined;
+            const input = phase4aOfferInput(merged); if (!input) return phase4aError("invalid_offer", "Invalid offer");
+            if (!("isAvailable" in body)) delete input.isAvailable;
+            if (merged.availabilityType === "immediate") input.preparationTimeMinutes = null;
+            input.updatedAt = new Date().toISOString();
+            if (!(await phase4aCommit([{ update: phase4aDoc("offers", body.offerId, input), updateMask: { fieldPaths: Object.keys(input) }, currentDocument: { updateTime: offerSnap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Offer changed; refresh and retry", 409);
+            return jsonResponse({ success: true, offerId: body.offerId, offer: { ...offerSnap.data, ...input } });
+          }
+          if (path === "/orders/payment-proof") {
+            if (!phase4aKeysOnly(body, ["orderId", "proofImageUrl", "proofNote", "paymentReference"]) || !phase4aSafeSegment(body.orderId)) return phase4aError("invalid_request", "Invalid payment proof");
+            const snap = await getFirestoreSnapshot("orders", body.orderId, accessToken); if (!snap) return phase4aError("not_found", "Order not found", 404);
+            const order = snap.data;
+            if (order.customerUid !== auth.uid || !["BANK_TRANSFER", "STC_PAY"].includes(order.paymentMethod) || !["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status) || !["PENDING", "PAYMENT_REJECTED"].includes(order.paymentStatus)) return phase4aError("forbidden", "Payment proof is not allowed", 403);
+            const fields = { paymentStatus: "PROOF_SENT", stcPayProofImageUrl: typeof body.proofImageUrl === "string" ? body.proofImageUrl.slice(0, 2048) : "", stcPayProofNote: typeof body.proofNote === "string" ? body.proofNote.slice(0, 1000) : "", paymentReference: typeof body.paymentReference === "string" ? body.paymentReference.slice(0, 200) : "", paymentRejectionReason: null, paymentRejectedAt: null, updatedAt: new Date().toISOString() };
+            if (!fields.stcPayProofImageUrl && !fields.stcPayProofNote && !fields.paymentReference) return phase4aError("invalid_request", "Proof is required");
+            if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
+            return jsonResponse({ success: true, orderId: body.orderId, paymentStatus: "PROOF_SENT" });
+          }
+          if (path === "/orders/payment-confirm") {
+            if (!phase4aKeysOnly(body, ["orderId"]) || !phase4aSafeSegment(body.orderId)) return phase4aError("invalid_request", "Invalid payment confirmation");
+            const snap = await getFirestoreSnapshot("orders", body.orderId, accessToken); if (!snap) return phase4aError("not_found", "Order not found", 404);
+            const order = snap.data;
+            if (auth.user.role !== "provider" || order.providerUid !== auth.uid || order.paymentStatus !== "PROOF_SENT" || !["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status)) return phase4aError("forbidden", "Payment confirmation is not allowed", 403);
+            const fields = { paymentStatus: "PAID_CONFIRMED", paymentConfirmedBy: auth.uid, paymentConfirmedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+            if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
+            return jsonResponse({ success: true, orderId: body.orderId, paymentStatus: "PAID_CONFIRMED" });
+          }
+          if (path === "/orders/payment-reject") {
+            if (!phase4aKeysOnly(body, ["orderId", "reason"]) || !phase4aSafeSegment(body.orderId)) return phase4aError("invalid_request", "Invalid payment rejection");
+            const snap = await getFirestoreSnapshot("orders", body.orderId, accessToken); if (!snap) return phase4aError("not_found", "Order not found", 404);
+            if (auth.user.role !== "provider" || snap.data.providerUid !== auth.uid || snap.data.paymentStatus !== "PROOF_SENT" || !["pending", "accepted", "preparing", "ready_for_pickup"].includes(snap.data.status) || (body.reason != null && (typeof body.reason !== "string" || body.reason.length > 500))) return phase4aError("forbidden", "Payment rejection is not allowed", 403);
+            const fields = { paymentStatus: "PAYMENT_REJECTED", paymentRejectionReason: String(body.reason || "").trim(), paymentRejectedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+            if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
+            return jsonResponse({ success: true, orderId: body.orderId, paymentStatus: "PAYMENT_REJECTED" });
+          }
+        } catch (e) { console.error("[Phase4A] mutation error:", e); return phase4aError("internal_error", "Internal error", 500); }
+      }
+      const offerAvailabilityMatch = path.match(/^\/offers\/([^/]+)\/availability$/);
+      const offerDeleteMatch = path.match(/^\/offers\/([^/]+)\/delete$/);
+      if ((offerAvailabilityMatch || offerDeleteMatch) && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          if (auth.user.role !== "provider") return phase4aError("forbidden", "Provider account required", 403);
+          const mutationAccess = phase4aProviderAccess(auth.user); if (!mutationAccess.ok) return phase4aError(mutationAccess.code, "Provider subscription required", 403);
+          const offerId = decodeURIComponent((offerAvailabilityMatch || offerDeleteMatch)[1]);
+          if (!phase4aSafeSegment(offerId)) return phase4aError("INVALID_REQUEST", "Invalid offer id", 400);
+          const snap = await getFirestoreSnapshot("offers", offerId, accessToken);
+          if (!snap) return phase4aError("offer_not_found", "Offer not found", 404);
+          if (snap.data.providerUid !== auth.uid && snap.data.providerId !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
+          let body = {}; try { body = await request.json(); } catch {}
+          if (offerAvailabilityMatch) {
+            if (!phase4aKeysOnly(body, ["isAvailable"]) || typeof body.isAvailable !== "boolean") return phase4aError("invalid_request", "Only isAvailable is accepted");
+            const fields = { isAvailable: body.isAvailable, updatedAt: new Date().toISOString() };
+            if (!(await phase4aCommit([{ update: phase4aDoc("offers", offerId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Offer changed; retry", 409);
+            return jsonResponse({ success: true, offerId, isAvailable: body.isAvailable });
+          }
+          const orders = await queryFirestore("orders", "offerId", "EQUAL", offerId, accessToken);
+          // Historical orders remain untouched; only active references block deletion.
+          if (orders.some((order) => orderIsActive(order))) return phase4aError("active_order_conflict", "Offer has active orders", 409);
+          if (!(await phase4aCommit([{ delete: "projects/tabbakheen-99883/databases/(default)/documents/offers/" + offerId, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Offer changed; retry", 409);
+          return jsonResponse({ success: true, offerId });
+        } catch (e) { console.error("[Phase4A] offer mutation error:", e); return phase4aError("internal_error", "Internal error", 500); }
+      }
       if (path === "/admin" || path === "/admin/") {
         return new Response(getAdminHTML(), {
           headers: { "Content-Type": "text/html;charset=UTF-8" }
@@ -4816,46 +5134,42 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         try {
           const body = await request.json();
           const { type, uid } = body;
-          if (!type || !uid || !["provider", "driver"].includes(type)) {
+          if (!type || !phase4aSafeSegment(uid) || !["provider", "driver"].includes(type)) {
             return Response.json({ success: false, error: "Missing or invalid type/uid" }, { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
           }
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           const collectionPath = type === "provider" ? "provider_ratings" : "driver_ratings";
           const ratingsUrl = FIRESTORE_BASE + "/" + collectionPath + "/" + uid + "/ratings";
-          const ratingsResponse = await fetch(ratingsUrl, {
-            headers: { "Authorization": "Bearer " + accessToken }
-          });
-          let ratings = [];
-          if (ratingsResponse.ok) {
-            const ratingsData = await ratingsResponse.json();
-            if (ratingsData.documents) {
-              ratings = ratingsData.documents.map((doc) => parseFirestoreDoc(doc)).filter(Boolean);
-            }
+          for (let aggregateAttempt = 0; aggregateAttempt < 3; aggregateAttempt++) {
+            // Optimistic read ordering is intentional: any Worker rating that
+            // changes the target after this read invalidates the final CAS.
+            const targetSnap = await getFirestoreSnapshot("users", uid, accessToken);
+            if (!targetSnap) return phase4aError("NOT_FOUND", "Rating target not found", 404);
+            const ratings = [];
+            let ratingsPageToken = null;
+            let ratingsPages = 0;
+            do {
+              if (ratingsPages >= 100 || ratings.length >= 2e4) return phase4aError("RATINGS_AGGREGATE_LIMIT", "Rating aggregate exceeds safe limit", 409);
+              let ratingsPageUrl = ratingsUrl + "?pageSize=300";
+              if (ratingsPageToken) ratingsPageUrl += "&pageToken=" + encodeURIComponent(ratingsPageToken);
+              const ratingsResponse = await fetch(ratingsPageUrl, { headers: { "Authorization": "Bearer " + accessToken } });
+              if (!ratingsResponse.ok) return phase4aError("RATINGS_READ_FAILED", "Failed to read ratings", 502);
+              const ratingsData = await ratingsResponse.json();
+              ratings.push(...(ratingsData.documents || []).map((doc) => parseFirestoreDoc(doc)).filter(Boolean));
+              if (ratings.length > 2e4) return phase4aError("RATINGS_AGGREGATE_LIMIT", "Rating aggregate exceeds safe limit", 409);
+              ratingsPageToken = ratingsData.nextPageToken || null;
+              ratingsPages++;
+            } while (ratingsPageToken);
+            const count = ratings.length;
+            const avg = count > 0 ? ratings.reduce((sum, rating) => sum + (typeof rating.stars === "number" ? rating.stars : 0), 0) / count : 0;
+            const roundedAvg = Math.round(avg * 100) / 100;
+            const targetDeletion = await getFirestoreSnapshot("account_deletion_requests", uid, accessToken);
+            if (targetDeletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(targetDeletion.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Rating target unavailable", 409);
+            const aggregateFields = { ratingAverage: roundedAvg, ratingCount: count };
+            const committed = await phase4aCommit([{ update: phase4aDoc("users", uid, aggregateFields), updateMask: { fieldPaths: ["ratingAverage", "ratingCount"] }, currentDocument: { updateTime: targetSnap.updateTime } }, phase4aDeletionFence(uid, targetDeletion)], accessToken);
+            if (committed) return Response.json({ success: true, ratingAverage: roundedAvg, ratingCount: count }, { headers: { "Access-Control-Allow-Origin": "*" } });
           }
-          const count = ratings.length;
-          const avg = count > 0 ? ratings.reduce((sum, r) => sum + (r.stars || 0), 0) / count : 0;
-          const roundedAvg = Math.round(avg * 10) / 10;
-          const updateUrl = FIRESTORE_BASE + "/users/" + uid + "?updateMask.fieldPaths=ratingAverage&updateMask.fieldPaths=ratingCount";
-          const updateResponse = await fetch(updateUrl, {
-            method: "PATCH",
-            headers: {
-              "Authorization": "Bearer " + accessToken,
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              fields: {
-                ratingAverage: { doubleValue: roundedAvg },
-                ratingCount: { integerValue: String(count) }
-              }
-            })
-          });
-          if (!updateResponse.ok) {
-            await updateResponse.text();
-            return Response.json({ success: false, error: "Failed to update user rating" }, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
-          }
-          return Response.json({ success: true, ratingAverage: roundedAvg, ratingCount: count }, {
-            headers: { "Access-Control-Allow-Origin": "*" }
-          });
+          return phase4aError("STATE_CONFLICT", "Rating aggregate changed; retry", 409);
         } catch (e) {
           return Response.json({ success: false, error: e.message || "Internal error" }, {
             status: 500,
