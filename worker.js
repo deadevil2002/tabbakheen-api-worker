@@ -5463,7 +5463,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const before = await getFirestoreDoc("app_settings", "main", accessToken) || {};
             const changes = {};
             for (const key of ["requirePhoneAtSignup", "phonePasswordLoginEnabled"]) {
-              if (key in fields && before[key] !== fields[key]) changes[key] = { oldValue: before[key] === true, newValue: fields[key] };
+              const oldValue = key === "requirePhoneAtSignup" ? before[key] !== false : before[key] === true;
+              if (key in fields && oldValue !== fields[key]) changes[key] = { oldValue, newValue: fields[key] };
             }
             if (Object.keys(changes).length) {
               const changedAt = new Date().toISOString();
