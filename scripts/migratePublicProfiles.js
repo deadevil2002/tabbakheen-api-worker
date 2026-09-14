@@ -107,12 +107,14 @@ async function main() {
   const report = {
     executed: execute,
     totalCandidates: users.size,
-    safeProjections: 0,
+    safeBasicProjections: 0,
+    explicitPublicLocations: 0,
+    legacyLocationsOmitted: 0,
+    consentAbsent: 0,
     unchanged: 0,
     publicDocsRemoved: 0,
     orphanPublicDocs: 0,
     deletedOrIneligiblePublicDocs: 0,
-    ambiguousLocation: 0,
     missingRequiredFields: {},
     otherBlockers: 0
   };
@@ -121,12 +123,15 @@ async function main() {
     const user = users.get(uid)?.data();
     const prior = publicDocs.get(uid)?.data();
     const profile = user && publicProfileFromPrivateUser(uid, user);
-    if (user?.location && !profile?.discoveryLocation) report.ambiguousLocation++;
+    const explicitPublicLocation = profile?.publicLocation;
+    if (user?.location && !explicitPublicLocation) report.legacyLocationsOmitted++;
+    if (user && !explicitPublicLocation) report.consentAbsent++;
     if (user && !profile) {
       increment(report.missingRequiredFields, "displayName");
       report.otherBlockers++;
     }
-    if (profile) report.safeProjections++;
+    if (profile) report.safeBasicProjections++;
+    if (explicitPublicLocation) report.explicitPublicLocations++;
     else if (prior) {
       report.publicDocsRemoved++;
       if (!user) report.orphanPublicDocs++;

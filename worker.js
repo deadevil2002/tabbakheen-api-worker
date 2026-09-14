@@ -438,13 +438,16 @@
         updatedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
       if (user.role === "provider") {
-        if (typeof user.city === "string" && user.city.trim()) profile.city = user.city.trim().slice(0, 120);
         if (typeof user.socialLink === "string" && user.socialLink.trim()) profile.socialLink = user.socialLink.trim().slice(0, 2048);
-        // A legacy `location` has ambiguous/private semantics and MUST NOT be
-        // projected. Only the explicitly opted-in discoveryLocation is used.
-        const loc = user.discoveryLocation;
-        if (loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lng) && loc.lat >= -90 && loc.lat <= 90 && loc.lng >= -180 && loc.lng <= 180) {
-          profile.discoveryLocation = { lat: loc.lat, lng: loc.lng };
+        // A legacy `location` and the former `discoveryLocation` field both
+        // have ambiguous consent semantics and MUST NOT be projected. A map
+        // coordinate exists only after the owner sends the explicit public
+        // preference through the authenticated Worker endpoint.
+        const loc = user.publicLocation;
+        const city = typeof loc?.city === "string" ? loc.city.trim().slice(0, 120) : "";
+        if (user.publicLocationEnabled === true && loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lng) && loc.lat >= 12 && loc.lat <= 34 && loc.lng >= 34 && loc.lng <= 61 && !(loc.lat === 0 && loc.lng === 0) && city) {
+          profile.publicLocationEnabled = true;
+          profile.publicLocation = { lat: loc.lat, lng: loc.lng, city };
         }
       } else {
         profile.isAvailable = user.isAvailable === true;
@@ -497,19 +500,20 @@
         console.error("[PublicProfile] projection sync failed:", error && error.message ? error.message : error);
       }
     }
-    async function updatePublicDiscoveryLocation(uid, location, accessToken) {
+    async function updatePublicLocationPreference(uid, enabled, location, accessToken) {
       const [sourceSnapshot, publicSnapshot, deletionSnapshot] = await Promise.all([
         getFirestoreSnapshot("users", uid, accessToken),
         getFirestoreSnapshot("public_profiles", uid, accessToken),
         getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
       ]);
-      if (!sourceSnapshot || !["provider", "driver"].includes(sourceSnapshot.data.role)) return { ok: false, code: "forbidden" };
+      if (!sourceSnapshot || sourceSnapshot.data.role !== "provider" || !isProviderAccountAllowed(sourceSnapshot.data)) return { ok: false, code: "forbidden" };
       if (publicProfileDeletionActive(deletionSnapshot)) return { ok: false, code: "account_deletion_blocked" };
-      const nextUser = { ...sourceSnapshot.data, discoveryLocation: location };
+      const fields = enabled ? { publicLocationEnabled: true, publicLocation: location } : { publicLocationEnabled: false, publicLocation: null };
+      const nextUser = { ...sourceSnapshot.data, ...fields };
       const profile = publicProfileFromPrivateUser(uid, nextUser);
       if (!profile) return { ok: false, code: "invalid_profile" };
       const writes = [
-        { update: phase4aDoc("users", uid, { discoveryLocation: location }), updateMask: { fieldPaths: ["discoveryLocation"] }, currentDocument: { updateTime: sourceSnapshot.updateTime } },
+        { update: phase4aDoc("users", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: sourceSnapshot.updateTime } },
         { update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } },
         phase4aDeletionFence(uid, deletionSnapshot)
       ];
@@ -559,8 +563,10 @@
       const users = await listAllUsers(accessToken);
       const candidates = users.filter((user) => user && ["provider", "driver"].includes(user.role));
       const missingRequiredFields = {};
-      let safeProjections = 0;
-      let ambiguousLocation = 0;
+      let safeBasicProjections = 0;
+      let explicitPublicLocations = 0;
+      let legacyLocationsOmitted = 0;
+      let consentAbsent = 0;
       let otherBlockers = 0;
       for (const user of candidates) {
         const profile = publicProfileFromPrivateUser(user._id, user);
@@ -570,16 +576,21 @@
         }
         const missing = ["displayName", "photoUrl"].filter((field) => !profile[field]);
         for (const field of missing) missingRequiredFields[field] = (missingRequiredFields[field] || 0) + 1;
-        // Existing private `location` values are deliberately not copied. This
-        // count makes the required owner choice visible without returning PII.
-        if (user.location && !profile.discoveryLocation) ambiguousLocation++;
+        // Existing private `location` values are deliberately not copied. The
+        // report distinguishes a stored legacy coordinate from real, explicit
+        // public-location consent without returning person-level data.
+        if (user.location && !profile.publicLocation) legacyLocationsOmitted++;
+        if (profile.publicLocation) explicitPublicLocations++;
+        else consentAbsent++;
         if (missing.length) otherBlockers++;
-        else safeProjections++;
+        else safeBasicProjections++;
       }
       return {
         totalCandidates: candidates.length,
-        safeProjections,
-        ambiguousLocation,
+        safeBasicProjections,
+        explicitPublicLocations,
+        legacyLocationsOmitted,
+        consentAbsent,
         missingRequiredFields,
         otherBlockers,
         executed: false
@@ -1549,6 +1560,7 @@
         fields.subscriptionStatus = "trialing";
         Object.assign(fields, commercialAccessFields(evaluateSubscriptionEntitlement(fields, now)));
         if (input.role === "driver") fields.isAvailable = false;
+        if (input.role === "provider") fields.publicLocationEnabled = false;
       }
       const writes = [{ update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } }];
       if (canonicalPhone && !phoneIndexingIsConfigured(env)) {
@@ -5265,7 +5277,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         handleOrderPaymentInstructions,
         handlePublicRatings,
         syncPublicProfile,
-        updatePublicDiscoveryLocation,
+        updatePublicLocationPreference,
         registerPrivateDevice,
         setDriverAvailabilityAndSync,
         publicRatingDto,
@@ -6382,10 +6394,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/profile/public-discovery" && request.method === "POST") {
         try {
           const body = await request.json();
+          if (!phase4aKeysOnly(body, ["action", "publicLocationEnabled", "publicLocation"])) {
+            return jsonResponse({ success: false, code: "invalid_request", error: "Only public location preference fields are accepted" }, 400);
+          }
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           const user = await getFirestoreDoc("users", callerUid, accessToken);
-          if (!user || !["provider", "driver"].includes(user.role)) {
-            return jsonResponse({ success: false, code: "forbidden", error: "Only provider and driver accounts have public profiles" }, 403);
+          if (!user || user.role !== "provider" || !isProviderAccountAllowed(user)) {
+            return jsonResponse({ success: false, code: "forbidden", error: "An eligible provider account is required" }, 403);
           }
           const deletion = await getFirestoreSnapshot("account_deletion_requests", callerUid, accessToken);
           if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.data.status)) {
@@ -6394,24 +6409,24 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (body?.action === "sync") {
             const synced = await syncPublicProfile(callerUid, user, accessToken);
             if (!synced) return jsonResponse({ success: false, code: "state_conflict", error: "Public profile changed; refresh and try again" }, 409);
-            return jsonResponse({ success: true, published: !!user.discoveryLocation });
+            return jsonResponse({ success: true, publicLocationEnabled: user.publicLocationEnabled === true });
           }
           let location;
-          if (body?.publishDiscoveryLocation === true) {
-            const loc = body.discoveryLocation;
-            if (!loc || !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng) || loc.lat < -90 || loc.lat > 90 || loc.lng < -180 || loc.lng > 180) {
-              return jsonResponse({ success: false, code: "invalid_request", error: "A valid discovery location is required to publish it" }, 400);
+          if (body?.publicLocationEnabled === true) {
+            const loc = body.publicLocation;
+            if (!loc || !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng) || loc.lat < 12 || loc.lat > 34 || loc.lng < 34 || loc.lng > 61 || loc.lat === 0 && loc.lng === 0 || typeof loc.city !== "string" || !loc.city.trim() || loc.city.trim().length > 120) {
+              return jsonResponse({ success: false, code: "invalid_request", error: "A valid Saudi public location and city are required" }, 400);
             }
-            location = { lat: loc.lat, lng: loc.lng };
-          } else if (body?.publishDiscoveryLocation === false) {
+            location = { lat: loc.lat, lng: loc.lng, city: loc.city.trim() };
+          } else if (body?.publicLocationEnabled === false) {
             location = null;
           } else {
-            return jsonResponse({ success: false, code: "invalid_request", error: "publishDiscoveryLocation must be boolean" }, 400);
+            return jsonResponse({ success: false, code: "invalid_request", error: "publicLocationEnabled must be boolean" }, 400);
           }
-          const updated = await updatePublicDiscoveryLocation(callerUid, location, accessToken);
+          const updated = await updatePublicLocationPreference(callerUid, body.publicLocationEnabled === true, location, accessToken);
           if (updated.code === "account_deletion_blocked") return jsonResponse({ success: false, code: "account_deletion_blocked", error: "Account deletion is in progress" }, 409);
           if (!updated.ok) return jsonResponse({ success: false, code: updated.code === "invalid_profile" ? "invalid_profile" : "state_conflict", error: "Public profile changed; refresh and try again" }, updated.code === "invalid_profile" ? 400 : 409);
-          return jsonResponse({ success: true, published: body.publishDiscoveryLocation === true });
+          return jsonResponse({ success: true, publicLocationEnabled: body.publicLocationEnabled === true });
         } catch (error) {
           console.error("[PublicProfile] Error:", error && error.message ? error.message : error);
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to update public discovery profile" }, 500);

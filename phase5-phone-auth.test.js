@@ -331,8 +331,8 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   assert.equal(Object.prototype.hasOwnProperty.call(payload, "email"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(payload, "phone"), false);
 
-  // Projection construction is allowlist-only and does not infer an
-  // ambiguous legacy location.
+  // Projection construction is allowlist-only and does not infer ambiguous
+  // legacy/private location fields as consent.
   const profile = hooks.publicProfileFromPrivateUser("provider-1", {
     role: "provider", displayName: "Provider", photoUrl: "avatar", phone: "+966500000001",
     email: "provider@example.test", expoPushToken: "ExponentPushToken[private]", paymentMethods: { bankTransfer: {} },
@@ -342,6 +342,13 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
     uid: "provider-1", role: "provider", displayName: "Provider", photoUrl: "avatar",
     ratingAverage: 4.5, ratingCount: 2, verificationStatus: "unverified", updatedAt: profile.updatedAt
   });
+  const explicitlyPublic = hooks.publicProfileFromPrivateUser("provider-1", {
+    role: "provider", displayName: "Provider", location: { lat: 24.7, lng: 46.6 },
+    discoveryLocation: { lat: 24.7, lng: 46.6 }, publicLocationEnabled: true,
+    publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" }
+  });
+  assert.deepEqual(explicitlyPublic.publicLocation, { lat: 24.8, lng: 46.7, city: "Riyadh" });
+  assert.equal(explicitlyPublic.publicLocationEnabled, true);
 
   // The controlled migration imports the exact Worker allowlist constructor,
   // rather than maintaining a second copy that could leak a newly added field.
@@ -391,8 +398,8 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   reset();
   put("users/race-uid", { role: "provider", displayName: "Race" });
   global.__createDeletionBeforeNextCommit = "race-uid";
-  assert.equal(await hooks.updatePublicDiscoveryLocation("race-uid", { lat: 24.7, lng: 46.6 }, "token").then((r) => r.ok), false);
-  assert.equal(docs.get("users/race-uid").data.discoveryLocation, undefined);
+  assert.equal(await hooks.updatePublicLocationPreference("race-uid", true, { lat: 24.7, lng: 46.6, city: "Riyadh" }, "token").then((r) => r.ok), false);
+  assert.equal(docs.get("users/race-uid").data.publicLocation, undefined);
   assert.equal(docs.has("public_profiles/race-uid"), false);
   docs.delete("account_deletion_requests/race-uid");
   global.__createDeletionBeforeNextCommit = "race-uid";
@@ -408,6 +415,58 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   global.__createDeletionBeforeNextCommit = "driver-race";
   assert.equal(await hooks.setDriverAvailabilityAndSync("driver-race", true, "token").then((r) => r.ok), false);
   assert.equal(docs.get("users/driver-race").data.isAvailable, false);
+
+  // Public-location preference uses the real authenticated dispatch, accepts
+  // only its allowlisted public fields, never treats legacy coordinates as
+  // consent, and replaces the projection when turned off.
+  reset();
+  Object.assign(global, baseEnv());
+  put("users/provider-public", {
+    role: "provider", displayName: "Public provider",
+    createdAt: "2026-01-01T00:00:00.000Z", subscriptionStatus: "trialing", trialEndsAt: "2099-01-01T00:00:00.000Z",
+    location: { lat: 24.71, lng: 46.67 },
+    discoveryLocation: { lat: 24.72, lng: 46.68 },
+    phone: "+966500000008"
+  });
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
+    publicLocationEnabled: true,
+    publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" }
+  }, "provider-public"));
+  assert.equal(privateResponse.status, 200);
+  assert.deepEqual(await privateResponse.json(), { success: true, publicLocationEnabled: true });
+  assert.deepEqual(docs.get("public_profiles/provider-public").data.publicLocation, { lat: 24.8, lng: 46.7, city: "Riyadh" });
+  assert.equal(docs.get("public_profiles/provider-public").data.publicLocationEnabled, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(docs.get("public_profiles/provider-public").data, "location"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(docs.get("public_profiles/provider-public").data, "discoveryLocation"), false);
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
+    publicLocationEnabled: true,
+    publicLocation: { lat: 50, lng: 46.7, city: "Riyadh" }
+  }, "provider-public"));
+  assert.equal(privateResponse.status, 400);
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
+    publicLocationEnabled: true,
+    publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" },
+    privateLocation: { lat: 1, lng: 1 }
+  }, "provider-public"));
+  assert.equal(privateResponse.status, 400);
+  put("users/driver-public", { role: "driver", displayName: "Driver", createdAt: "2026-01-01T00:00:00.000Z", subscriptionStatus: "trialing", trialEndsAt: "2099-01-01T00:00:00.000Z" });
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
+    publicLocationEnabled: true,
+    publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" }
+  }, "driver-public"));
+  assert.equal(privateResponse.status, 403);
+  global.__createDeletionBeforeNextCommit = "provider-public";
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", { publicLocationEnabled: false }, "provider-public"));
+  assert.equal(privateResponse.status, 409);
+  docs.delete("account_deletion_requests/provider-public");
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", { publicLocationEnabled: false }, "provider-public"));
+  assert.equal(privateResponse.status, 200);
+  assert.deepEqual(await privateResponse.json(), { success: true, publicLocationEnabled: false });
+  assert.equal(docs.get("users/provider-public").data.location.lat, 24.71);
+  assert.equal(docs.get("users/provider-public").data.discoveryLocation.lat, 24.72);
+  assert.equal(docs.get("users/provider-public").data.publicLocation, null);
+  assert.equal(docs.get("public_profiles/provider-public").data.publicLocation, undefined);
+  assert.equal(docs.get("public_profiles/provider-public").data.publicLocationEnabled, undefined);
 
   // Contact and payment are role-, purpose-, and state-scoped. Uppercase
   // persisted payment methods retain compatibility without broadening access.
