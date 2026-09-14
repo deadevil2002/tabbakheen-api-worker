@@ -1141,7 +1141,7 @@
       const cooldownMs = 15 * 60 * 1e3;
       const maxAttempts = 5;
       for (let attempt = 0; attempt < 3; attempt++) {
-        const snapshot = await getFirestoreSnapshot("phone_login_rate_limits", subject, accessToken);
+        const snapshot = await getFirestoreSnapshot("phoneLoginRateLimits", subject, accessToken);
         const prior = snapshot?.data || {};
         if (Number(prior.cooldownUntil) > now) return false;
         const sameWindow = Number(prior.windowStartedAt) > now - windowMs;
@@ -1155,9 +1155,9 @@
         };
         let committed;
         if (snapshot) {
-          committed = await compareAndSetFirestoreDocument("phone_login_rate_limits", subject, fields, snapshot.updateTime, accessToken);
+          committed = await compareAndSetFirestoreDocument("phoneLoginRateLimits", subject, fields, snapshot.updateTime, accessToken);
         } else {
-          committed = await phase4aCommit([{ update: phase4aDoc("phone_login_rate_limits", subject, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { exists: false } }], accessToken) ? { ok: true } : { ok: false };
+          committed = await phase4aCommit([{ update: phase4aDoc("phoneLoginRateLimits", subject, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { exists: false } }], accessToken) ? { ok: true } : { ok: false };
         }
         if (committed.ok) return nextCount < maxAttempts;
       }
