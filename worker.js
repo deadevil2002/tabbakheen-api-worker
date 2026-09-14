@@ -454,10 +454,25 @@
     __name(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
     __name2(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
     async function syncPublicProfile(uid, user, accessToken) {
-      const profile = publicProfileFromPrivateUser(uid, user);
+      // Re-read and fence the authoritative source. This prevents a delayed
+      // profile sync from recreating a projection after account deletion or
+      // overwriting a newer private-profile change.
+      const sourceSnapshot = await getFirestoreSnapshot("users", uid, accessToken);
+      if (!sourceSnapshot) return false;
+      const profile = publicProfileFromPrivateUser(uid, sourceSnapshot.data);
       if (!profile) return false;
-      await updateFirestoreDocument("public_profiles", uid, profile, accessToken);
-      return true;
+      const [publicSnapshot, deletionSnapshot] = await Promise.all([
+        getFirestoreSnapshot("public_profiles", uid, accessToken),
+        getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
+      ]);
+      const writes = [
+        { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid, currentDocument: { updateTime: sourceSnapshot.updateTime } },
+        // No updateMask intentionally replaces the complete allowlist
+        // document, removing stale keys from earlier schema versions.
+        { update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } },
+        phase4aDeletionFence(uid, deletionSnapshot)
+      ];
+      return phase4aCommit(writes, accessToken);
     }
     __name(syncPublicProfile, "syncPublicProfile");
     __name2(syncPublicProfile, "syncPublicProfile");
@@ -542,15 +557,17 @@
       }
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
-      if (callerUid !== order.customerUid || ["cancelled", "rejected"].includes(order.status) || !["stc_pay", "bank_transfer"].includes(order.paymentMethod)) {
+      const paymentMethod = String(order.paymentMethod || "").toLowerCase().replace("stc_pay", "stc_pay").replace("bank_transfer", "bank_transfer");
+      const canonicalMethod = paymentMethod === "stc_pay" ? "stc_pay" : paymentMethod === "bank_transfer" ? "bank_transfer" : "";
+      if (callerUid !== order.customerUid || !order.providerUid || ["cancelled", "rejected", "completed"].includes(order.status) || !canonicalMethod || !["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status)) {
         return jsonResponse({ success: false, code: "forbidden", error: "Payment instructions are not available" }, 403);
       }
       const provider = await getFirestoreDoc("users", order.providerUid, accessToken);
       const methods = provider?.paymentMethods || {};
-      if (order.paymentMethod === "stc_pay" && methods.stcPay?.enabled === true && typeof methods.stcPay.phone === "string") {
+      if (canonicalMethod === "stc_pay" && methods.stcPay?.enabled === true && typeof methods.stcPay.phone === "string") {
         return jsonResponse({ success: true, method: "stc_pay", stcPayPhone: methods.stcPay.phone });
       }
-      if (order.paymentMethod === "bank_transfer" && methods.bankTransfer?.enabled === true && typeof methods.bankTransfer.iban === "string") {
+      if (canonicalMethod === "bank_transfer" && methods.bankTransfer?.enabled === true && typeof methods.bankTransfer.iban === "string") {
         return jsonResponse({ success: true, method: "bank_transfer", bankName: typeof methods.bankTransfer.bankName === "string" ? methods.bankTransfer.bankName : "", accountName: typeof methods.bankTransfer.accountName === "string" ? methods.bankTransfer.accountName : "", iban: methods.bankTransfer.iban });
       }
       return jsonResponse({ success: false, code: "not_available", error: "Selected payment instructions are unavailable" }, 409);
@@ -5354,6 +5371,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const deliveries = (await queryFirestoreLimited("orders", "deliveryStatus", "EQUAL", "ready_for_driver", requestedLimit, accessToken)).filter((order) => !order.driverUid && isFulfillmentEligible(order) && isDriverDeliveryMethod(order.deliveryMethod)).map(driverAvailableDeliveryDto);
         return jsonResponse({ success: true, deliveries });
       }
+      if (path === "/providers/payment-availability" && request.method === "GET") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        const providerUid = String(url.searchParams.get("providerUid") || "");
+        if (!phase4aSafeSegment(providerUid)) return phase4aError("INVALID_REQUEST", "Invalid provider");
+        const provider = await getFirestoreDoc("users", providerUid, accessToken);
+        if (!provider || provider.role !== "provider") return phase4aError("NOT_FOUND", "Provider not found", 404);
+        const methods = provider.paymentMethods || {};
+        // Availability only: payment destination values never leave the
+        // private profile until the exact customer order is authorized.
+        return jsonResponse({ success: true, cod: true, stcPay: methods.stcPay?.enabled === true, bankTransfer: methods.bankTransfer?.enabled === true });
+      }
       // Authenticated Phase 4A mutation surface.
       // Google Play has no verified product catalog in this deployment. No
       // purchase-verification endpoint is exposed and no product IDs are
@@ -6218,12 +6247,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (typeof body?.token === "string" && !isExpoPushToken(body.token)) {
             return jsonResponse({ success: false, code: "invalid_request", error: "Invalid Expo device token" }, 400);
           }
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const deletion = await getFirestoreSnapshot("account_deletion_requests", callerUid, accessToken);
+          if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.data.status)) {
+            return jsonResponse({ success: false, code: "account_deletion_blocked", error: "Account deletion is in progress" }, 409);
+          }
           await updateFirestoreDocument("private_devices", callerUid, {
             expoPushToken: body.token,
             pushNotificationsEnabled: typeof body.token === "string",
             platform: body.platform === "web" ? "web" : "native",
             updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-          }, await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY));
+          }, accessToken);
           return jsonResponse({ success: true });
         } catch (error) {
           console.error("[DeviceRegistration] Error:", error && error.message ? error.message : error);
@@ -6237,6 +6271,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const user = await getFirestoreDoc("users", callerUid, accessToken);
           if (!user || !["provider", "driver"].includes(user.role)) {
             return jsonResponse({ success: false, code: "forbidden", error: "Only provider and driver accounts have public profiles" }, 403);
+          }
+          const deletion = await getFirestoreSnapshot("account_deletion_requests", callerUid, accessToken);
+          if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.data.status)) {
+            return jsonResponse({ success: false, code: "account_deletion_blocked", error: "Account deletion is in progress" }, 409);
           }
           if (body?.action === "sync") {
             await syncPublicProfile(callerUid, user, accessToken);
