@@ -5717,6 +5717,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               return jsonResponse({ error: "No valid fields" }, 400);
             }
             await updateFirestoreDocument("users", uid, fields, accessToken);
+            await syncPublicProfileBestEffort(uid, accessToken);
             return jsonResponse({ success: true, updated: Object.keys(fields) });
           }
           if (path === "/admin/api/verification" && request.method === "GET") {
@@ -5757,6 +5758,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               verificationSource: "freelance_certificate",
               verifiedAt: now
             }, accessToken);
+            await syncPublicProfileBestEffort(uid, accessToken);
             return jsonResponse({ success: true });
           }
           const flRejectMatch = path.match(/^\/admin\/api\/verification\/freelance\/([^/]+)\/reject$/);
@@ -5784,6 +5786,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
                 verificationStatus: "unverified",
                 verificationSource: ""
               }, accessToken);
+              await syncPublicProfileBestEffort(uid, accessToken);
             }
             return jsonResponse({ success: true });
           }
