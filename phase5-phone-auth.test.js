@@ -2,6 +2,7 @@
 // Offline integration harness: invokes real compiled-Worker handlers with a
 // stateful mocked fetch implementation. No production network is contacted.
 const assert = require("assert");
+const fs = require("fs");
 const { generateKeyPairSync, webcrypto, sign } = require("crypto");
 if (!global.crypto) global.crypto = webcrypto;
 global.addEventListener = () => {};
@@ -53,7 +54,7 @@ global.fetch = async (url, init = {}) => {
   if (url.includes("securetoken@system.gserviceaccount.com")) return new Response(JSON.stringify({ keys: [FIREBASE_TEST_JWK] }), { headers: { "Content-Type": "application/json", "cache-control": "max-age=3600" } });
   if (url.includes("accounts:lookup")) return response({ users: [{ email: "hidden@example.test" }] });
   if (url.includes("accounts:signInWithPassword")) return response({ localId: global.__passwordUid || "uid-1" });
-  if (!(url.startsWith(BASE) || url === BASE.slice(0, -1) + ":commit")) throw new Error("Unexpected mocked URL: " + url);
+  if (!(url.startsWith(BASE) || url === BASE.slice(0, -1) + ":commit" || url === BASE.slice(0, -1) + ":runQuery")) throw new Error("Unexpected mocked URL: " + url);
   if (url === BASE.slice(0, -1) + ":commit") {
     const writes = JSON.parse(init.body).writes;
     if (global.__createDeletionBeforeNextCommit) {
@@ -82,6 +83,17 @@ global.fetch = async (url, init = {}) => {
     }
     return response({});
   }
+  if (url === BASE.slice(0, -1) + ":runQuery") {
+    const filter = JSON.parse(init.body).structuredQuery;
+    const field = filter.where.fieldFilter.field.fieldPath;
+    const expected = decode(filter.where.fieldFilter.value);
+    const collection = filter.from[0].collectionId + "/";
+    const documents = [...docs.entries()]
+      .filter(([path, record]) => path.startsWith(collection) && !path.slice(collection.length).includes("/") && record.data[field] === expected)
+      .slice(0, filter.limit || 100)
+      .map(([path, record]) => ({ document: firestoreDoc(path, record) }));
+    return response(documents);
+  }
   const [rawPath, query = ""] = url.slice(BASE.length).split("?");
   if (init.method === "PATCH") {
     const existing = docs.get(rawPath);
@@ -102,6 +114,18 @@ global.fetch = async (url, init = {}) => {
   if (/^(provider_ratings|driver_ratings)\/[^/]+\/ratings$/.test(rawPath)) {
     const documents = [...docs.entries()].filter(([path]) => path.startsWith(rawPath + "/")).map(([path, record]) => firestoreDoc(path, record));
     return response({ documents });
+  }
+  if (/^order_messages\/[^/]+\/messages$/.test(rawPath)) {
+    const pageSize = Number(new URLSearchParams(query).get("pageSize") || 300);
+    const offset = Number(new URLSearchParams(query).get("pageToken") || 0);
+    const all = [...docs.entries()]
+      .filter(([path]) => path.startsWith(rawPath + "/"))
+      .sort(([, a], [, b]) => String(b.data.createdAt || "").localeCompare(String(a.data.createdAt || "")));
+    const page = all.slice(offset, offset + pageSize);
+    return response({
+      documents: page.map(([path, record]) => firestoreDoc(path, record)),
+      ...(offset + pageSize < all.length ? { nextPageToken: String(offset + pageSize) } : {}),
+    });
   }
   const existing = docs.get(rawPath);
   return existing ? response(firestoreDoc(rawPath, existing)) : response({ error: { status: "NOT_FOUND" } }, 404);
@@ -125,6 +149,14 @@ function firebaseIdToken(uid, email) {
   return head + "." + body + "." + sign("RSA-SHA256", Buffer.from(head + "." + body), privateKey).toString("base64url");
 }
 const authorizedReq = (path, body, uid = "register-uid") => new Request("https://worker.test" + path, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + firebaseIdToken(uid, "user@example.test") }, body: JSON.stringify(body) });
+const authorizedGet = (path, uid = "register-uid") => new Request("https://worker.test" + path, { headers: { Authorization: "Bearer " + firebaseIdToken(uid, "user@example.test") } });
+function assertThreeCalendarMonthTrial(profile) {
+  const start = new Date(profile.trialStartedAt);
+  const end = new Date(profile.trialEndsAt);
+  const expected = new Date(start.getTime());
+  expected.setUTCMonth(expected.getUTCMonth() + 3);
+  assert.equal(end.toISOString(), expected.toISOString());
+}
 
 (async () => {
   // Real canonicalizer, including rejection rather than letter stripping.
@@ -159,12 +191,15 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   put("app_settings/main", { requirePhoneAtSignup: false });
   registration = await hooks.handlePhase4cProfileRegistration(authorizedReq("/profiles/register", { role: "customer", displayName: "Optional" }, "optional-uid"), baseEnv(), "token");
   assert.equal((await registration.json()).success, true);
+  assert.equal(docs.get("users/optional-uid").data.phone, undefined);
   registration = await hooks.handlePhase4cProfileRegistration(authorizedReq("/profiles/register", { role: "provider", displayName: "Provider", phone: "0512345678" }, "provider-uid"), baseEnv(), "token");
   assert.equal((await registration.json()).success, true);
   assert.equal(docs.get("users/provider-uid").data.subscriptionStatus, "trialing");
+  assertThreeCalendarMonthTrial(docs.get("users/provider-uid").data);
   registration = await hooks.handlePhase4cProfileRegistration(authorizedReq("/profiles/register", { role: "driver", displayName: "Driver", phone: "0523456789" }, "driver-uid"), baseEnv(), "token");
   assert.equal((await registration.json()).success, true);
   assert.equal(docs.get("users/driver-uid").data.subscriptionStatus, "trialing");
+  assertThreeCalendarMonthTrial(docs.get("users/driver-uid").data);
 
   // A valid legacy alias blocks claims even when the other alias is malformed;
   // equal aliases classify once, while malformed/disagreeing profiles quarantine.
@@ -571,6 +606,134 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   privateResponse = await hooks.handleRequest(authorizedReq("/aggregate-rating", { type: "provider", uid: "role-target" }, "aggregate-customer"));
   assert.equal(privateResponse.status, 403);
   assert.equal(docs.get("users/role-target").data.ratingAverage, 4);
+
+  // Pre-decision chat is server-authoritative: participants and canonical
+  // pending state are required, unknown payload fields are rejected, controls
+  // are removed before the immutable message write, and retry uses requestId.
+  reset();
+  put("users/chat-customer", { role: "customer" });
+  put("users/chat-provider", { role: "provider", activatedByAdmin: true });
+  put("users/chat-driver", { role: "driver" });
+  put("users/chat-unrelated", { role: "customer" });
+  put("orders/chat-order", { customerUid: "chat-customer", providerUid: "chat-provider", status: "pending" });
+  Object.assign(global, baseEnv());
+  privateResponse = await hooks.handleRequest(req("/orders/chat/send", { orderId: "chat-order", requestId: "anonymous", text: "no" }));
+  assert.equal(privateResponse.status, 401);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "message-1", text: "  مرحبا\u0007  " }, "chat-customer"), baseEnv(), "token");
+  payload = await privateResponse.json();
+  assert.equal(payload.success, true);
+  assert.equal(payload.message.text, "مرحبا");
+  assert.equal(docs.get("order_messages/chat-order/messages/message-1").data.senderUid, "chat-customer");
+  assert.equal(docs.get("order_transition_events/chat-order_order_chat_to_provider_message-1").data.transition, "order_chat_to_provider");
+  assert.equal(docs.get("order_transition_events/chat-order_order_chat_to_provider_message-1").data.recipientUid, "chat-provider");
+  assert.equal(docs.get("order_message_rate_limits/chat-order_chat-customer").data.count, 1);
+  privateResponse = await hooks.handleOrderChatList(authorizedGet("/orders/chat-order/chat?limit=30", "chat-unrelated"), "token", "chat-order");
+  assert.equal(privateResponse.status, 403);
+  privateResponse = await hooks.handleOrderChatList(authorizedGet("/orders/chat-order/chat?limit=30", "chat-provider"), "token", "chat-order");
+  payload = await privateResponse.json();
+  assert.equal(payload.messages.length, 1);
+  assert.equal(payload.unreadVisibleCount, 1);
+  docs.get("orders/chat-order").data.customerChatLastReadAt = "2026-01-01T00:00:00.000Z";
+  privateResponse = await hooks.handleOrderChatMarkRead(authorizedReq("/orders/chat/read", { orderId: "chat-order", lastVisibleMessageId: "message-1", contiguousFromSequence: 1 }, "chat-provider"), "token");
+  assert.equal((await privateResponse.json()).success, true);
+  assert.equal(typeof docs.get("orders/chat-order").data.providerChatLastReadAt, "string");
+  assert.equal(docs.get("orders/chat-order").data.providerChatLastReadSequence, 1);
+  assert.equal(docs.get("orders/chat-order").data.customerChatLastReadAt, "2026-01-01T00:00:00.000Z");
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "message-2", text: "رسالة لاحقة" }, "chat-customer"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 200);
+  privateResponse = await hooks.handleOrderChatList(authorizedGet("/orders/chat-order/chat?limit=30", "chat-provider"), "token", "chat-order");
+  assert.equal((await privateResponse.json()).unreadVisibleCount, 1, "a send committed after the fetched read marker remains unread");
+  const mutatedOrder = { customerUid: "chat-customer", providerUid: "replacement-provider", status: "pending" };
+  const frozenRecipients = await hooks.getEventRecipientUids("order_chat_to_provider", mutatedOrder, "token", docs.get("order_transition_events/chat-order_order_chat_to_provider_message-1").data);
+  assert.deepEqual(frozenRecipients, ["chat-provider"], "chat retry recipient is frozen in the outbox");
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "message-1", text: "مرحبا" }, "chat-customer"), baseEnv(), "token");
+  assert.equal((await privateResponse.json()).idempotent, true);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "driver-message", text: "no" }, "chat-driver"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 403);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "unknown-field", text: "no", providerUid: "chat-provider" }, "chat-customer"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 400);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "unicode-limit", text: "\u{1F600}".repeat(501) }, "chat-customer"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 400);
+  put("orders/chat-order", { customerUid: "chat-customer", providerUid: "chat-provider", status: "accepted" });
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "message-1", text: "مرحبا" }, "chat-customer"), baseEnv(), "token");
+  assert.equal((await privateResponse.json()).idempotent, true);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "after-decision", text: "no" }, "chat-customer"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 403);
+
+  // The per-user/order limiter persists in Firestore and a report is visible
+  // only through the authenticated complaint/admin path.
+  reset();
+  put("users/chat-customer", { role: "customer" });
+  put("users/chat-provider", { role: "provider", activatedByAdmin: true });
+  put("orders/chat-order", { customerUid: "chat-customer", providerUid: "chat-provider", status: "pending" });
+  for (let i = 0; i < 5; i++) {
+    privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "limit-" + i, text: "رسالة " + i }, "chat-customer"), baseEnv(), "token");
+    assert.equal(privateResponse.status, 200);
+  }
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "limit-6", text: "زيادة" }, "chat-customer"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 429);
+  privateResponse = await hooks.handleOrderChatReport(authorizedReq("/orders/chat/report", { orderId: "chat-order", messageId: "limit-0" }, "chat-customer"), "token");
+  assert.equal((await privateResponse.json()).success, true);
+  const chatReport = docs.get("delivery_complaints/chat_chat-order_chat-customer_limit-0").data;
+  assert.equal(chatReport.reporterUid, "chat-customer");
+  assert.equal(chatReport.customerUid, undefined);
+  assert.equal(chatReport.providerUid, undefined);
+  privateResponse = await hooks.handleComplaintCreate(authorizedReq("/complaints/create", { orderId: "chat-order", type: "delivery_not_confirmed", note: "لم يتم التأكيد", target: "provider" }, "chat-customer"), "token");
+  assert.equal((await privateResponse.json()).success, true);
+  privateResponse = await hooks.handleComplaintCreate(authorizedReq("/complaints/create", { orderId: "chat-order", type: "customer_complaint", note: "شكوى العميل", target: "provider" }, "chat-customer"), "token");
+  assert.equal((await privateResponse.json()).success, true);
+  assert.equal(docs.get("delivery_complaints/delivery_chat-order_chat-customer_customer_complaint").data.type, "customer_complaint");
+  privateResponse = await hooks.handleComplaintCreate(authorizedReq("/complaints/create", { orderId: "chat-order", type: "provider_complaint", note: "شكوى مقدم الخدمة", target: "customer" }, "chat-provider"), "token");
+  assert.equal((await privateResponse.json()).success, true);
+  assert.equal(docs.get("delivery_complaints/delivery_chat-order_chat-provider_provider_complaint").data.type, "provider_complaint");
+  privateResponse = await hooks.handleComplaintCreate(authorizedReq("/complaints/create", { orderId: "chat-order", type: "provider_complaint", note: "غير مسموح", target: "customer" }, "chat-customer"), "token");
+  assert.equal(privateResponse.status, 403);
+  privateResponse = await hooks.handleOrderChatReport(authorizedReq("/orders/chat/report", { orderId: "chat-order" }, "chat-customer"), "token");
+  assert.equal((await privateResponse.json()).success, true);
+  assert.equal(docs.get("delivery_complaints/chat_chat-order_chat-customer_conversation").data.messageId, "");
+  const workerSource = fs.readFileSync(require.resolve("./worker.js"), "utf8");
+  assert.equal(workerSource.includes('esc(m.text||"")'), true, "admin chat context rendering escapes user text");
+  assert.equal(workerSource.includes("Conversation-level reports deliberately have no selected"), true, "conversation reports receive bounded admin context");
+  privateResponse = await hooks.handleMyComplaints(authorizedGet("/complaints/mine", "chat-customer"), "token");
+  payload = await privateResponse.json();
+  assert.equal(payload.complaints.some((complaint) => complaint.orderId === "chat-order" && complaint.source === "customer"), true);
+  assert.equal(payload.complaints.some((complaint) => "providerUid" in complaint || "reporterUid" in complaint), false);
+
+  // A newest 30-message poll cannot globally acknowledge an older mixed-sender
+  // gap. Paging the gap produces contiguous acknowledgements in capped ranges.
+  reset();
+  put("users/gap-customer", { role: "customer" });
+  put("users/gap-provider", { role: "provider", activatedByAdmin: true });
+  put("orders/gap-order", { customerUid: "gap-customer", providerUid: "gap-provider", status: "pending" });
+  put("order_messages/gap-order", { orderId: "gap-order", nextSequence: 55 });
+  for (let sequence = 1; sequence <= 55; sequence++) {
+    const senderRole = sequence % 2 ? "customer" : "provider";
+    put(`order_messages/gap-order/messages/gap-${String(sequence).padStart(2, "0")}`, {
+      messageId: `gap-${String(sequence).padStart(2, "0")}`,
+      orderId: "gap-order",
+      senderUid: senderRole === "customer" ? "gap-customer" : "gap-provider",
+      senderRole,
+      text: `m${sequence}`,
+      sequence,
+      createdAt: `2026-01-01T00:00:${String(sequence).padStart(2, "0")}.000Z`,
+      type: "text",
+    });
+  }
+  privateResponse = await hooks.handleOrderChatList(authorizedGet("/orders/gap-order/chat?limit=30", "gap-provider"), "token", "gap-order");
+  payload = await privateResponse.json();
+  assert.equal(payload.messages.length, 30);
+  assert.equal(payload.unreadVisibleCount, 15);
+  assert.equal(payload.unreadMayExistOutsidePage, true);
+  privateResponse = await hooks.handleOrderChatMarkRead(authorizedReq("/orders/chat/read", { orderId: "gap-order", lastVisibleMessageId: "gap-55", contiguousFromSequence: 1 }, "gap-provider"), "token");
+  assert.equal(privateResponse.status, 409);
+  privateResponse = await hooks.handleOrderChatList(authorizedGet("/orders/gap-order/chat?limit=30&cursor=30", "gap-provider"), "token", "gap-order");
+  assert.equal((await privateResponse.json()).messages.length, 25);
+  privateResponse = await hooks.handleOrderChatMarkRead(authorizedReq("/orders/chat/read", { orderId: "gap-order", lastVisibleMessageId: "gap-30", contiguousFromSequence: 1 }, "gap-provider"), "token");
+  assert.equal(privateResponse.status, 200);
+  privateResponse = await hooks.handleOrderChatMarkRead(authorizedReq("/orders/chat/read", { orderId: "gap-order", lastVisibleMessageId: "gap-55", contiguousFromSequence: 31 }, "gap-provider"), "token");
+  assert.equal(privateResponse.status, 200);
+  privateResponse = await hooks.handleOrderChatList(authorizedGet("/orders/gap-order/chat?limit=30", "gap-provider"), "token", "gap-order");
+  assert.equal((await privateResponse.json()).unreadVisibleCount, 0);
 
   console.log("phase5 phone auth real-handler tests: PASS");
 })().catch((error) => {

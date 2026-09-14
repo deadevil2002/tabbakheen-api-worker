@@ -782,12 +782,19 @@
     }
     __name(notificationEventId, "notificationEventId");
     __name2(notificationEventId, "notificationEventId");
-    async function getEventRecipientUids(event, order, accessToken) {
+    async function getEventRecipientUids(event, order, accessToken, storedEvent) {
       let values = [];
       if (["order_accepted", "order_rejected", "order_preparing", "order_ready", "picked_up", "arrived", "delivery_pending_confirmation", "self_pickup_completed"].includes(event)) values.push(order.customerUid);
       if (["customer_cancelled", "order_cancelled", "self_pickup_selected", "driver_delivery_requested", "driver_assigned", "driver_rejected", "delivered"].includes(event)) values.push(order.providerUid);
       if (["order_cancelled", "driver_assigned", "driver_rejected", "delivered"].includes(event)) values.push(order.customerUid);
       if (event === "order_created") values.push(order.providerUid);
+      // Chat notifications are bound to the participant snapshot committed
+      // with the immutable message. Retries must never follow a later order
+      // participant mutation.
+      if (["order_chat_to_customer", "order_chat_to_provider"].includes(event)) {
+        if (typeof storedEvent?.recipientUid === "string" && storedEvent.recipientUid) values.push(storedEvent.recipientUid);
+        else values.push(event === "order_chat_to_customer" ? order.customerUid : order.providerUid);
+      }
       if (event === "driver_assigned_by_provider") values.push(order.driverUid, order.customerUid);
       if (event === "driver_delivery_requested") {
         // Bounded fan-out: over-fetch up to 200 candidates from the
@@ -806,7 +813,8 @@
       const eventId = notificationEventId(orderId, transition, stateVersion);
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) return null;
-      const recipientUids = await getEventRecipientUids(transition, order, accessToken);
+      const priorEvent = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
+      const recipientUids = await getEventRecipientUids(transition, order, accessToken, priorEvent?.data);
       const recipients = recipientUids.map((uid) => ({ uid, status: "pending", attempts: 0, receiptAttempts: 0 }));
       const url = FIRESTORE_BASE + "/order_transition_events/" + eventId + "?currentDocument.exists=false";
       let response = await fetch(url, {
@@ -821,7 +829,7 @@
         } })
       });
       if (response.ok) await response.json();
-      let snapshot = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
+      let snapshot = priorEvent || await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
       if (!snapshot || snapshot.data.status === "sent" || snapshot.data.status === "terminal") return null;
       let current = snapshot.data.recipients || recipients;
       const now = Date.now();
@@ -1218,6 +1226,229 @@
     }
     __name(handleOrderTransition, "handleOrderTransition");
     __name2(handleOrderTransition, "handleOrderTransition");
+    // Order negotiation chat is deliberately Worker-only.  Clients have no
+    // Firestore message reads/writes and every authorization decision is made
+    // from the order snapshot, never request-supplied participant identifiers.
+    const ORDER_CHAT_WRITABLE_STATES = ["pending"];
+    const ORDER_CHAT_RATE_WINDOW_MS = 60 * 1e3;
+    const ORDER_CHAT_RATE_MAX = 5;
+    function orderChatInput(body) {
+      if (!phase4aKeysOnly(body, ["orderId", "requestId", "text"]) || !phase4aSafeSegment(body?.orderId) || !phase4aSafeSegment(body?.requestId) || typeof body?.text !== "string") return null;
+      // Preserve ordinary line breaks while removing non-rendering control
+      // bytes.  The normalized value is what is committed and is immutable.
+      const text = body.text.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").trim();
+      if (!text || Array.from(text).length > 500) return null;
+      return { orderId: body.orderId, requestId: body.requestId, text };
+    }
+    function orderChatIsWritable(order) {
+      return !!order && ORDER_CHAT_WRITABLE_STATES.includes(order.status) && typeof order.customerUid === "string" && typeof order.providerUid === "string" && !!order.customerUid && !!order.providerUid;
+    }
+    function orderChatRateId(orderId, uid) {
+      return orderId + "_" + uid;
+    }
+    function orderChatMessageDto(message) {
+      if (!message || message.type !== "text" || !phase4aSafeSegment(message.messageId) || !["customer", "provider"].includes(message.senderRole) || typeof message.senderUid !== "string" || typeof message.text !== "string" || typeof message.createdAt !== "string") return null;
+      return { messageId: message.messageId, orderId: message.orderId, senderUid: message.senderUid, senderRole: message.senderRole, text: message.text, createdAt: message.createdAt, sequence: Number.isInteger(message.sequence) ? message.sequence : 0, type: "text" };
+    }
+    async function handleOrderChatSend(request, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      let body;
+      try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid chat message"); }
+      const input = orderChatInput(body);
+      if (!input) return phase4aError("invalid_request", "Invalid chat message");
+      if (!["customer", "provider"].includes(auth.user.role)) return phase4aError("forbidden", "Order chat is unavailable", 403);
+      const [orderSnapshot, existingMessage, chatSnapshot] = await Promise.all([
+        getFirestoreSnapshot("orders", input.orderId, accessToken),
+        getFirestoreDoc("order_messages/" + input.orderId + "/messages", input.requestId, accessToken),
+        getFirestoreSnapshot("order_messages", input.orderId, accessToken)
+      ]);
+      if (!orderSnapshot) return phase4aError("not_found", "Order not found", 404);
+      const order = orderSnapshot.data;
+      const senderRole = auth.user.role;
+      const senderIsParticipant = senderRole === "customer" ? order.customerUid === auth.uid : order.providerUid === auth.uid;
+      if (!senderIsParticipant) return phase4aError("forbidden", "Order chat is unavailable", 403);
+      if (existingMessage) {
+        const same = existingMessage.messageId === input.requestId && existingMessage.orderId === input.orderId && existingMessage.senderUid === auth.uid && existingMessage.senderRole === senderRole && existingMessage.text === input.text && existingMessage.type === "text";
+        return same ? jsonResponse({ success: true, idempotent: true, message: orderChatMessageDto(existingMessage) }) : phase4aError("idempotency_conflict", "Message request already exists", 409);
+      }
+      if (!orderChatIsWritable(order)) return phase4aError("forbidden", "Order chat is read-only", 403);
+      const recipientUid = senderRole === "customer" ? order.providerUid : order.customerUid;
+      const recipientRole = senderRole === "customer" ? "provider" : "customer";
+      const [rateSnapshot, recipientDeletion] = await Promise.all([
+        getFirestoreSnapshot("order_message_rate_limits", orderChatRateId(input.orderId, auth.uid), accessToken),
+        getFirestoreSnapshot("account_deletion_requests", recipientUid, accessToken)
+      ]);
+      if (publicProfileDeletionActive(recipientDeletion)) return phase4aError("forbidden", "Order chat is unavailable", 403);
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const priorSequence = Number(chatSnapshot?.data?.nextSequence || 0);
+      if (!Number.isInteger(priorSequence) || priorSequence < 0) return phase4aError("state_conflict", "Order chat changed; refresh and try again", 409);
+      const sequence = priorSequence + 1;
+      const previous = rateSnapshot?.data || {};
+      const startedAt = new Date(previous.windowStartedAt || 0).getTime();
+      const inWindow = Number.isFinite(startedAt) && now.getTime() - startedAt >= 0 && now.getTime() - startedAt < ORDER_CHAT_RATE_WINDOW_MS;
+      const count = inWindow ? Number(previous.count || 0) : 0;
+      if (!Number.isInteger(count) || count < 0 || count >= ORDER_CHAT_RATE_MAX) return phase4aError("rate_limited", "Please wait before sending another message", 429);
+      const message = { messageId: input.requestId, orderId: input.orderId, senderUid: auth.uid, senderRole, text: input.text, createdAt: nowIso, sequence, type: "text" };
+      const event = senderRole === "customer" ? "order_chat_to_provider" : "order_chat_to_customer";
+      const eventId = notificationEventId(input.orderId, event, input.requestId);
+      const outbox = { orderId: input.orderId, transition: event, stateVersion: input.requestId, recipientUid, recipientRole, status: "pending", createdAt: nowIso };
+      const rate = { orderId: input.orderId, uid: auth.uid, windowStartedAt: inWindow ? previous.windowStartedAt : nowIso, count: count + 1, updatedAt: nowIso };
+      const writes = [
+        { verify: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + input.orderId, currentDocument: { updateTime: orderSnapshot.updateTime } },
+        { update: phase4aDoc("order_messages", input.orderId, { orderId: input.orderId, nextSequence: sequence, updatedAt: nowIso }), updateMask: { fieldPaths: ["orderId", "nextSequence", "updatedAt"] }, currentDocument: chatSnapshot ? { updateTime: chatSnapshot.updateTime } : { exists: false } },
+        { update: phase4aDoc("order_message_rate_limits", orderChatRateId(input.orderId, auth.uid), rate), updateMask: { fieldPaths: Object.keys(rate) }, currentDocument: rateSnapshot ? { updateTime: rateSnapshot.updateTime } : { exists: false } },
+        { update: phase4aDoc("order_messages/" + input.orderId + "/messages", input.requestId, message), updateMask: { fieldPaths: Object.keys(message) }, currentDocument: { exists: false } },
+        { update: phase4aDoc("order_transition_events", eventId, outbox), updateMask: { fieldPaths: Object.keys(outbox) }, currentDocument: { exists: false } },
+        auth.deletionFence,
+        phase4aDeletionFence(recipientUid, recipientDeletion)
+      ];
+      if (!(await phase4aCommit(writes, accessToken))) {
+        const saved = await getFirestoreDoc("order_messages/" + input.orderId + "/messages", input.requestId, accessToken);
+        if (saved && saved.senderUid === auth.uid && saved.senderRole === senderRole && saved.text === input.text && saved.type === "text") {
+          await sendTransitionNotification(event, input.orderId, accessToken, input.requestId);
+          return jsonResponse({ success: true, idempotent: true, message: orderChatMessageDto(saved) });
+        }
+        return phase4aError("state_conflict", "Order chat changed; refresh and try again", 409);
+      }
+      await sendTransitionNotification(event, input.orderId, accessToken, input.requestId);
+      return jsonResponse({ success: true, message });
+    }
+    async function handleOrderChatList(request, accessToken, orderId) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      if (!phase4aSafeSegment(orderId) || !["customer", "provider"].includes(auth.user.role)) return phase4aError("forbidden", "Order chat is unavailable", 403);
+      const order = await getFirestoreDoc("orders", orderId, accessToken);
+      const participant = order && (auth.user.role === "customer" && order.customerUid === auth.uid || auth.user.role === "provider" && order.providerUid === auth.uid);
+      if (!participant) return phase4aError("forbidden", "Order chat is unavailable", 403);
+      const requestedLimit = Number(new URL(request.url).searchParams.get("limit") || 30);
+      if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 50) return phase4aError("invalid_request", "limit must be from 1 to 50");
+      const cursor = new URL(request.url).searchParams.get("cursor");
+      // Newest-first paging keeps the polling path bounded while a user can
+      // explicitly page back through retained history.
+      let endpoint = FIRESTORE_BASE + "/order_messages/" + orderId + "/messages?pageSize=" + requestedLimit + "&orderBy=createdAt%20desc";
+      if (cursor) endpoint += "&pageToken=" + encodeURIComponent(cursor);
+      const response = await fetch(endpoint, { headers: { "Authorization": "Bearer " + accessToken } });
+      if (!response.ok) throw new Error("Order chat list failed: " + response.status);
+      const payload = await response.json();
+      const messages = (payload.documents || []).map(parseFirestoreDoc).map(orderChatMessageDto).filter(Boolean).sort((a, b) => a.sequence - b.sequence || String(a.createdAt).localeCompare(String(b.createdAt)));
+      const readField = auth.user.role === "customer" ? "customerChatLastReadAt" : "providerChatLastReadAt";
+      const readSequenceField = auth.user.role === "customer" ? "customerChatLastReadSequence" : "providerChatLastReadSequence";
+      const readAt = new Date(order[readField] || 0).getTime();
+      const readSequence = Number(order[readSequenceField] || 0);
+      // This is intentionally derived only from the bounded returned page.
+      // The watermark is authoritative; next-page history is never scanned
+      // merely to paint a badge.
+      const unreadCount = messages.filter((message) => message.senderUid !== auth.uid && (message.sequence > 0 ? message.sequence > readSequence : new Date(message.createdAt).getTime() > readAt)).length;
+      const nextCursor = typeof payload.nextPageToken === "string" ? payload.nextPageToken : null;
+      return jsonResponse({ success: true, writable: orderChatIsWritable(order), messages, lastReadSequence: Number.isInteger(readSequence) && readSequence >= 0 ? readSequence : 0, unreadVisibleCount: unreadCount, unreadMayExistOutsidePage: !!nextCursor, nextCursor });
+    }
+    async function handleOrderChatMarkRead(request, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid chat read request"); }
+      if (!phase4aKeysOnly(body, ["orderId", "lastVisibleMessageId", "contiguousFromSequence"]) || !phase4aSafeSegment(body?.orderId) || !phase4aSafeSegment(body?.lastVisibleMessageId) || !Number.isInteger(body?.contiguousFromSequence) || body.contiguousFromSequence < 1 || !["customer", "provider"].includes(auth.user.role)) return phase4aError("invalid_request", "Invalid chat read request");
+      const field = auth.user.role === "customer" ? "customerChatLastReadAt" : "providerChatLastReadAt";
+      const sequenceField = auth.user.role === "customer" ? "customerChatLastReadSequence" : "providerChatLastReadSequence";
+      // Retrying the narrow, monotonic per-role field avoids dropping a read
+      // acknowledgement when a message/transition concurrently changes the
+      // order document. It never writes the other participant's marker.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const snapshot = await getFirestoreSnapshot("orders", body.orderId, accessToken);
+        const participant = snapshot && (auth.user.role === "customer" && snapshot.data.customerUid === auth.uid || auth.user.role === "provider" && snapshot.data.providerUid === auth.uid);
+        if (!participant) return phase4aError("forbidden", "Order chat is unavailable", 403);
+        const visible = await getFirestoreDoc("order_messages/" + body.orderId + "/messages", body.lastVisibleMessageId, accessToken);
+        if (!visible || visible.orderId !== body.orderId || visible.type !== "text" || typeof visible.createdAt !== "string" || !Number.isFinite(new Date(visible.createdAt).getTime())) return phase4aError("not_found", "Visible chat message not found", 404);
+        // The client can acknowledge only the immutable server timestamp of a
+        // message it names. A message committed between GET and this POST has
+        // a later timestamp and therefore remains unread.
+        const existing = new Date(snapshot.data[field] || 0).getTime();
+        const existingSequence = Number(snapshot.data[sequenceField] || 0);
+        const visibleSequence = Number(visible.sequence || 0);
+        // An acknowledgement can move only across one contiguous 30-message
+        // fetched page. This prevents a newest-page poll from globally marking a
+        // hidden older gap as read; the client must page that gap first.
+        if (!Number.isInteger(existingSequence) || existingSequence < 0 || !Number.isInteger(visibleSequence) || visibleSequence < body.contiguousFromSequence || body.contiguousFromSequence !== existingSequence + 1 || visibleSequence - existingSequence > 30) return phase4aError("read_gap", "Load earlier chat messages before marking this range read", 409);
+        const readSequence = visibleSequence;
+        const readAt = new Date(Math.max(existing || 0, new Date(visible.createdAt).getTime())).toISOString();
+        const committed = await compareAndSetFirestoreDocument("orders", body.orderId, { [field]: readAt, [sequenceField]: readSequence }, snapshot.updateTime, accessToken);
+        if (committed.ok) return jsonResponse({ success: true, lastReadAt: readAt, lastReadSequence: readSequence });
+      }
+      return phase4aError("state_conflict", "Order chat changed; refresh and try again", 409);
+    }
+    async function handleOrderChatReport(request, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid chat report"); }
+      if (!phase4aKeysOnly(body, ["orderId", "messageId", "note"]) || !phase4aSafeSegment(body?.orderId) || (body.messageId !== undefined && !phase4aSafeSegment(body.messageId)) || (body.note !== undefined && (typeof body.note !== "string" || Array.from(body.note.trim()).length > 500))) return phase4aError("invalid_request", "Invalid chat report");
+      const order = await getFirestoreDoc("orders", body.orderId, accessToken);
+      const participant = order && (auth.user.role === "customer" && order.customerUid === auth.uid || auth.user.role === "provider" && order.providerUid === auth.uid);
+      if (!participant) return phase4aError("forbidden", "Order chat is unavailable", 403);
+      if (body.messageId) {
+        const message = await getFirestoreDoc("order_messages/" + body.orderId + "/messages", body.messageId, accessToken);
+        if (!message || message.orderId !== body.orderId || message.type !== "text") return phase4aError("not_found", "Chat message not found", 404);
+      }
+      const reportId = "chat_" + body.orderId + "_" + auth.uid + "_" + (body.messageId || "conversation");
+      // Do not persist the other participant UID (or any participant UID
+      // field) in chat reports. This is important while legacy Rules still
+      // permit participant-field complaint queries.
+      const report = { orderId: body.orderId, reporterUid: auth.uid, source: auth.user.role, target: auth.user.role === "customer" ? "provider" : "customer", type: "order_chat_report", messageId: body.messageId || "", note: typeof body.note === "string" ? body.note.trim() : "", complaintStatus: "pending", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      const saved = await getFirestoreDoc("delivery_complaints", reportId, accessToken);
+      if (saved) return saved.orderId === report.orderId && saved.source === report.source ? jsonResponse({ success: true, idempotent: true, reportId }) : phase4aError("idempotency_conflict", "Report already exists", 409);
+      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", reportId, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, auth.deletionFence], accessToken);
+      return created ? jsonResponse({ success: true, reportId }) : phase4aError("state_conflict", "Report changed; retry", 409);
+    }
+    function complaintRefDto(complaint) {
+      if (!complaint || typeof complaint.orderId !== "string" || typeof complaint.source !== "string" || typeof complaint.complaintStatus !== "string") return null;
+      // This is the only customer-facing complaint shape. It intentionally
+      // omits every participant UID, including the chat reporter UID.
+      return {
+        id: typeof complaint._id === "string" ? complaint._id : "",
+        orderId: complaint.orderId,
+        orderNumber: typeof complaint.orderNumber === "string" ? complaint.orderNumber : "",
+        source: complaint.source,
+        target: typeof complaint.target === "string" ? complaint.target : "",
+        type: typeof complaint.type === "string" ? complaint.type : "",
+        complaintStatus: complaint.complaintStatus,
+        note: typeof complaint.note === "string" ? complaint.note : "",
+        adminNote: typeof complaint.adminNote === "string" ? complaint.adminNote : "",
+        createdAt: typeof complaint.createdAt === "string" ? complaint.createdAt : "",
+        updatedAt: typeof complaint.updatedAt === "string" ? complaint.updatedAt : ""
+      };
+    }
+    async function handleMyComplaints(request, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      if (!["customer", "provider", "driver"].includes(auth.user.role)) return phase4aError("forbidden", "Complaints are unavailable", 403);
+      const participantField = auth.user.role + "Uid";
+      const [legacy, chatReports] = await Promise.all([
+        queryFirestoreLimited("delivery_complaints", participantField, "EQUAL", auth.uid, 100, accessToken),
+        queryFirestoreLimited("delivery_complaints", "reporterUid", "EQUAL", auth.uid, 100, accessToken)
+      ]);
+      const refs = [...legacy, ...chatReports]
+        .filter((complaint) => complaint.source === auth.user.role && (complaint.type !== "order_chat_report" || complaint.reporterUid === auth.uid))
+        .map(complaintRefDto).filter(Boolean);
+      const unique = new Map(refs.map((ref) => [ref.id || ref.orderId + "_" + ref.source + "_" + ref.type, ref]));
+      return jsonResponse({ success: true, complaints: [...unique.values()] });
+    }
+    async function handleComplaintCreate(request, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid complaint"); }
+      if (!phase4aKeysOnly(body, ["orderId", "type", "note", "target"]) || !phase4aSafeSegment(body?.orderId) || !["customer_rejected_receipt", "delivery_not_confirmed", "customer_complaint", "provider_complaint"].includes(body?.type) || typeof body?.note !== "string" || Array.from(body.note).length > 500 || (body.target !== undefined && !["customer", "provider", "driver"].includes(body.target))) return phase4aError("invalid_request", "Invalid complaint");
+      const order = await getFirestoreDoc("orders", body.orderId, accessToken);
+      const role = auth.user.role;
+      const participant = order && (role === "customer" && order.customerUid === auth.uid || role === "provider" && order.providerUid === auth.uid || role === "driver" && order.driverUid === auth.uid);
+      if (!participant) return phase4aError("forbidden", "Complaint is unavailable", 403);
+      if (body.type === "customer_complaint" && role !== "customer" || body.type === "provider_complaint" && role !== "provider") return phase4aError("forbidden", "Complaint type is unavailable", 403);
+      const id = "delivery_" + body.orderId + "_" + auth.uid + "_" + body.type;
+      const report = { orderId: body.orderId, customerUid: order.customerUid || "", providerUid: order.providerUid || "", driverUid: order.driverUid || "", status: order.status || "", deliveryStatus: order.deliveryStatus || "", source: role, target: body.target || "", type: body.type, note: body.note.trim(), complaintStatus: "pending", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      const existing = await getFirestoreDoc("delivery_complaints", id, accessToken);
+      if (existing) return existing.source === role && existing.orderId === body.orderId ? jsonResponse({ success: true, idempotent: true, complaint: complaintRefDto(existing) }) : phase4aError("idempotency_conflict", "Complaint already exists", 409);
+      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, auth.deletionFence], accessToken);
+      return created ? jsonResponse({ success: true, complaint: complaintRefDto({ ...report, _id: id }) }) : phase4aError("state_conflict", "Complaint changed; retry", 409);
+    }
     async function createFirestoreDocument(collectionPath, docId, fields, accessToken) {
       const url = docId ? `${FIRESTORE_BASE}/${collectionPath}/${docId}` : `${FIRESTORE_BASE}/${collectionPath}`;
       const firestoreFields = {};
@@ -2010,7 +2241,6 @@
       formData.append("timestamp", timestamp);
       formData.append("folder", folder);
       formData.append("signature", signature);
-      console.log("[Cloudinary] Uploading to folder:", folder, "cloud:", cloudName);
       const res = await fetch("https://api.cloudinary.com/v1_1/" + cloudName + "/image/upload", {
         method: "POST",
         body: formData
@@ -2021,7 +2251,6 @@
         console.error("[Cloudinary] Upload failed:", errMsg);
         throw new Error("Cloudinary upload failed: " + errMsg);
       }
-      console.log("[Cloudinary] Upload success:", result.secure_url);
       return { secure_url: result.secure_url, public_id: result.public_id };
     }
     __name(uploadToCloudinary, "uploadToCloudinary");
@@ -2036,7 +2265,7 @@
     async function sendEmail(to, subject, html, env, attachments) {
       const apiKey = env.EMAIL_API_KEY;
       if (!apiKey) {
-        console.log("[Email] EMAIL_API_KEY not configured, skipping email to:", to);
+        console.log("[Email] EMAIL_API_KEY not configured; email skipped");
         return { sent: false, reason: "EMAIL_API_KEY not configured" };
       }
       const from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
@@ -2055,14 +2284,14 @@
         });
         const data = await res.json();
         if (res.ok) {
-          console.log("[Email] Sent to", to, "id:", data.id);
+          console.log("[Email] Sent");
           return { sent: true, id: data.id };
         } else {
-          console.error("[Email] Failed:", JSON.stringify(data));
+          console.error("[Email] Failed");
           return { sent: false, reason: data.message || "Failed" };
         }
       } catch (e) {
-        console.error("[Email] Error:", e);
+        console.error("[Email] Error");
         return { sent: false, reason: e.message };
       }
     }
@@ -2533,6 +2762,21 @@
               });
             }
           }
+          break;
+        }
+        case "order_chat_to_customer":
+        case "order_chat_to_provider": {
+          const recipientUid = typeof leaseContext?.data?.recipientUid === "string" && leaseContext.data.recipientUid ? leaseContext.data.recipientUid : event === "order_chat_to_customer" ? order.customerUid : order.providerUid;
+          const recipientRole = leaseContext?.data?.recipientRole === "customer" || leaseContext?.data?.recipientRole === "provider" ? leaseContext.data.recipientRole : event === "order_chat_to_customer" ? "customer" : "provider";
+          const token = recipientUid ? await getUserPushToken(recipientUid, accessToken) : null;
+          if (token) messages.push({
+            to: token,
+            title: "\u0645\u062d\u0627\u062f\u062b\u0629 \u0627\u0644\u0637\u0644\u0628",
+            // Never put user-generated message text on the lock screen.
+            body: "\u0644\u062f\u064a\u0643 \u0631\u0633\u0627\u0644\u0629 \u062c\u062f\u064a\u062f\u0629 \u0628\u062e\u0635\u0648\u0635 \u0637\u0644\u0628\u0643",
+            data: { type: "order_chat_message", orderId, role: recipientRole },
+            sound: "default"
+          });
           break;
         }
         case "order_rejected": {
@@ -3883,6 +4127,7 @@ function complaintStatusBadge(status){
 }
 function complaintStatusLabel(status){return ct(status==="pending"?"pending":status==="resolved"?"resolved":status==="closed"?"closed":"unknown");}
 function complaintTypeLabel(type){
+  if(type==="order_chat_report")return lang==="ar"?"بلاغ محادثة الطلب":"Order chat report";
   var m={customer_complaint:"customerComplaint",provider_complaint:"providerComplaint",delivery_not_confirmed:"deliveryNotConfirmed",customer_rejected_receipt:"customerRejectedReceipt"};
   return ct(m[type]||"unknown");
 }
@@ -3956,6 +4201,7 @@ async function viewComplaint(id){
   var data=await api("/complaints/"+encodeURIComponent(id));
   if(!data||!data.complaint){closeModal();toast((data&&data.error)||ct("saveFailed"),"error");return;}
   var x=data.complaint;
+  var chatContext=x.type==="order_chat_report"?'<div class="form-group"><label>'+(lang==="ar"?"الرسالة المُبلّغ عنها":"Reported chat message")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+((x.reportedChatContext||[]).map(function(m){return '<div><strong>'+esc(complaintRoleLabel(m.senderRole))+'</strong><div>'+esc(m.text||"")+'</div><small>'+complaintDate(m.createdAt)+'</small></div>';}).join("")||(lang==="ar"?"لا توجد رسالة مرتبطة بهذا البلاغ":"No message is attached to this report"))+'</div></div>':"";
   openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span style="font-size:13px;color:var(--text2)">#'+esc(x.orderNumber||x.orderId||x.id)+'</span></h3>'+
     '<div class="detail-grid">'+
     '<div><label>'+ct("orderNumber")+'</label><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong></div>'+
@@ -3967,7 +4213,7 @@ async function viewComplaint(id){
     '<div><label>'+ct("driver")+'</label>'+complaintPerson(x,"driver")+'</div>'+
     '<div><label>'+ct("created")+'</label><strong>'+complaintDate(x.createdAt)+'</strong></div>'+
     '</div>'+
-    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+
+    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+
     '<div class="form-group"><label for="complaint-status">'+ct("status")+'</label><select id="complaint-status" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px">'+["pending","resolved","closed"].map(function(s){return'<option value="'+s+'" '+(x.complaintStatus===s?"selected":"")+'>'+ct(s)+'</option>';}).join("")+'</select></div>'+
     '<div class="form-group"><label for="complaint-admin-note">'+ct("adminReply")+'</label><textarea id="complaint-admin-note" rows="4" maxlength="4000" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;resize:vertical">'+esc(x.adminNote||"")+'</textarea></div>'+
     '<div style="font-size:12px;color:var(--text2);margin-bottom:12px">'+ct("updated")+': '+complaintDate(x.updatedAt)+'</div>'+
@@ -5288,7 +5534,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         registerPrivateDevice,
         setDriverAvailabilityAndSync,
         publicRatingDto,
-        handlePhase4aOrderCreate
+        handlePhase4aOrderCreate,
+        orderChatInput,
+        orderChatIsWritable,
+        orderChatMessageDto,
+        handleOrderChatSend,
+        handleOrderChatList,
+        handleOrderChatMarkRead,
+        handleOrderChatReport,
+        handleMyComplaints,
+        handleComplaintCreate,
+        claimNotificationEvent,
+        getEventRecipientUids
       };
     }
     addEventListener("scheduled", (event) => {
@@ -5837,13 +6094,32 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               if (user && user._id) userMap[user._id] = { uid: user._id, displayName: user.displayName || "", email: user.email || "", phone: user.phone || "" };
             }
             const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
-            return jsonResponse({ success: true, complaint: {
+            const detail = {
               ...complaint,
               id: complaint._id || complaint.id || complaintId,
               customer: person(complaint.customerUid),
               provider: person(complaint.providerUid),
               driver: person(complaint.driverUid)
-            } });
+            };
+            // Chat text is never an admin-wide browsing feed.  It is supplied
+            // only when inspecting a specific authenticated chat-abuse report.
+            if (complaint.type === "order_chat_report") {
+              detail.reportedChatContext = [];
+              // The admin receives only the explicitly reported immutable
+              // message, never an unrestricted order conversation.
+              if (phase4aSafeSegment(complaint.orderId) && phase4aSafeSegment(complaint.messageId)) {
+                const reportedMessage = await getFirestoreDoc("order_messages/" + complaint.orderId + "/messages", complaint.messageId, accessToken);
+                const dto = orderChatMessageDto(reportedMessage);
+                if (dto && dto.orderId === complaint.orderId) detail.reportedChatContext = [dto];
+              } else if (phase4aSafeSegment(complaint.orderId)) {
+                // Conversation-level reports deliberately have no selected
+                // message. Supply a bounded, authoritative context window for
+                // support review rather than an empty admin panel.
+                const chatResponse = await fetch(FIRESTORE_BASE + "/order_messages/" + complaint.orderId + "/messages?pageSize=50&orderBy=createdAt%20desc", { headers: { "Authorization": "Bearer " + accessToken } });
+                if (chatResponse.ok) detail.reportedChatContext = ((await chatResponse.json()).documents || []).map(parseFirestoreDoc).map(orderChatMessageDto).filter(Boolean).sort((a, b) => a.sequence - b.sequence || String(a.createdAt).localeCompare(String(b.createdAt)));
+              }
+            }
+            return jsonResponse({ success: true, complaint: detail });
           }
           const complaintUpdateMatch = path.match(/^\/admin\/api\/complaints\/([^/]+)\/update$/);
           if (complaintUpdateMatch && request.method === "POST") {
@@ -6319,7 +6595,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         try {
           callerUid = await verifyFirebaseIdToken(getTokenFromRequest(request));
         } catch (e) {
-          console.log("[Auth] Rejected app request:", e && e.message ? e.message : e);
+          console.log("[Auth] Rejected app request");
           return Response.json({ success: false, error: "Unauthorized" }, { status: 401, headers: { "Access-Control-Allow-Origin": "*" } });
         }
       }
@@ -6376,6 +6652,61 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch (error) {
           console.error("[OrderPayment] Error:", error && error.message ? error.message : error);
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to retrieve payment instructions" }, 500);
+        }
+      }
+      const orderChatMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/chat$/);
+      if (orderChatMatch && request.method === "GET") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderChatList(request, accessToken, orderChatMatch[1]);
+        } catch (error) {
+          console.error("[OrderChat] List failed");
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to load order chat" }, 500);
+        }
+      }
+      if (path === "/orders/chat/send" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderChatSend(request, env, accessToken);
+        } catch (error) {
+          console.error("[OrderChat] Send failed");
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to send chat message" }, 500);
+        }
+      }
+      if (path === "/orders/chat/read" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderChatMarkRead(request, accessToken);
+        } catch (error) {
+          console.error("[OrderChat] Read receipt failed");
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to mark order chat read" }, 500);
+        }
+      }
+      if (path === "/orders/chat/report" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderChatReport(request, accessToken);
+        } catch (error) {
+          console.error("[OrderChat] Report failed");
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to report order chat" }, 500);
+        }
+      }
+      if (path === "/complaints/mine" && request.method === "GET") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleMyComplaints(request, accessToken);
+        } catch {
+          console.error("[Complaints] List failed");
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to load complaints" }, 500);
+        }
+      }
+      if (path === "/complaints/create" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleComplaintCreate(request, accessToken);
+        } catch {
+          console.error("[Complaints] Create failed");
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to create complaint" }, 500);
         }
       }
       if (path === "/devices/register" && request.method === "POST") {

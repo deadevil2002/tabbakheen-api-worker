@@ -88,15 +88,17 @@ async function main() {
   if (execute && !approval) throw new Error("Refusing execution: PUBLIC_PROFILE_MIGRATION_APPROVAL is required");
   const required = ["FIREBASE_ADMIN_PROJECT_ID", "FIREBASE_ADMIN_CLIENT_EMAIL", "FIREBASE_ADMIN_PRIVATE_KEY"];
   for (const key of required) if (!process.env[key]) throw new Error("Missing required server-only credential: " + key);
-  let admin;
+  let adminApp;
   try {
-    const loaded = require("firebase-admin");
-    admin = loaded.default || loaded;
+    // firebase-admin v13's CommonJS package default is an app namespace that
+    // does not expose getApps. Import the explicit app entry point so the
+    // read-only dry-run works across supported Admin SDK module shapes.
+    adminApp = require("firebase-admin/app");
   } catch {
     throw new Error("firebase-admin is required on the controlled migration host");
   }
-  if (!admin.getApps().length) {
-    admin.initializeApp({ credential: admin.cert({
+  if (!adminApp.getApps().length) {
+    adminApp.initializeApp({ credential: adminApp.cert({
       projectId: process.env.FIREBASE_ADMIN_PROJECT_ID,
       clientEmail: process.env.FIREBASE_ADMIN_CLIENT_EMAIL,
       privateKey: process.env.FIREBASE_ADMIN_PRIVATE_KEY.replace(/\\n/g, "\n")
