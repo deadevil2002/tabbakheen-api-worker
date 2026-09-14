@@ -461,6 +461,19 @@
     }
     __name(syncPublicProfile, "syncPublicProfile");
     __name2(syncPublicProfile, "syncPublicProfile");
+    async function syncPublicProfileByUid(uid, accessToken) {
+      const user = await getFirestoreDoc("users", uid, accessToken);
+      return user ? syncPublicProfile(uid, user, accessToken) : false;
+    }
+    __name(syncPublicProfileByUid, "syncPublicProfileByUid");
+    __name2(syncPublicProfileByUid, "syncPublicProfileByUid");
+    async function syncPublicProfileBestEffort(uid, accessToken) {
+      try { await syncPublicProfileByUid(uid, accessToken); } catch (error) {
+        console.error("[PublicProfile] projection sync failed:", error && error.message ? error.message : error);
+      }
+    }
+    __name(syncPublicProfileBestEffort, "syncPublicProfileBestEffort");
+    __name2(syncPublicProfileBestEffort, "syncPublicProfileBestEffort");
     async function classifyPublicProfileProjection(accessToken) {
       const users = await listAllUsers(accessToken);
       const candidates = users.filter((user) => user && ["provider", "driver"].includes(user.role));
@@ -611,6 +624,7 @@
       if (user.role === "driver" && !entitlement.eligible) fields.isAvailable = false;
       try {
         await updateFirestoreDocument("users", uid, fields, accessToken);
+        await syncPublicProfile(uid, { ...user, ...fields }, accessToken);
       } catch (error) {
         // Entitlement decisions never fail open merely because denormalization failed.
         console.error("[Entitlement] Best-effort normalization failed:", uid, error && error.message ? error.message : error);
@@ -2804,6 +2818,7 @@
       }
       const now = (/* @__PURE__ */ new Date()).toISOString();
       await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+      await syncPublicProfileBestEffort(uid, accessToken);
       await createFirestoreDocument("verifications", uid, { crNumber, submittedAt: now, checkedAt: now }, accessToken);
       try {
         const result = await fetchWathqCommercialRegistration(crNumber, env);
@@ -2813,6 +2828,7 @@
             verificationSource: "wathq",
             verifiedAt: now
           }, accessToken);
+          await syncPublicProfileBestEffort(uid, accessToken);
           await updateFirestoreDocument("verifications", uid, {
             checkedAt: now,
             verificationSource: "wathq",
@@ -2822,6 +2838,7 @@
           return jsonResponse({ success: true, verificationStatus: "verified", verifiedAt: now });
         }
         await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+        await syncPublicProfileBestEffort(uid, accessToken);
         await updateFirestoreDocument("verifications", uid, {
           checkedAt: now,
           internalError: result && result.statusToken ? result.statusToken : result && result.status ? "wathq_http_" + result.status : "wathq_not_active_or_unclear"
@@ -2829,6 +2846,7 @@
         return jsonResponse({ success: true, verificationStatus: "pending_review" });
       } catch (e) {
         await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+        await syncPublicProfileBestEffort(uid, accessToken);
         await updateFirestoreDocument("verifications", uid, {
           checkedAt: now,
           internalError: e && e.message ? e.message.slice(0, 180) : "wathq_unreachable"
@@ -2876,6 +2894,7 @@
       const alreadyWathqVerified = curStatus === "verified" && curSource === "wathq";
       if (!alreadyWathqVerified) {
         await updateFirestoreDocument("users", uid, { verificationStatus: "pending_review" }, accessToken);
+        await syncPublicProfileBestEffort(uid, accessToken);
       }
       return jsonResponse({ success: true, verificationStatus: alreadyWathqVerified ? curStatus : "pending_review" });
     }
@@ -4684,10 +4703,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           else {
             if (receipt.details && receipt.details.error === "DeviceNotRegistered") {
               try {
-                const userSnapshot = await getFirestoreSnapshot("users", recipient.uid, accessToken);
-                const currentToken = userSnapshot?.data?.expoPushToken;
-                if (userSnapshot && userSnapshot.data.pushNotificationsEnabled === true && isExpoPushToken(currentToken) && recipient.submittedTokenHash && await sha256Hex(currentToken) === recipient.submittedTokenHash) {
-                  await compareAndSetFirestoreDocument("users", recipient.uid, { expoPushToken: null, pushNotificationsEnabled: false }, userSnapshot.updateTime, accessToken);
+                const deviceSnapshot = await getFirestoreSnapshot("private_devices", recipient.uid, accessToken);
+                const currentToken = deviceSnapshot?.data?.expoPushToken;
+                if (deviceSnapshot && deviceSnapshot.data.pushNotificationsEnabled === true && isExpoPushToken(currentToken) && recipient.submittedTokenHash && await sha256Hex(currentToken) === recipient.submittedTokenHash) {
+                  await compareAndSetFirestoreDocument("private_devices", recipient.uid, { expoPushToken: null, pushNotificationsEnabled: false }, deviceSnapshot.updateTime, accessToken);
+                } else {
+                  // Legacy-only cleanup for a token registered by a released
+                  // client; new registrations never write this user field.
+                  const userSnapshot = await getFirestoreSnapshot("users", recipient.uid, accessToken);
+                  const legacyToken = userSnapshot?.data?.expoPushToken;
+                  if (userSnapshot && userSnapshot.data.pushNotificationsEnabled === true && isExpoPushToken(legacyToken) && recipient.submittedTokenHash && await sha256Hex(legacyToken) === recipient.submittedTokenHash) {
+                    await compareAndSetFirestoreDocument("users", recipient.uid, { expoPushToken: null, pushNotificationsEnabled: false }, userSnapshot.updateTime, accessToken);
+                  }
                 }
               } catch {}
             }
@@ -4886,10 +4913,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       // preserve their resumability rather than turning an old deletion into a
       // permanently pending request.
       if (!Object.prototype.hasOwnProperty.call(manifest, "phoneIndexDeleted")) manifest.phoneIndexDeleted = true;
-      // Old manifests predate these private/public projections. Treat their
-      // absence as already-cleaned so an existing deletion can still resume.
-      if (!Object.prototype.hasOwnProperty.call(manifest, "publicProfileDeleted")) manifest.publicProfileDeleted = true;
-      if (!Object.prototype.hasOwnProperty.call(manifest, "privateDeviceDeleted")) manifest.privateDeviceDeleted = true;
+      // Old manifests predate these projections; delete them explicitly on
+      // resume so a previously started deletion cannot leave public identity
+      // or a private push token behind.
+      if (!Object.prototype.hasOwnProperty.call(manifest, "publicProfileDeleted")) manifest.publicProfileDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "privateDeviceDeleted")) manifest.privateDeviceDeleted = false;
       const failures = [];
       if (manifest.phoneIndexDeleted !== true) {
         if (!manifest.phoneIndexKey) {
@@ -5306,6 +5334,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
         }
         await updateFirestoreDocument("users", uid, { isAvailable: body.isAvailable, ...commercialAccessFields(entitlement) }, accessToken);
+        await syncPublicProfileBestEffort(uid, accessToken);
         return jsonResponse({ success: true, isAvailable: body.isAvailable, entitlement });
       }
       if (path === "/deliveries/available" && request.method === "GET") {
@@ -5368,6 +5397,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!claim) writes.push({ update: phase4aDoc("apple_transaction_claims", originalTransactionId, { uid: auth.uid, createdAt: new Date().toISOString() }), updateMask: { fieldPaths: ["uid", "createdAt"] }, currentDocument: { exists: false } });
           else writes.push({ verify: "projects/tabbakheen-99883/databases/(default)/documents/apple_transaction_claims/" + originalTransactionId, currentDocument: { updateTime: claimSnap.updateTime } });
           if (!(await phase4aCommit(writes, accessToken))) return phase4aError("STATE_CONFLICT", "Subscription changed; retry", 409);
+           await syncPublicProfile(auth.uid, { ...userSnap.data, ...fields }, accessToken);
           return jsonResponse({ success: true, subscription: fields });
         } catch (error) {
           return phase4aError(error && error.message === "APPLE_TRANSACTION_INVALID" ? "APPLE_TRANSACTION_INVALID" : "APPLE_SYNC_FAILED", "Apple subscription sync failed", 502);
@@ -5407,6 +5437,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const aggregateFields = { ratingCount: oldCount + 1, ratingAverage: (oldAverage * oldCount + body.stars) / (oldCount + 1) };
         const fields = body.type === "provider" ? { providerHasRating: true, ratingSubmitted: true, providerRatingStars: body.stars, providerRatingComment: rating.comment, updatedAt: new Date().toISOString() } : { driverHasRating: true, driverRatingSubmitted: true, driverRatingStars: body.stars, driverRatingComment: rating.comment, updatedAt: new Date().toISOString() };
         if (!(await phase4aCommit([{ update: phase4aDoc(ratingCollection, ratingId, rating), updateMask: { fieldPaths: Object.keys(rating) }, currentDocument: { exists: false } }, { update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, { update: phase4aDoc("users", targetUid, aggregateFields), updateMask: { fieldPaths: Object.keys(aggregateFields) }, currentDocument: { updateTime: targetSnap.updateTime } }, auth.deletionFence, phase4aDeletionFence(targetUid, targetDeletion)], accessToken))) return phase4aError("state_conflict", "Rating changed; retry", 409);
+         await syncPublicProfile(targetUid, { ...targetSnap.data, ...aggregateFields }, accessToken);
         return jsonResponse({ success: true, ratingId, rating });
       }
       if (["/orders/create", "/offers/create", "/offers/update", "/orders/payment-proof", "/orders/payment-confirm", "/orders/payment-reject"].includes(path) && request.method === "POST") {
@@ -5936,8 +5967,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const endDate = user.subscriptionEndsAt || user.trialEndsAt;
               const daysLeft = endDate ? Math.ceil((new Date(endDate) - Date.now()) / (1e3 * 60 * 60 * 24)) : 0;
               const name = user.displayName || "";
-              const pushToken = user.expoPushToken;
-              if (user.pushNotificationsEnabled === true && pushToken && isExpoPushToken(pushToken)) {
+              const pushToken = await getUserPushToken(uid, accessToken);
+              if (pushToken) {
                 await sendExpoPush([{
                   to: pushToken,
                   title: "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
