@@ -186,6 +186,37 @@
     }
     __name(toFirestoreValue, "toFirestoreValue");
     __name2(toFirestoreValue, "toFirestoreValue");
+    // Phone identity is canonicalized only here, on the server. Clients submit
+    // display input; they must never create their own index key.
+    function normalizeSaudiMobilePhone(value) {
+      if (typeof value !== "string") return null;
+      let digits = value.trim().replace(/[^\d+]/g, "");
+      if (!digits) return null;
+      if (digits.startsWith("+")) digits = digits.slice(1);
+      if (digits.startsWith("00")) digits = digits.slice(2);
+      if (digits.startsWith("966")) digits = digits.slice(3);
+      else if (digits.startsWith("0")) digits = digits.slice(1);
+      if (!/^5\d{8}$/.test(digits)) return null;
+      return "+966" + digits;
+    }
+    __name(normalizeSaudiMobilePhone, "normalizeSaudiMobilePhone");
+    __name2(normalizeSaudiMobilePhone, "normalizeSaudiMobilePhone");
+    async function phoneLookupKey(value, env, namespace = "phone-index") {
+      if (!env.PHONE_LOGIN_HMAC_SECRET) throw new Error("PHONE_LOGIN_HMAC_SECRET is not configured");
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.PHONE_LOGIN_HMAC_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(namespace + ":" + value));
+      return Array.from(new Uint8Array(signature)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    __name(phoneLookupKey, "phoneLookupKey");
+    __name2(phoneLookupKey, "phoneLookupKey");
+    function phoneAuthSettings(settings) {
+      return {
+        requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
+        phonePasswordLoginEnabled: !!(settings && settings.phonePasswordLoginEnabled === true)
+      };
+    }
+    __name(phoneAuthSettings, "phoneAuthSettings");
+    __name2(phoneAuthSettings, "phoneAuthSettings");
     async function listAllUsers(accessToken) {
       const users = [];
       let pageToken = null;
@@ -1070,6 +1101,66 @@
       if (!existing || existing._id !== uid || existing.email !== email) return false;
       return Object.entries(requested).every(([key, value]) => JSON.stringify(existing[key]) === JSON.stringify(value));
     }
+    function phoneIndexDocument(key, uid, now) {
+      return { uid, status: "eligible", createdAt: now, updatedAt: now, schemaVersion: 1 };
+    }
+    __name(phoneIndexDocument, "phoneIndexDocument");
+    __name2(phoneIndexDocument, "phoneIndexDocument");
+    const KNOWN_DUPLICATE_PHONE_UIDS = /* @__PURE__ */ new Set(["F23GUoy3VJVxWOZs5sZHZxifVVI3", "KLonAzumgwNWg2RJLi5E4uupVGo1"]);
+    function isKnownDuplicatePhoneOwner(uid) {
+      return KNOWN_DUPLICATE_PHONE_UIDS.has(uid);
+    }
+    __name(isKnownDuplicatePhoneOwner, "isKnownDuplicatePhoneOwner");
+    __name2(isKnownDuplicatePhoneOwner, "isKnownDuplicatePhoneOwner");
+    async function existingPhoneProfileOwners(phone, accessToken, exceptUid = "") {
+      // Until Rules reject legacy direct phone writes, index creation must also
+      // defend against an already-stored, unindexed canonical equivalent.
+      return (await listAllUsers(accessToken)).filter((user) => {
+        if (user._id === exceptUid) return false;
+        const supplied = typeof user.phone === "string" ? user.phone : typeof user.phoneNumber === "string" ? user.phoneNumber : "";
+        return normalizeSaudiMobilePhone(supplied) === phone;
+      }).map((user) => user._id);
+    }
+    __name(existingPhoneProfileOwners, "existingPhoneProfileOwners");
+    __name2(existingPhoneProfileOwners, "existingPhoneProfileOwners");
+    function genericPhoneLoginFailure(status = 401) {
+      return jsonResponse({ success: false, code: "INVALID_CREDENTIALS", error: "Invalid credentials" }, status);
+    }
+    __name(genericPhoneLoginFailure, "genericPhoneLoginFailure");
+    __name2(genericPhoneLoginFailure, "genericPhoneLoginFailure");
+    async function consumePhoneLoginRateLimit(subject, accessToken) {
+      // Firestore makes the limiter durable across Worker isolates. The key is
+      // HMAC-derived, so neither a phone nor an IP address is stored here.
+      const now = Date.now();
+      const windowMs = 15 * 60 * 1e3;
+      const cooldownMs = 15 * 60 * 1e3;
+      const maxAttempts = 5;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const snapshot = await getFirestoreSnapshot("phone_login_rate_limits", subject, accessToken);
+        const prior = snapshot?.data || {};
+        if (Number(prior.cooldownUntil) > now) return false;
+        const sameWindow = Number(prior.windowStartedAt) > now - windowMs;
+        const count = sameWindow ? Number(prior.attempts || 0) : 0;
+        const nextCount = count + 1;
+        const fields = {
+          windowStartedAt: sameWindow ? Number(prior.windowStartedAt) : now,
+          attempts: nextCount,
+          cooldownUntil: nextCount >= maxAttempts ? now + cooldownMs : 0,
+          updatedAt: new Date(now).toISOString()
+        };
+        let committed;
+        if (snapshot) {
+          committed = await compareAndSetFirestoreDocument("phone_login_rate_limits", subject, fields, snapshot.updateTime, accessToken);
+        } else {
+          committed = await phase4aCommit([{ update: phase4aDoc("phone_login_rate_limits", subject, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { exists: false } }], accessToken) ? { ok: true } : { ok: false };
+        }
+        if (committed.ok) return nextCount < maxAttempts;
+      }
+      // Fail closed rather than allowing bursts when concurrent requests race.
+      return false;
+    }
+    __name(consumePhoneLoginRateLimit, "consumePhoneLoginRateLimit");
+    __name2(consumePhoneLoginRateLimit, "consumePhoneLoginRateLimit");
     async function batchGetUsers(uids, accessToken) {
       const response = await fetch(FIRESTORE_BASE + ":batchGet", {
         method: "POST",
@@ -1149,20 +1240,31 @@
         transactions: groups.flatMap((group) => Array.isArray(group && group.lastTransactions) ? group.lastTransactions : []).map((item) => parseAppleSubscriptionStatusPayload(item)).filter(Boolean)
       };
     }
-    async function handlePhase4cProfileRegistration(request, accessToken) {
+    async function handlePhase4cProfileRegistration(request, env, accessToken) {
       let claims;
       try { claims = await verifyFirebaseIdToken(getTokenFromRequest(request), true); } catch { return phase4aError("UNAUTHORIZED", "Unauthorized", 401); }
       let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid profile"); }
       const input = phase4cProfileInput(body);
       const email = typeof claims.email === "string" ? claims.email.trim().toLowerCase() : "";
       if (!input || !email) return phase4aError("INVALID_PROFILE", "A Firebase email and valid profile are required");
+      const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+      const phoneSettings = phoneAuthSettings(settings);
+      const rawPhone = typeof input.phone === "string" ? input.phone : "";
+      const canonicalPhone = rawPhone ? normalizeSaudiMobilePhone(rawPhone) : null;
+      if ((phoneSettings.requirePhoneAtSignup && !canonicalPhone) || (rawPhone && !canonicalPhone)) {
+        return phase4aError("INVALID_PHONE", "A valid Saudi mobile number is required");
+      }
+      if (canonicalPhone) input.phone = canonicalPhone;
       const existing = await getFirestoreDoc("users", claims.sub, accessToken);
       if (existing) {
         if (!profileMatchesExisting(existing, input, claims.sub, email)) return phase4aError("PROFILE_CONFLICT", "A conflicting profile already exists", 409);
         return jsonResponse({ success: true, idempotent: true, profile: existing, entitlement: evaluateSubscriptionEntitlement(existing) });
       }
+      if (canonicalPhone && (await existingPhoneProfileOwners(canonicalPhone, accessToken)).length) {
+        return phase4aError("PHONE_UNAVAILABLE", "Phone cannot be used", 409);
+      }
       const now = new Date();
-      const fields = { ...input, uid: claims.sub, email, createdAt: now.toISOString() };
+      const fields = { ...input, uid: claims.sub, email, createdAt: now.toISOString(), phoneVerified: false };
       if (input.role === "provider" || input.role === "driver") {
         fields.trialStartedAt = now.toISOString();
         fields.trialEndsAt = addUtcCalendarMonths(now, 3).toISOString();
@@ -1170,7 +1272,15 @@
         Object.assign(fields, commercialAccessFields(evaluateSubscriptionEntitlement(fields, now)));
         if (input.role === "driver") fields.isAvailable = false;
       }
-      const ok = await phase4aCommit([{ update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } }], accessToken);
+      const writes = [{ update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } }];
+      if (canonicalPhone) {
+        const key = await phoneLookupKey(canonicalPhone, env);
+        fields.phoneIndexStatus = "indexed";
+        fields.phoneIndexSchemaVersion = 1;
+        writes[0] = { update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } };
+        writes.push({ update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, claims.sub, now.toISOString())), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } });
+      }
+      const ok = await phase4aCommit(writes, accessToken);
       if (!ok) {
         const raced = await getFirestoreDoc("users", claims.sub, accessToken);
         if (profileMatchesExisting(raced, input, claims.sub, email)) return jsonResponse({ success: true, idempotent: true, profile: raced, entitlement: evaluateSubscriptionEntitlement(raced) });
@@ -1178,6 +1288,174 @@
       }
       return jsonResponse({ success: true, profile: fields, entitlement: evaluateSubscriptionEntitlement(fields) }, 201);
     }
+    async function createFirebaseCustomToken(uid, env) {
+      const now = Math.floor(Date.now() / 1e3);
+      const header = base64urlStr(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+      const payload = base64urlStr(JSON.stringify({
+        iss: env.FIREBASE_CLIENT_EMAIL,
+        sub: env.FIREBASE_CLIENT_EMAIL,
+        aud: "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit",
+        iat: now,
+        exp: now + 300,
+        uid
+      }));
+      const signed = header + "." + payload;
+      const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", await importPrivateKey(env.FIREBASE_PRIVATE_KEY), new TextEncoder().encode(signed));
+      return signed + "." + base64url(signature);
+    }
+    __name(createFirebaseCustomToken, "createFirebaseCustomToken");
+    __name2(createFirebaseCustomToken, "createFirebaseCustomToken");
+    async function lookupFirebaseEmail(uid, accessToken) {
+      const response = await fetch("https://identitytoolkit.googleapis.com/v1/projects/tabbakheen-99883/accounts:lookup", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ localId: [uid] })
+      });
+      if (!response.ok) throw new Error("Firebase account lookup failed");
+      const user = (await response.json()).users?.[0];
+      return user && typeof user.email === "string" ? user.email : "";
+    }
+    __name(lookupFirebaseEmail, "lookupFirebaseEmail");
+    __name2(lookupFirebaseEmail, "lookupFirebaseEmail");
+    async function verifyFirebasePassword(email, password, env) {
+      if (!env.FIREBASE_WEB_API_KEY) throw new Error("FIREBASE_WEB_API_KEY is not configured");
+      const response = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + encodeURIComponent(env.FIREBASE_WEB_API_KEY), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password, returnSecureToken: true })
+      });
+      if (!response.ok) return null;
+      const result = await response.json();
+      return result && typeof result.localId === "string" ? result.localId : null;
+    }
+    __name(verifyFirebasePassword, "verifyFirebasePassword");
+    __name2(verifyFirebasePassword, "verifyFirebasePassword");
+    async function handlePhonePasswordLogin(request, env, accessToken) {
+      // This endpoint intentionally has one client-visible failure for malformed,
+      // unknown, conflicted, disabled, and wrong-password attempts.
+      let body;
+      try { body = await request.json(); } catch { return genericPhoneLoginFailure(); }
+      if (!phase4aKeysOnly(body, ["phone", "password"]) || typeof body.phone !== "string" || typeof body.password !== "string" || body.phone.length > 80 || body.password.length < 1 || body.password.length > 1024) return genericPhoneLoginFailure();
+      const settings = phoneAuthSettings(await getFirestoreDoc("app_settings", "main", accessToken));
+      if (!settings.phonePasswordLoginEnabled) return genericPhoneLoginFailure();
+      const canonicalPhone = normalizeSaudiMobilePhone(body.phone);
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const ipSubject = await phoneLookupKey(ip, env, "phone-login-ip");
+      const phoneSubject = await phoneLookupKey(canonicalPhone || ("invalid:" + body.phone), env, "phone-login-phone");
+      if (!await consumePhoneLoginRateLimit(ipSubject, accessToken) || !await consumePhoneLoginRateLimit(phoneSubject, accessToken)) return genericPhoneLoginFailure(429);
+      if (!canonicalPhone) return genericPhoneLoginFailure();
+      const index = await getFirestoreDoc("phoneLoginIndex", await phoneLookupKey(canonicalPhone, env), accessToken);
+      if (!index || index.status !== "eligible" || !phase4aSafeSegment(index.uid) || isKnownDuplicatePhoneOwner(index.uid)) return genericPhoneLoginFailure();
+      const identityAccessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY, "https://www.googleapis.com/auth/identitytoolkit");
+      const email = await lookupFirebaseEmail(index.uid, identityAccessToken);
+      if (!email) return genericPhoneLoginFailure();
+      const authenticatedUid = await verifyFirebasePassword(email, body.password, env);
+      if (!authenticatedUid || authenticatedUid !== index.uid) return genericPhoneLoginFailure();
+      return jsonResponse({ success: true, customToken: await createFirebaseCustomToken(index.uid, env) });
+    }
+    __name(handlePhonePasswordLogin, "handlePhonePasswordLogin");
+    __name2(handlePhonePasswordLogin, "handlePhonePasswordLogin");
+    async function handleProfilePhoneUpdate(request, env, accessToken) {
+      let claims;
+      try { claims = await verifyFirebaseIdToken(getTokenFromRequest(request), true); } catch { return phase4aError("UNAUTHORIZED", "Unauthorized", 401); }
+      let body;
+      try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid phone"); }
+      if (!phase4aKeysOnly(body, ["phone"]) || typeof body.phone !== "string") return phase4aError("INVALID_PHONE", "Invalid phone");
+      if (isKnownDuplicatePhoneOwner(claims.sub)) return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until duplicate ownership is resolved", 409);
+      const phone = normalizeSaudiMobilePhone(body.phone);
+      if (!phone) return phase4aError("INVALID_PHONE", "Invalid phone");
+      const profileSnapshot = await getFirestoreSnapshot("users", claims.sub, accessToken);
+      const profile = profileSnapshot?.data;
+      if (!profile || profile.phoneIndexStatus !== "indexed" || profile.phoneIndexSchemaVersion !== 1) return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until this account is securely indexed", 409);
+      const oldPhone = normalizeSaudiMobilePhone(profile.phone);
+      if (!oldPhone) return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until this account is securely indexed", 409);
+      const oldKey = await phoneLookupKey(oldPhone, env);
+      const oldIndexSnapshot = await getFirestoreSnapshot("phoneLoginIndex", oldKey, accessToken);
+      if (!oldIndexSnapshot || oldIndexSnapshot.data.uid !== claims.sub || oldIndexSnapshot.data.status !== "eligible") return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until this account is securely indexed", 409);
+      const newKey = await phoneLookupKey(phone, env);
+      if (newKey === oldKey) return jsonResponse({ success: true, phone, idempotent: true });
+      if ((await existingPhoneProfileOwners(phone, accessToken, claims.sub)).length) return phase4aError("PHONE_UNAVAILABLE", "Phone cannot be used", 409);
+      const newIndex = await getFirestoreSnapshot("phoneLoginIndex", newKey, accessToken);
+      if (newIndex) return phase4aError("PHONE_UNAVAILABLE", "Phone cannot be used", 409);
+      const now = new Date().toISOString();
+      const profileFields = { phone, phoneVerified: false, phoneIndexStatus: "indexed", phoneIndexSchemaVersion: 1 };
+      const committed = await phase4aCommit([
+        { update: phase4aDoc("users", claims.sub, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
+        { delete: "projects/tabbakheen-99883/databases/(default)/documents/phoneLoginIndex/" + oldKey, currentDocument: { updateTime: oldIndexSnapshot.updateTime } },
+        { update: phase4aDoc("phoneLoginIndex", newKey, phoneIndexDocument(newKey, claims.sub, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } }
+      ], accessToken);
+      return committed ? jsonResponse({ success: true, phone }) : phase4aError("PHONE_UNAVAILABLE", "Phone cannot be used", 409);
+    }
+    __name(handleProfilePhoneUpdate, "handleProfilePhoneUpdate");
+    __name2(handleProfilePhoneUpdate, "handleProfilePhoneUpdate");
+    async function classifyPhoneIndexBackfill(accessToken, env) {
+      const users = await listAllUsers(accessToken);
+      const groups = /* @__PURE__ */ new Map();
+      const invalid = [];
+      let noPhone = 0;
+      for (const user of users) {
+        const supplied = typeof user.phone === "string" ? user.phone : typeof user.phoneNumber === "string" ? user.phoneNumber : "";
+        if (!supplied.trim()) {
+          noPhone++;
+          continue;
+        }
+        const phone = normalizeSaudiMobilePhone(supplied);
+        if (!phone) {
+          invalid.push(user._id);
+          continue;
+        }
+        if (!groups.has(phone)) groups.set(phone, []);
+        groups.get(phone).push(user._id);
+      }
+      const candidates = [];
+      const conflicts = [];
+      for (const [phone, uids] of groups.entries()) {
+        if (uids.length === 1 && !isKnownDuplicatePhoneOwner(uids[0])) candidates.push({ uid: uids[0], phone });
+        else conflicts.push({ phone, uids: [...uids].sort() });
+      }
+      const knownConflictExcluded = conflicts.some((item) => item.uids.includes("F23GUoy3VJVxWOZs5sZHZxifVVI3") && item.uids.includes("KLonAzumgwNWg2RJLi5E4uupVGo1"));
+      const fingerprint = await phoneLookupKey(JSON.stringify({ candidates: candidates.map((item) => item.uid).sort(), conflicts: conflicts.map((item) => item.uids).sort() }), env, "phone-backfill");
+      return {
+        counts: { UNIQUE_SAFE: candidates.length, DUPLICATE_CONFLICT: conflicts.reduce((count, item) => count + item.uids.length, 0), INVALID_PHONE: invalid.length, NO_PHONE: noPhone },
+        candidates,
+        knownConflictExcluded,
+        fingerprint
+      };
+    }
+    __name(classifyPhoneIndexBackfill, "classifyPhoneIndexBackfill");
+    __name2(classifyPhoneIndexBackfill, "classifyPhoneIndexBackfill");
+    async function executePhoneIndexBackfill(request, env, accessToken) {
+      let body;
+      try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid backfill request"); }
+      if (!phase4aKeysOnly(body, ["confirm", "dryRunFingerprint"]) || body.confirm !== true || typeof body.dryRunFingerprint !== "string") return phase4aError("INVALID_REQUEST", "Explicit confirmation and a current dry-run fingerprint are required");
+      // This environment gate must remain absent until Firestore Rules deny all
+      // client writes to protected phone and index fields. It prevents an admin
+      // UI action from activating a stale-profile migration prematurely.
+      if (env.PHONE_INDEX_BACKFILL_APPROVED !== "true") return phase4aError("RULES_HARDENING_REQUIRED", "Backfill is blocked until Rules hardening is approved", 409);
+      const classification = await classifyPhoneIndexBackfill(accessToken, env);
+      if (body.dryRunFingerprint !== classification.fingerprint) return phase4aError("DRY_RUN_STALE", "Run the dry-run again before backfill", 409);
+      let indexed = 0;
+      let alreadyIndexed = 0;
+      let conflicts = 0;
+      for (const candidate of classification.candidates) {
+        const key = await phoneLookupKey(candidate.phone, env);
+        const existing = await getFirestoreDoc("phoneLoginIndex", key, accessToken);
+        if (existing) {
+          if (existing.uid === candidate.uid && existing.status === "eligible") alreadyIndexed++;
+          else conflicts++;
+          continue;
+        }
+        const now = new Date().toISOString();
+        const committed = await phase4aCommit([{ update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, candidate.uid, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } }], accessToken);
+        if (committed) indexed++;
+        else conflicts++;
+      }
+      const auditId = "phone-index-backfill-" + crypto.randomUUID();
+      await phase4aCommit([{ update: phase4aDoc("admin_audit_logs", auditId, { action: "phone_index_backfill", changedAt: new Date().toISOString(), changedBy: "admin_token", dryRunFingerprint: classification.fingerprint, counts: classification.counts, indexed, alreadyIndexed, conflicts }), updateMask: { fieldPaths: ["action", "changedAt", "changedBy", "dryRunFingerprint", "counts", "indexed", "alreadyIndexed", "conflicts"] }, currentDocument: { exists: false } }], accessToken);
+      return jsonResponse({ success: true, counts: classification.counts, indexed, alreadyIndexed, conflicts, knownConflictExcluded: classification.knownConflictExcluded });
+    }
+    __name(executePhoneIndexBackfill, "executePhoneIndexBackfill");
+    __name2(executePhoneIndexBackfill, "executePhoneIndexBackfill");
     async function phase4aAppleJwt(env) {
       if (!env.ASC_ISSUER_ID || !env.ASC_KEY_ID || !env.ASC_KEY_P8) throw new Error("Apple credentials unavailable");
       const now = Math.floor(Date.now() / 1e3);
@@ -3653,6 +3931,10 @@ async function renderSettings(c){
   var bannerUrl=appSettings.bannerImageUrl||"";
   var bannerEnabled=appSettings.bannerEnabled!==false;
   c.innerHTML='<h1 class="page-title">'+t("appSettings")+'</h1>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"أمان الحساب":"Account security")+'</h3>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup"'+(appSettings.requirePhoneAtSignup!==false?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+'</label></div>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-phonePasswordLoginEnabled"'+(appSettings.phonePasswordLoginEnabled===true?" checked":"")+'> '+(lang==="ar"?"تفعيل تسجيل الدخول برقم الجوال":"Enable phone number login")+'</label><p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"لا تفعّله قبل تطبيق قواعد Firestore والتحقق من الفهرسة الآمنة.":"Do not enable before Firestore Rules hardening and safe index verification.")+'</p></div>'+
+    '</div>'+
     '<div class="settings-section"><h3>'+t("language")+'</h3>'+
     '<div class="lang-switch"><button class="'+(lang==="ar"?"active":"")+'" onclick="setLang(\\'ar\\')">'+t("arabic")+'</button><button class="'+(lang==="en"?"active":"")+'" onclick="setLang(\\'en\\')">'+t("english")+'</button></div>'+
     '</div>'+
@@ -3782,6 +4064,8 @@ async function saveSettings(){
     },
     defaultLanguage:lang,
     subscriptionWarningDays:Math.max(0,integerValue("s-warningDays",7)),
+    requirePhoneAtSignup:document.getElementById("s-requirePhoneAtSignup")?document.getElementById("s-requirePhoneAtSignup").checked:true,
+    phonePasswordLoginEnabled:document.getElementById("s-phonePasswordLoginEnabled")?document.getElementById("s-phonePasswordLoginEnabled").checked:false,
     notifyOnNewUser:document.getElementById("s-notifyNewUser")?document.getElementById("s-notifyNewUser").checked:false,
     notifyOnNewProvider:document.getElementById("s-notifyNewProvider")?document.getElementById("s-notifyNewProvider").checked:false,
     notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
@@ -4567,6 +4851,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof ASC_KEY_P8 !== "undefined") env.ASC_KEY_P8 = ASC_KEY_P8;
       } catch {
       }
+      try {
+        if (typeof PHONE_LOGIN_HMAC_SECRET !== "undefined") env.PHONE_LOGIN_HMAC_SECRET = PHONE_LOGIN_HMAC_SECRET;
+      } catch {
+      }
+      try {
+        if (typeof FIREBASE_WEB_API_KEY !== "undefined") env.FIREBASE_WEB_API_KEY = FIREBASE_WEB_API_KEY;
+      } catch {
+      }
+      try {
+        if (typeof PHONE_INDEX_BACKFILL_APPROVED !== "undefined") env.PHONE_INDEX_BACKFILL_APPROVED = PHONE_INDEX_BACKFILL_APPROVED;
+      } catch {
+      }
       const url = new URL(request.url);
       const path = url.pathname;
       if (request.method === "OPTIONS") {
@@ -4581,16 +4877,41 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/" && request.method === "GET") {
         return Response.json({ status: "ok", service: "tabbakheen-api", version: "2.2.0", admin: true, pdf: true, deliveryPricingAdmin: true });
       }
+      if (path === "/app-settings/auth" && request.method === "GET") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return jsonResponse({ success: true, settings: phoneAuthSettings(await getFirestoreDoc("app_settings", "main", accessToken)) });
+        } catch {
+          // Do not turn a settings outage into an unsafe phone-login fallback.
+          return jsonResponse({ success: true, settings: { requirePhoneAtSignup: true, phonePasswordLoginEnabled: false } });
+        }
+      }
+      if (path === "/auth/phone-password" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handlePhonePasswordLogin(request, env, accessToken);
+        } catch {
+          return genericPhoneLoginFailure();
+        }
+      }
       // Phase 4C commercial access API. These routes are server-authoritative;
       // deployed Firestore Rules still permit some legacy direct writes, so
       // Worker enforcement cannot close that separate path until a Rules release.
       if (path === "/profiles/register" && request.method === "POST") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          return await handlePhase4cProfileRegistration(request, accessToken);
+           return await handlePhase4cProfileRegistration(request, env, accessToken);
         } catch (error) {
           console.error("[ProfileRegistration] Error:", error && error.message ? error.message : error);
           return phase4aError("INTERNAL_ERROR", "Profile registration failed", 500);
+        }
+      }
+      if (path === "/profiles/phone" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleProfilePhoneUpdate(request, env, accessToken);
+        } catch {
+          return phase4aError("PHONE_UPDATE_FAILED", "Phone update failed", 500);
         }
       }
       if (path === "/profiles/me" && request.method === "GET") {
@@ -5096,6 +5417,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
+            for (const key of ["requirePhoneAtSignup", "phonePasswordLoginEnabled"]) {
+              if (key in body && typeof body[key] !== "boolean") return jsonResponse({ error: key + " must be boolean" }, 400);
+            }
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -5125,7 +5449,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "notifyOnCrVerification",
               "notifyOnFreelanceRequest",
               "providerSubscription",
-              "driverSubscription"
+              "driverSubscription",
+              "requirePhoneAtSignup",
+              "phonePasswordLoginEnabled"
             ];
             const fields = {};
             for (const key of allowedSettings) {
@@ -5134,8 +5460,30 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if (Object.keys(fields).length === 0) {
               return jsonResponse({ error: "No valid settings fields" }, 400);
             }
-            await updateFirestoreDocument("app_settings", "main", fields, accessToken);
+            const before = await getFirestoreDoc("app_settings", "main", accessToken) || {};
+            const changes = {};
+            for (const key of ["requirePhoneAtSignup", "phonePasswordLoginEnabled"]) {
+              if (key in fields && before[key] !== fields[key]) changes[key] = { oldValue: before[key] === true, newValue: fields[key] };
+            }
+            if (Object.keys(changes).length) {
+              const changedAt = new Date().toISOString();
+              const auditId = "settings-" + crypto.randomUUID();
+              const committed = await phase4aCommit([
+                { update: phase4aDoc("app_settings", "main", fields), updateMask: { fieldPaths: Object.keys(fields) } },
+                { update: phase4aDoc("admin_audit_logs", auditId, { action: "app_settings_changed", changedAt, changedBy: "admin_token", changes }), updateMask: { fieldPaths: ["action", "changedAt", "changedBy", "changes"] }, currentDocument: { exists: false } }
+              ], accessToken);
+              if (!committed) return jsonResponse({ error: "Settings changed concurrently; retry" }, 409);
+            } else {
+              await updateFirestoreDocument("app_settings", "main", fields, accessToken);
+            }
             return jsonResponse({ success: true, updated: Object.keys(fields) });
+          }
+          if (path === "/admin/api/phone-index/dry-run" && request.method === "GET") {
+            const classification = await classifyPhoneIndexBackfill(accessToken, env);
+            return jsonResponse({ success: true, counts: classification.counts, knownConflictExcluded: classification.knownConflictExcluded, dryRunFingerprint: classification.fingerprint });
+          }
+          if (path === "/admin/api/phone-index/backfill" && request.method === "POST") {
+            return await executePhoneIndexBackfill(request, env, accessToken);
           }
           if (path === "/admin/api/upload-banner" && request.method === "POST") {
             try {
