@@ -202,7 +202,7 @@
     __name(normalizeSaudiMobilePhone, "normalizeSaudiMobilePhone");
     __name2(normalizeSaudiMobilePhone, "normalizeSaudiMobilePhone");
     async function phoneLookupKey(value, env, namespace = "phone-index") {
-      if (!env.PHONE_LOGIN_HMAC_SECRET) throw new Error("PHONE_LOGIN_HMAC_SECRET is not configured");
+      if (!phoneIndexingIsConfigured(env)) throw new Error("PHONE_LOGIN_HMAC_SECRET is not configured");
       const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.PHONE_LOGIN_HMAC_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
       const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(namespace + ":" + value));
       return Array.from(new Uint8Array(signature)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -217,6 +217,11 @@
     }
     __name(phoneAuthSettings, "phoneAuthSettings");
     __name2(phoneAuthSettings, "phoneAuthSettings");
+    function phoneIndexingIsConfigured(env) {
+      return !!(env.PHONE_LOGIN_HMAC_SECRET && String(env.PHONE_LOGIN_HMAC_SECRET).length >= 32);
+    }
+    __name(phoneIndexingIsConfigured, "phoneIndexingIsConfigured");
+    __name2(phoneIndexingIsConfigured, "phoneIndexingIsConfigured");
     async function listAllUsers(accessToken) {
       const users = [];
       let pageToken = null;
@@ -1273,12 +1278,19 @@
         if (input.role === "driver") fields.isAvailable = false;
       }
       const writes = [{ update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } }];
-      if (canonicalPhone) {
+      if (canonicalPhone && phoneIndexingIsConfigured(env)) {
         const key = await phoneLookupKey(canonicalPhone, env);
         fields.phoneIndexStatus = "indexed";
         fields.phoneIndexSchemaVersion = 1;
         writes[0] = { update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } };
         writes.push({ update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, claims.sub, now.toISOString())), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } });
+      } else if (canonicalPhone) {
+        // Staged deployments must retain ordinary account registration even
+        // before the new HMAC secret is installed. Such records can never be
+        // used for phone login and are explicitly excluded from activation.
+        fields.phoneIndexStatus = "pending_hmac";
+        fields.phoneIndexSchemaVersion = 1;
+        writes[0] = { update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } };
       }
       const ok = await phase4aCommit(writes, accessToken);
       if (!ok) {
@@ -1414,7 +1426,7 @@
         else conflicts.push({ phone, uids: [...uids].sort() });
       }
       const knownConflictExcluded = conflicts.some((item) => item.uids.includes("F23GUoy3VJVxWOZs5sZHZxifVVI3") && item.uids.includes("KLonAzumgwNWg2RJLi5E4uupVGo1"));
-      const fingerprint = await phoneLookupKey(JSON.stringify({ candidates: candidates.map((item) => item.uid).sort(), conflicts: conflicts.map((item) => item.uids).sort() }), env, "phone-backfill");
+      const fingerprint = phoneIndexingIsConfigured(env) ? await phoneLookupKey(JSON.stringify({ candidates: candidates.map((item) => item.uid).sort(), conflicts: conflicts.map((item) => item.uids).sort() }), env, "phone-backfill") : null;
       return {
         counts: { UNIQUE_SAFE: candidates.length, DUPLICATE_CONFLICT: conflicts.reduce((count, item) => count + item.uids.length, 0), INVALID_PHONE: invalid.length, NO_PHONE: noPhone },
         candidates,
@@ -1433,7 +1445,7 @@
       // UI action from activating a stale-profile migration prematurely.
       if (env.PHONE_INDEX_BACKFILL_APPROVED !== "true") return phase4aError("RULES_HARDENING_REQUIRED", "Backfill is blocked until Rules hardening is approved", 409);
       const classification = await classifyPhoneIndexBackfill(accessToken, env);
-      if (body.dryRunFingerprint !== classification.fingerprint) return phase4aError("DRY_RUN_STALE", "Run the dry-run again before backfill", 409);
+      if (!classification.fingerprint || body.dryRunFingerprint !== classification.fingerprint) return phase4aError("DRY_RUN_STALE", "Run the dry-run again after configuring the phone index secret", 409);
       let indexed = 0;
       let alreadyIndexed = 0;
       let conflicts = 0;
@@ -1456,6 +1468,25 @@
     }
     __name(executePhoneIndexBackfill, "executePhoneIndexBackfill");
     __name2(executePhoneIndexBackfill, "executePhoneIndexBackfill");
+    async function phoneLoginActivationBlocker(env, accessToken) {
+      if (!phoneIndexingIsConfigured(env)) return "PHONE_LOGIN_HMAC_SECRET_REQUIRED";
+      if (!env.FIREBASE_WEB_API_KEY) return "FIREBASE_WEB_API_KEY_REQUIRED";
+      // These are deployment secrets, never mutable app settings. They may be
+      // set only after a human verifies the Rules release and a completed,
+      // reviewed index migration; the admin checkbox cannot bypass them.
+      if (env.PHONE_LOGIN_RULES_HARDENED !== "true") return "FIRESTORE_RULES_NOT_APPROVED";
+      if (env.PHONE_LOGIN_INDEX_READY !== "true") return "PHONE_INDEX_NOT_APPROVED";
+      if (env.PHONE_LOGIN_ACTIVATION_APPROVED !== "true") return "PHONE_LOGIN_NOT_APPROVED";
+      const classification = await classifyPhoneIndexBackfill(accessToken, env);
+      if (classification.counts.DUPLICATE_CONFLICT > 0) return "DUPLICATE_PHONE_OWNERSHIP_UNRESOLVED";
+      for (const candidate of classification.candidates) {
+        const index = await getFirestoreDoc("phoneLoginIndex", await phoneLookupKey(candidate.phone, env), accessToken);
+        if (!index || index.uid !== candidate.uid || index.status !== "eligible") return "PHONE_INDEX_INCOMPLETE";
+      }
+      return null;
+    }
+    __name(phoneLoginActivationBlocker, "phoneLoginActivationBlocker");
+    __name2(phoneLoginActivationBlocker, "phoneLoginActivationBlocker");
     async function phase4aAppleJwt(env) {
       if (!env.ASC_ISSUER_ID || !env.ASC_KEY_ID || !env.ASC_KEY_P8) throw new Error("Apple credentials unavailable");
       const now = Math.floor(Date.now() / 1e3);
@@ -4573,7 +4604,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(cleanupLimitationsFrom, "cleanupLimitationsFrom");
     __name2(cleanupLimitationsFrom, "cleanupLimitationsFrom");
-    async function buildAccountDeletionManifest(uid, user, accessToken) {
+    async function buildAccountDeletionManifest(uid, user, accessToken, env) {
       const verification = await getFirestoreDoc("verifications", uid, accessToken);
       const certificatePublicId = cloudinaryPublicIdFromVerification(verification);
       const offers = user.role === "provider" ? await queryFirestore("offers", "providerId", "EQUAL", uid, accessToken) : [];
@@ -4586,11 +4617,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       cleanupLimitations.push(...(certificatePublicId ? verificationLimitations.filter((item) => !item.startsWith("verification.freelanceCertificate.fileUrl_has_no_public_id")) : verificationLimitations));
       cleanupLimitations.push(...offers.flatMap((offer) => cleanupLimitationsFrom(offer, "offer")));
       if (!certificatePublicId && verification?.freelanceCertificate?.fileUrl) cleanupLimitations.push("certificate_url_has_no_public_id");
+      const profilePhone = normalizeSaudiMobilePhone(user.phone);
+      const indexedPhoneMustBeRemoved = profilePhone && user.phoneIndexStatus === "indexed";
+      const phoneIndexKey = indexedPhoneMustBeRemoved && phoneIndexingIsConfigured(env) ? await phoneLookupKey(profilePhone, env) : null;
       return {
         role: user.role,
         certificatePublicId,
         certificateDeleted: !certificatePublicId,
         remainingOfferIds: [...new Set(offers.map((offer) => offer?._id).filter(Boolean))],
+        // Hash only: no phone is copied into the account-deletion record.
+        phoneIndexKey,
+        phoneIndexDeleted: !indexedPhoneMustBeRemoved,
         userDeleted: false,
         verificationDeleted: false,
         cleanupLimitations: [...new Set(cleanupLimitations)]
@@ -4618,7 +4655,31 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       const manifest = { ...(record.cleanupManifest || {}) };
       manifest.remainingOfferIds = Array.isArray(manifest.remainingOfferIds) ? manifest.remainingOfferIds : [];
       manifest.cleanupLimitations = Array.isArray(manifest.cleanupLimitations) ? manifest.cleanupLimitations : [];
+      // Manifests created before phone identity existed have no index to clean;
+      // preserve their resumability rather than turning an old deletion into a
+      // permanently pending request.
+      if (!Object.prototype.hasOwnProperty.call(manifest, "phoneIndexDeleted")) manifest.phoneIndexDeleted = true;
       const failures = [];
+      if (manifest.phoneIndexDeleted !== true) {
+        if (!manifest.phoneIndexKey) {
+          failures.push("phone_index_secret_unavailable");
+        } else {
+          if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+          try {
+            const indexSnapshot = await getFirestoreSnapshot("phoneLoginIndex", manifest.phoneIndexKey, accessToken);
+            if (!indexSnapshot || indexSnapshot.data.uid === uid) {
+              if (indexSnapshot) await deleteFirestoreDocument("phoneLoginIndex", manifest.phoneIndexKey, accessToken);
+              manifest.phoneIndexDeleted = true;
+              const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+              if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+            } else {
+              failures.push("phone_index_owner_mismatch");
+            }
+          } catch {
+            failures.push("phone_index_delete_failed");
+          }
+        }
+      }
       // Known media is optional infrastructure, isolated from all critical deletes.
       if (manifest.certificatePublicId && manifest.certificateDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -4660,7 +4721,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("verification_delete_failed"); }
       }
-      const complete = manifest.remainingOfferIds.length === 0 && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
+      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
       const final = await writeDeletionState(uid, owner, {
         status: complete ? "completed" : "cleanup_pending",
         cleanupManifest: manifest,
@@ -4687,7 +4748,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (active.length) {
           return await writeDeletionState(uid, owner, { status: "failed", code: "ACTIVE_ORDERS", failureCode: "active_orders" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
-        const cleanupManifest = await buildAccountDeletionManifest(uid, user, accessToken);
+        const cleanupManifest = await buildAccountDeletionManifest(uid, user, accessToken, env);
         record = await writeDeletionState(uid, owner, { uid, role: user.role, status: "in_progress", cleanupManifest, code: null, failureCode: "" }, accessToken);
         if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
       }
@@ -4861,6 +4922,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       }
       try {
         if (typeof PHONE_INDEX_BACKFILL_APPROVED !== "undefined") env.PHONE_INDEX_BACKFILL_APPROVED = PHONE_INDEX_BACKFILL_APPROVED;
+      } catch {
+      }
+      try {
+        if (typeof PHONE_LOGIN_RULES_HARDENED !== "undefined") env.PHONE_LOGIN_RULES_HARDENED = PHONE_LOGIN_RULES_HARDENED;
+      } catch {
+      }
+      try {
+        if (typeof PHONE_LOGIN_INDEX_READY !== "undefined") env.PHONE_LOGIN_INDEX_READY = PHONE_LOGIN_INDEX_READY;
+      } catch {
+      }
+      try {
+        if (typeof PHONE_LOGIN_ACTIVATION_APPROVED !== "undefined") env.PHONE_LOGIN_ACTIVATION_APPROVED = PHONE_LOGIN_ACTIVATION_APPROVED;
       } catch {
       }
       const url = new URL(request.url);
@@ -5419,6 +5492,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const body = await request.json();
             for (const key of ["requirePhoneAtSignup", "phonePasswordLoginEnabled"]) {
               if (key in body && typeof body[key] !== "boolean") return jsonResponse({ error: key + " must be boolean" }, 400);
+            }
+            if (body.phonePasswordLoginEnabled === true) {
+              const blocker = await phoneLoginActivationBlocker(env, accessToken);
+              if (blocker) return jsonResponse({ error: "Phone login activation prerequisites are not met", code: blocker }, 409);
             }
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
