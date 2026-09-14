@@ -74,7 +74,9 @@ global.fetch = async (url, init = {}) => {
       else {
         const values = Object.fromEntries(Object.entries(write.update.fields || {}).map(([k, v]) => [k, decode(v)]));
         const prior = docs.get(target)?.data || {};
-        put(target, write.updateMask ? { ...prior, ...values } : values);
+        const next = write.updateMask ? { ...prior, ...values } : values;
+        if (write.updateMask) for (const field of write.updateMask.fieldPaths || []) if (!Object.prototype.hasOwnProperty.call(values, field)) delete next[field];
+        put(target, next);
       }
     }
     return response({});
@@ -265,6 +267,25 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   assert.equal(payload.indexed, 0);
   assert.equal(docs.get("users/backfill-fenced").data.phone, "0534333258");
   assert.equal(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey("+966534333258", env)), false);
+
+  // Backfill collapses both legacy forms to one canonical `phone`, then a
+  // real phone change releases only the old index and retains no alias.
+  reset();
+  put("users/legacy-only", { phoneNumber: "0534333256" });
+  put("users/equal-dual", { phone: "0512345678", phoneNumber: "+966512345678" });
+  const aliasBackfill = await hooks.classifyPhoneIndexBackfill("token", backfillEnv);
+  result = await hooks.executePhoneIndexBackfill(req("/admin/api/phone-index/backfill", { confirm: true, dryRunFingerprint: aliasBackfill.fingerprint }), backfillEnv, "token");
+  assert.equal((await result.json()).indexed, 2);
+  assert.equal(docs.get("users/legacy-only").data.phone, phone);
+  assert.equal(Object.prototype.hasOwnProperty.call(docs.get("users/legacy-only").data, "phoneNumber"), false);
+  assert.equal(docs.get("users/equal-dual").data.phone, "+966512345678");
+  assert.equal(Object.prototype.hasOwnProperty.call(docs.get("users/equal-dual").data, "phoneNumber"), false);
+  result = await hooks.handleProfilePhoneUpdate(authorizedReq("/profiles/phone", { phone: "0534333257" }, "legacy-only"), env, "token");
+  assert.equal((await result.json()).success, true);
+  assert.equal(docs.get("users/legacy-only").data.phone, "+966534333257");
+  assert.equal(Object.prototype.hasOwnProperty.call(docs.get("users/legacy-only").data, "phoneNumber"), false);
+  assert.equal(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey(phone, env)), false);
+  assert.equal(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey("+966534333257", env)), true);
 
   // Real deletion cleanup removes an owned private index before completion.
   reset();

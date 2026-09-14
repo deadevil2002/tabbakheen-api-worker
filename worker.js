@@ -1140,6 +1140,13 @@
     }
     __name(profileCanonicalPhoneIdentity, "profileCanonicalPhoneIdentity");
     __name2(profileCanonicalPhoneIdentity, "profileCanonicalPhoneIdentity");
+    function canonicalPhoneProfileMask(fields) {
+      // Omitting phoneNumber while including it in the update mask deletes the
+      // legacy alias atomically, leaving one authoritative canonical field.
+      return { fieldPaths: [...Object.keys(fields), "phoneNumber"] };
+    }
+    __name(canonicalPhoneProfileMask, "canonicalPhoneProfileMask");
+    __name2(canonicalPhoneProfileMask, "canonicalPhoneProfileMask");
     async function existingPhoneProfileOwners(phone, accessToken, exceptUid = "") {
       // Until Rules reject legacy direct phone writes, index creation must also
       // defend against an already-stored, unindexed canonical equivalent.
@@ -1427,7 +1434,7 @@
       const now = new Date().toISOString();
       const profileFields = { phone, phoneVerified: false, phoneIndexStatus: "indexed", phoneIndexSchemaVersion: 1 };
       const committed = await phase4aCommit([
-        { update: phase4aDoc("users", claims.sub, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
+        { update: phase4aDoc("users", claims.sub, profileFields), updateMask: canonicalPhoneProfileMask(profileFields), currentDocument: { updateTime: profileSnapshot.updateTime } },
         { delete: "projects/tabbakheen-99883/databases/(default)/documents/phoneLoginIndex/" + oldKey, currentDocument: { updateTime: oldIndexSnapshot.updateTime } },
         { update: phase4aDoc("phoneLoginIndex", newKey, phoneIndexDocument(newKey, claims.sub, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } },
         phase4aDeletionFence(claims.sub, deletionSnapshot)
@@ -1506,7 +1513,7 @@
         if (existing) {
           if (existing.data.uid === candidate.uid && existing.data.status === "eligible") {
             const marked = await phase4aCommit([
-              { update: phase4aDoc("users", candidate.uid, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
+              { update: phase4aDoc("users", candidate.uid, profileFields), updateMask: canonicalPhoneProfileMask(profileFields), currentDocument: { updateTime: profileSnapshot.updateTime } },
               phase4aDeletionFence(candidate.uid, deletionSnapshot)
             ], accessToken);
             if (marked) alreadyIndexed++;
@@ -1517,7 +1524,7 @@
         }
         const now = new Date().toISOString();
         const committed = await phase4aCommit([
-          { update: phase4aDoc("users", candidate.uid, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
+          { update: phase4aDoc("users", candidate.uid, profileFields), updateMask: canonicalPhoneProfileMask(profileFields), currentDocument: { updateTime: profileSnapshot.updateTime } },
           { update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, candidate.uid, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } },
           phase4aDeletionFence(candidate.uid, deletionSnapshot)
         ], accessToken);

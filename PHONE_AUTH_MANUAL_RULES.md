@@ -16,6 +16,8 @@ eligible for indexing. A malformed or disagreeing pair is quarantined; any
 valid alias it contains remains unavailable to other accounts. Every Worker
 phone/index mutation includes a Firestore deletion-request verify fence, so a
 concurrent account-deletion manifest prevents that mutation.
+Backfill and Worker phone changes atomically remove legacy `phoneNumber` from
+eligible profiles, retaining only canonical `phone`.
 
 ```rules
 rules_version = '2';
