@@ -1126,13 +1126,26 @@
     }
     __name(isQuarantinedKnownDuplicate, "isQuarantinedKnownDuplicate");
     __name2(isQuarantinedKnownDuplicate, "isQuarantinedKnownDuplicate");
+    function profileCanonicalPhoneIdentity(user) {
+      const aliases = ["phone", "phoneNumber"].filter((field) => typeof user?.[field] === "string" && user[field].trim()).map((field) => ({ field, value: user[field] }));
+      if (!aliases.length) return { state: "none", canonicalPhones: [] };
+      const canonicalPhones = aliases.map((item) => normalizeSaudiMobilePhone(item.value));
+      const validPhones = [...new Set(canonicalPhones.filter(Boolean))];
+      // A malformed alias or aliases resolving to different numbers means the
+      // profile is quarantined: it cannot be indexed/backfilled, and any valid
+      // alias it contains still blocks another account from claiming that phone.
+      if (canonicalPhones.some((item) => !item)) return { state: "invalid", canonicalPhones: validPhones };
+      if (validPhones.length !== 1) return { state: "disagree", canonicalPhones: validPhones };
+      return { state: "ok", canonicalPhones: validPhones, phone: validPhones[0] };
+    }
+    __name(profileCanonicalPhoneIdentity, "profileCanonicalPhoneIdentity");
+    __name2(profileCanonicalPhoneIdentity, "profileCanonicalPhoneIdentity");
     async function existingPhoneProfileOwners(phone, accessToken, exceptUid = "") {
       // Until Rules reject legacy direct phone writes, index creation must also
       // defend against an already-stored, unindexed canonical equivalent.
       return (await listAllUsers(accessToken)).filter((user) => {
         if (user._id === exceptUid) return false;
-        const supplied = typeof user.phone === "string" ? user.phone : typeof user.phoneNumber === "string" ? user.phoneNumber : "";
-        return normalizeSaudiMobilePhone(supplied) === phone;
+        return profileCanonicalPhoneIdentity(user).canonicalPhones.includes(phone);
       }).map((user) => user._id);
     }
     __name(existingPhoneProfileOwners, "existingPhoneProfileOwners");
@@ -1277,6 +1290,8 @@
       if (canonicalPhone && (await existingPhoneProfileOwners(canonicalPhone, accessToken)).length) {
         return phase4aError("PHONE_UNAVAILABLE", "Phone cannot be used", 409);
       }
+      const deletionSnapshot = await getFirestoreSnapshot("account_deletion_requests", claims.sub, accessToken);
+      if (deletionSnapshot && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletionSnapshot.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Account deletion is in progress", 409);
       const now = new Date();
       const fields = { ...input, uid: claims.sub, email, createdAt: now.toISOString(), phoneVerified: false };
       if (input.role === "provider" || input.role === "driver") {
@@ -1300,6 +1315,7 @@
         writes[0] = { update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } };
         writes.push({ update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, claims.sub, now.toISOString())), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } });
       }
+      writes.push(phase4aDeletionFence(claims.sub, deletionSnapshot));
       const ok = await phase4aCommit(writes, accessToken);
       if (!ok) {
         const raced = await getFirestoreDoc("users", claims.sub, accessToken);
@@ -1395,11 +1411,14 @@
       const profileSnapshot = await getFirestoreSnapshot("users", claims.sub, accessToken);
       const profile = profileSnapshot?.data;
       if (!profile || profile.phoneIndexStatus !== "indexed" || profile.phoneIndexSchemaVersion !== 1) return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until this account is securely indexed", 409);
-      const oldPhone = normalizeSaudiMobilePhone(profile.phone);
-      if (!oldPhone) return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until this account is securely indexed", 409);
+      const oldIdentity = profileCanonicalPhoneIdentity(profile);
+      if (oldIdentity.state !== "ok") return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until this account is securely indexed", 409);
+      const oldPhone = oldIdentity.phone;
       const oldKey = await phoneLookupKey(oldPhone, env);
       const oldIndexSnapshot = await getFirestoreSnapshot("phoneLoginIndex", oldKey, accessToken);
       if (!oldIndexSnapshot || oldIndexSnapshot.data.uid !== claims.sub || oldIndexSnapshot.data.status !== "eligible") return phase4aError("PHONE_MIGRATION_REQUIRED", "Phone update is unavailable until this account is securely indexed", 409);
+      const deletionSnapshot = await getFirestoreSnapshot("account_deletion_requests", claims.sub, accessToken);
+      if (deletionSnapshot && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletionSnapshot.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Account deletion is in progress", 409);
       const newKey = await phoneLookupKey(phone, env);
       if (newKey === oldKey) return jsonResponse({ success: true, phone, idempotent: true });
       if ((await existingPhoneProfileOwners(phone, accessToken, claims.sub)).length) return phase4aError("PHONE_UNAVAILABLE", "Phone cannot be used", 409);
@@ -1410,7 +1429,8 @@
       const committed = await phase4aCommit([
         { update: phase4aDoc("users", claims.sub, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
         { delete: "projects/tabbakheen-99883/databases/(default)/documents/phoneLoginIndex/" + oldKey, currentDocument: { updateTime: oldIndexSnapshot.updateTime } },
-        { update: phase4aDoc("phoneLoginIndex", newKey, phoneIndexDocument(newKey, claims.sub, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } }
+        { update: phase4aDoc("phoneLoginIndex", newKey, phoneIndexDocument(newKey, claims.sub, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } },
+        phase4aDeletionFence(claims.sub, deletionSnapshot)
       ], accessToken);
       return committed ? jsonResponse({ success: true, phone }) : phase4aError("PHONE_UNAVAILABLE", "Phone cannot be used", 409);
     }
@@ -1422,16 +1442,16 @@
       const invalid = [];
       let noPhone = 0;
       for (const user of users) {
-        const supplied = typeof user.phone === "string" ? user.phone : typeof user.phoneNumber === "string" ? user.phoneNumber : "";
-        if (!supplied.trim()) {
+        const identity = profileCanonicalPhoneIdentity(user);
+        if (identity.state === "none") {
           noPhone++;
           continue;
         }
-        const phone = normalizeSaudiMobilePhone(supplied);
-        if (!phone) {
+        if (identity.state !== "ok") {
           invalid.push(user._id);
           continue;
         }
+        const phone = identity.phone;
         if (!groups.has(phone)) groups.set(phone, []);
         groups.get(phone).push(user._id);
       }
@@ -1472,7 +1492,12 @@
       for (const candidate of classification.candidates) {
         const key = await phoneLookupKey(candidate.phone, env);
         const profileSnapshot = await getFirestoreSnapshot("users", candidate.uid, accessToken);
-        if (!profileSnapshot || normalizeSaudiMobilePhone(profileSnapshot.data.phone) !== candidate.phone) {
+        if (!profileSnapshot || profileCanonicalPhoneIdentity(profileSnapshot.data).state !== "ok" || profileCanonicalPhoneIdentity(profileSnapshot.data).phone !== candidate.phone) {
+          conflicts++;
+          continue;
+        }
+        const deletionSnapshot = await getFirestoreSnapshot("account_deletion_requests", candidate.uid, accessToken);
+        if (deletionSnapshot && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletionSnapshot.data.status)) {
           conflicts++;
           continue;
         }
@@ -1480,7 +1505,10 @@
         const existing = await getFirestoreSnapshot("phoneLoginIndex", key, accessToken);
         if (existing) {
           if (existing.data.uid === candidate.uid && existing.data.status === "eligible") {
-            const marked = await phase4aCommit([{ update: phase4aDoc("users", candidate.uid, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } }], accessToken);
+            const marked = await phase4aCommit([
+              { update: phase4aDoc("users", candidate.uid, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
+              phase4aDeletionFence(candidate.uid, deletionSnapshot)
+            ], accessToken);
             if (marked) alreadyIndexed++;
             else conflicts++;
           }
@@ -1490,7 +1518,8 @@
         const now = new Date().toISOString();
         const committed = await phase4aCommit([
           { update: phase4aDoc("users", candidate.uid, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
-          { update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, candidate.uid, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } }
+          { update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, candidate.uid, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } },
+          phase4aDeletionFence(candidate.uid, deletionSnapshot)
         ], accessToken);
         if (committed) indexed++;
         else conflicts++;

@@ -43,7 +43,7 @@ const firestoreDoc = (path, record) => ({
   fields: Object.fromEntries(Object.entries(record.data).map(([k, v]) => [k, encode(v)])),
 });
 const response = (body, status = 200) => new Response(body == null ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-const writeTarget = (write) => (write.update?.name || write.delete).split("/documents/")[1];
+const writeTarget = (write) => (write.update?.name || write.delete || write.verify).split("/documents/")[1];
 function reset() { docs.clear(); revision = 0; }
 
 global.fetch = async (url, init = {}) => {
@@ -55,6 +55,11 @@ global.fetch = async (url, init = {}) => {
   if (!(url.startsWith(BASE) || url === BASE.slice(0, -1) + ":commit")) throw new Error("Unexpected mocked URL: " + url);
   if (url === BASE.slice(0, -1) + ":commit") {
     const writes = JSON.parse(init.body).writes;
+    if (global.__createDeletionBeforeNextCommit) {
+      const uid = global.__createDeletionBeforeNextCommit;
+      global.__createDeletionBeforeNextCommit = "";
+      put("account_deletion_requests/" + uid, { status: "in_progress" });
+    }
     for (const write of writes) {
       const target = writeTarget(write);
       const existing = docs.get(target);
@@ -64,6 +69,7 @@ global.fetch = async (url, init = {}) => {
     }
     for (const write of writes) {
       const target = writeTarget(write);
+      if (write.verify) continue;
       if (write.delete) docs.delete(target);
       else {
         const values = Object.fromEntries(Object.entries(write.update.fields || {}).map(([k, v]) => [k, decode(v)]));
@@ -153,6 +159,21 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   assert.equal((await registration.json()).success, true);
   assert.equal(docs.get("users/driver-uid").data.subscriptionStatus, "trialing");
 
+  // A valid legacy alias blocks claims even when the other alias is malformed;
+  // equal aliases classify once, while malformed/disagreeing profiles quarantine.
+  reset();
+  put("users/invalid-alias", { phone: "not-a-phone", phoneNumber: "0534333256" });
+  put("users/equal-alias", { phone: "0512345678", phoneNumber: "+966512345678" });
+  let aliasClassification = await hooks.classifyPhoneIndexBackfill("token", baseEnv());
+  assert.equal(aliasClassification.counts.INVALID_PHONE, 1);
+  assert.equal(aliasClassification.counts.UNIQUE_SAFE, 1);
+  put("app_settings/main", { requirePhoneAtSignup: true });
+  registration = await hooks.handlePhase4cProfileRegistration(authorizedReq("/profiles/register", { role: "customer", displayName: "Alias claim", phone: "0534333256" }, "alias-claim"), baseEnv(), "token");
+  assert.equal((await registration.json()).code, "PHONE_UNAVAILABLE");
+  put("users/disagree-alias", { phone: "0523456789", phoneNumber: "0534567890" });
+  aliasClassification = await hooks.classifyPhoneIndexBackfill("token", baseEnv());
+  assert.equal(aliasClassification.counts.INVALID_PHONE, 2);
+
   // Real top-level dispatch denies an admin mutation without an admin token.
   const unauthorizedAdmin = await hooks.handleRequest(req("/admin/api/settings", { phonePasswordLoginEnabled: true }));
   assert.equal(unauthorizedAdmin.status, 401);
@@ -221,11 +242,29 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   assert.equal(docs.get("users/backfill-unique").data.phoneIndexStatus, "indexed");
   assert(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey(phone, env)));
   assert(!docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey("+966555555555", env)));
+  // Simulate manifest creation between profile/index reads and commit. The
+  // real deletion verify fence must abort the complete phone mutation.
+  global.__createDeletionBeforeNextCommit = "backfill-unique";
+  result = await hooks.handleProfilePhoneUpdate(authorizedReq("/profiles/phone", { phone: "0534333257" }, "backfill-unique"), env, "token");
+  assert.equal((await result.json()).success, false);
+  assert.equal(docs.get("users/backfill-unique").data.phone, phone);
+  assert.equal(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey("+966534333257", env)), false);
+  docs.delete("account_deletion_requests/backfill-unique");
   result = await hooks.handleProfilePhoneUpdate(authorizedReq("/profiles/phone", { phone: "0534333257" }, "backfill-unique"), env, "token");
   assert.equal((await result.json()).success, true);
   assert.equal(docs.get("users/backfill-unique").data.phone, "+966534333257");
   assert.equal(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey(phone, env)), false);
   assert.equal(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey("+966534333257", env)), true);
+
+  reset();
+  put("users/backfill-fenced", { phone: "0534333258" });
+  const fencedClassification = await hooks.classifyPhoneIndexBackfill("token", backfillEnv);
+  global.__createDeletionBeforeNextCommit = "backfill-fenced";
+  result = await hooks.executePhoneIndexBackfill(req("/admin/api/phone-index/backfill", { confirm: true, dryRunFingerprint: fencedClassification.fingerprint }), backfillEnv, "token");
+  payload = await result.json();
+  assert.equal(payload.indexed, 0);
+  assert.equal(docs.get("users/backfill-fenced").data.phone, "0534333258");
+  assert.equal(docs.has("phoneLoginIndex/" + await hooks.phoneLookupKey("+966534333258", env)), false);
 
   // Real deletion cleanup removes an owned private index before completion.
   reset();

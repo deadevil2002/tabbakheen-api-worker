@@ -10,6 +10,13 @@ including a user modifying its own profile, from writing phone identity state.
 Keep the existing read policy and the existing non-phone business-field policy;
 add the following guards to its user write conditions.
 
+Treat `phone` and legacy `phoneNumber` as aliases for the same identity. Only
+one populated alias, or two aliases resolving to the same canonical number, is
+eligible for indexing. A malformed or disagreeing pair is quarantined; any
+valid alias it contains remains unavailable to other accounts. Every Worker
+phone/index mutation includes a Firestore deletion-request verify fence, so a
+concurrent account-deletion manifest prevents that mutation.
+
 ```rules
 rules_version = '2';
 service cloud.firestore {
@@ -86,10 +93,12 @@ available; phone changes from older clients will correctly be refused.
 
 ## Activation and migration sequence
 
-1. Deploy the Worker and app version with phone password login disabled.
-2. Add Worker secrets `PHONE_LOGIN_HMAC_SECRET` (at least 32 random bytes) and
+1. **Before deploying the Worker registration path**, securely configure
+   `PHONE_LOGIN_HMAC_SECRET` (at least 32 random bytes) and
    `FIREBASE_WEB_API_KEY`. The latter is used only by the Worker for Firebase
-   Identity Toolkit password verification.
+   Identity Toolkit password verification. Phone-bearing registration fails
+   closed if the HMAC secret is unavailable.
+2. Deploy the Worker and app version with phone password login disabled.
 3. Deploy and verify the Rules above. Run the read-only phone-index dry-run.
    The explicitly quarantined known duplicate pair must remain absent from the
    index; resolve every *unexpected* duplicate before backfill. Never modify
