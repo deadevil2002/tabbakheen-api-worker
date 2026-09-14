@@ -9,6 +9,7 @@ process.env.PHONE_AUTH_TEST_MODE = "1";
 require("./worker.js");
 const hooks = global.__PHONE_AUTH_TEST_HOOKS;
 assert(hooks, "Worker did not expose explicit Node test hooks");
+const migration = require("./scripts/migratePublicProfiles.js");
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const PRIVATE_KEY = privateKey.export({ format: "pem", type: "pkcs8" });
@@ -467,6 +468,51 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   assert.equal(docs.get("users/provider-public").data.publicLocation, null);
   assert.equal(docs.get("public_profiles/provider-public").data.publicLocation, undefined);
   assert.equal(docs.get("public_profiles/provider-public").data.publicLocationEnabled, undefined);
+
+  // A provider can always withdraw public-location consent, even when their
+  // commercial entitlement is expired or their account is suspended. The
+  // inverse operation remains entitlement-gated.
+  for (const [uid, accountState] of [
+    ["provider-expired", { subscriptionStatus: "expired" }],
+    ["provider-suspended", { subscriptionStatus: "trialing", trialEndsAt: "2099-01-01T00:00:00.000Z", accountStatus: "suspended" }],
+  ]) {
+    put(`users/${uid}`, {
+      role: "provider", displayName: uid, createdAt: "2026-01-01T00:00:00.000Z",
+      publicLocationEnabled: true, publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" },
+      ...accountState,
+    });
+    put(`public_profiles/${uid}`, hooks.publicProfileFromPrivateUser(uid, docs.get(`users/${uid}`).data));
+    privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
+      publicLocationEnabled: true, publicLocation: { lat: 24.9, lng: 46.8, city: "Riyadh" },
+    }, uid));
+    assert.equal(privateResponse.status, 403);
+    privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", { publicLocationEnabled: false }, uid));
+    assert.equal(privateResponse.status, 200);
+    assert.equal(docs.get(`users/${uid}`).data.publicLocation, null);
+    assert.equal(docs.get(`public_profiles/${uid}`).data.publicLocation, undefined);
+  }
+
+  // Sync is a safe projection refresh for both provider and driver private
+  // edits; it is not a public-location publication request.
+  put("users/driver-sync", {
+    role: "driver", displayName: "Updated driver", createdAt: "2026-01-01T00:00:00.000Z",
+    vehicleType: "car", isAvailable: false,
+  });
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", { action: "sync" }, "driver-sync"));
+  assert.equal(privateResponse.status, 200);
+  assert.deepEqual(await privateResponse.json(), { success: true, publicLocationEnabled: false });
+  assert.equal(docs.get("public_profiles/driver-sync").data.displayName, "Updated driver");
+  assert.equal(docs.get("public_profiles/driver-sync").data.vehicleType, "car");
+  assert.equal(docs.get("public_profiles/driver-sync").data.publicLocation, undefined);
+
+  // Dry-run classification and execution use the same canonical action.
+  const locationlessUser = { role: "provider", displayName: "Locationless" };
+  const locationlessProjection = migration.projectionForState("locationless", locationlessUser, null);
+  assert(locationlessProjection);
+  assert.equal(locationlessProjection.publicLocation, undefined);
+  assert.equal(migration.projectionAction(locationlessProjection, locationlessProjection), "unchanged");
+  assert.equal(migration.projectionAction({ ...locationlessProjection, stalePrivateLocation: true }, locationlessProjection), "replaced");
+  assert.notEqual(migration.projectionAction({ ...locationlessProjection, stalePrivateLocation: true }, locationlessProjection), "deleted");
 
   // Contact and payment are role-, purpose-, and state-scoped. Uppercase
   // persisted payment methods retain compatibility without broadening access.

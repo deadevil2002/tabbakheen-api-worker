@@ -46,6 +46,15 @@ function projectionContentEqual(prior, next) {
   const { updatedAt: ignoredNextTimestamp, ...nextContent } = next;
   return JSON.stringify(priorContent) === JSON.stringify(nextContent);
 }
+function projectionForState(uid, user, deletion) {
+  return !isDeletionActive(deletion) && user
+    ? publicProfileFromPrivateUser(uid, user)
+    : null;
+}
+function projectionAction(prior, profile) {
+  if (profile) return projectionContentEqual(prior, profile) ? "unchanged" : "replaced";
+  return prior ? "deleted" : "absent";
+}
 async function applyProjectionTransaction(db, uid) {
   return db.runTransaction(async (transaction) => {
     const userRef = db.collection("users").doc(uid);
@@ -55,20 +64,19 @@ async function applyProjectionTransaction(db, uid) {
       transaction.get(userRef), transaction.get(publicRef), transaction.get(deletionRef)
     ]);
     const user = userSnap.exists ? userSnap.data() : null;
-    const profile = !isDeletionActive(deletionSnap.exists ? deletionSnap.data() : null) && user
-      ? publicProfileFromPrivateUser(uid, user)
-      : null;
+    const profile = projectionForState(uid, user, deletionSnap.exists ? deletionSnap.data() : null);
     // Do not churn updatedAt or produce write charges on a rerun when the
     // complete canonical allowlist already matches. A mismatch includes stale
     // keys, so old unsafe fields are still removed by the replacement write.
-    if (profile) {
-      if (!projectionContentEqual(priorSnap.exists ? priorSnap.data() : null, profile)) {
-        transaction.set(publicRef, profile);
-        return "replaced";
-      }
+    const action = projectionAction(priorSnap.exists ? priorSnap.data() : null, profile);
+    if (action === "replaced") {
+      transaction.set(publicRef, profile);
+      return "replaced";
+    }
+    if (action === "unchanged") {
       return "unchanged";
     }
-    if (priorSnap.exists) {
+    if (action === "deleted") {
       transaction.delete(publicRef);
       return "deleted";
     }
@@ -96,13 +104,15 @@ async function main() {
   }
   const { getFirestore, FieldValue } = require("firebase-admin/firestore");
   const db = getFirestore();
-  const [providers, drivers, existingPublic] = await Promise.all([
+  const [providers, drivers, existingPublic, deletions] = await Promise.all([
     db.collection("users").where("role", "==", "provider").get(),
     db.collection("users").where("role", "==", "driver").get(),
-    db.collection("public_profiles").get()
+    db.collection("public_profiles").get(),
+    db.collection("account_deletion_requests").get()
   ]);
   const users = new Map([...providers.docs, ...drivers.docs].map((doc) => [doc.id, doc]));
   const publicDocs = new Map(existingPublic.docs.map((doc) => [doc.id, doc]));
+  const deletionDocs = new Map(deletions.docs.map((doc) => [doc.id, doc]));
   const ids = new Set([...users.keys(), ...publicDocs.keys()]);
   const report = {
     executed: execute,
@@ -122,7 +132,7 @@ async function main() {
   for (const uid of ids) {
     const user = users.get(uid)?.data();
     const prior = publicDocs.get(uid)?.data();
-    const profile = user && publicProfileFromPrivateUser(uid, user);
+    const profile = projectionForState(uid, user, deletionDocs.get(uid)?.data());
     const explicitPublicLocation = profile?.publicLocation;
     if (user?.location && !explicitPublicLocation) report.legacyLocationsOmitted++;
     if (user && !explicitPublicLocation) report.consentAbsent++;
@@ -130,14 +140,16 @@ async function main() {
       increment(report.missingRequiredFields, "displayName");
       report.otherBlockers++;
     }
-    if (profile) report.safeBasicProjections++;
-    if (explicitPublicLocation) report.explicitPublicLocations++;
-    else if (prior) {
+    const action = projectionAction(prior, profile);
+    if (profile) {
+      report.safeBasicProjections++;
+      if (explicitPublicLocation) report.explicitPublicLocations++;
+    } else if (action === "deleted") {
       report.publicDocsRemoved++;
       if (!user) report.orphanPublicDocs++;
       else report.deletedOrIneligiblePublicDocs++;
     }
-    if (profile && projectionContentEqual(prior, profile)) report.unchanged++;
+    if (action === "unchanged") report.unchanged++;
   }
   if (!execute) {
     console.log(JSON.stringify(report));
@@ -166,7 +178,7 @@ async function main() {
   console.log(JSON.stringify(report));
 }
 
-module.exports = { publicProfileFromPrivateUser, auditIdFor, isDeletionActive, projectionContentEqual, applyProjectionTransaction };
+module.exports = { publicProfileFromPrivateUser, auditIdFor, isDeletionActive, projectionContentEqual, projectionForState, projectionAction, applyProjectionTransaction };
 if (require.main === module) {
   main().catch((error) => {
     console.error(error.stack || error.message || error);

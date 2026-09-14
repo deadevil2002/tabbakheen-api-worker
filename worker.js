@@ -506,8 +506,12 @@
         getFirestoreSnapshot("public_profiles", uid, accessToken),
         getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
       ]);
-      if (!sourceSnapshot || sourceSnapshot.data.role !== "provider" || !isProviderAccountAllowed(sourceSnapshot.data)) return { ok: false, code: "forbidden" };
+      if (!sourceSnapshot || sourceSnapshot.data.role !== "provider") return { ok: false, code: "forbidden" };
       if (publicProfileDeletionActive(deletionSnapshot)) return { ok: false, code: "account_deletion_blocked" };
+      // Withdrawal is always available to the authenticated provider. An
+      // expired/suspended account must never be trapped with previously
+      // published coordinates. Enabling/replacing is the only gated action.
+      if (enabled && !isProviderAccountAllowed(sourceSnapshot.data)) return { ok: false, code: "forbidden" };
       const fields = enabled ? { publicLocationEnabled: true, publicLocation: location } : { publicLocationEnabled: false, publicLocation: null };
       const nextUser = { ...sourceSnapshot.data, ...fields };
       const profile = publicProfileFromPrivateUser(uid, nextUser);
@@ -6399,8 +6403,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           const user = await getFirestoreDoc("users", callerUid, accessToken);
-          if (!user || user.role !== "provider" || !isProviderAccountAllowed(user)) {
-            return jsonResponse({ success: false, code: "forbidden", error: "An eligible provider account is required" }, 403);
+          if (!user || !["provider", "driver"].includes(user.role)) {
+            return jsonResponse({ success: false, code: "forbidden", error: "A provider or driver account is required" }, 403);
           }
           const deletion = await getFirestoreSnapshot("account_deletion_requests", callerUid, accessToken);
           if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.data.status)) {
@@ -6409,10 +6413,16 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (body?.action === "sync") {
             const synced = await syncPublicProfile(callerUid, user, accessToken);
             if (!synced) return jsonResponse({ success: false, code: "state_conflict", error: "Public profile changed; refresh and try again" }, 409);
-            return jsonResponse({ success: true, publicLocationEnabled: user.publicLocationEnabled === true });
+            return jsonResponse({ success: true, publicLocationEnabled: user.role === "provider" && user.publicLocationEnabled === true });
+          }
+          if (user.role !== "provider") {
+            return jsonResponse({ success: false, code: "forbidden", error: "Only provider accounts can manage a public location" }, 403);
           }
           let location;
           if (body?.publicLocationEnabled === true) {
+            if (!isProviderAccountAllowed(user)) {
+              return jsonResponse({ success: false, code: "forbidden", error: "An eligible provider account is required to publish a location" }, 403);
+            }
             const loc = body.publicLocation;
             if (!loc || !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng) || loc.lat < 12 || loc.lat > 34 || loc.lng < 34 || loc.lng > 61 || loc.lat === 0 && loc.lng === 0 || typeof loc.city !== "string" || !loc.city.trim() || loc.city.trim().length > 120) {
               return jsonResponse({ success: false, code: "invalid_request", error: "A valid Saudi public location and city are required" }, 400);
