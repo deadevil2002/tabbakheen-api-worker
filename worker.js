@@ -515,12 +515,15 @@
       const fields = enabled ? { publicLocationEnabled: true, publicLocation: location } : { publicLocationEnabled: false, publicLocation: null };
       const nextUser = { ...sourceSnapshot.data, ...fields };
       const profile = publicProfileFromPrivateUser(uid, nextUser);
-      if (!profile) return { ok: false, code: "invalid_profile" };
+      // An invalid/incomplete legacy profile may not enable publication, but it
+      // must still be able to withdraw consent and remove any stale projection.
+      if (enabled && !profile) return { ok: false, code: "invalid_profile" };
       const writes = [
         { update: phase4aDoc("users", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: sourceSnapshot.updateTime } },
-        { update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } },
         phase4aDeletionFence(uid, deletionSnapshot)
       ];
+      if (profile) writes.splice(1, 0, { update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } });
+      else if (publicSnapshot) writes.splice(1, 0, { delete: "projects/tabbakheen-99883/databases/(default)/documents/public_profiles/" + uid, currentDocument: { updateTime: publicSnapshot.updateTime } });
       return { ok: await phase4aCommit(writes, accessToken) };
     }
     async function setDriverAvailabilityAndSync(uid, isAvailable, accessToken) {

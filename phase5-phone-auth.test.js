@@ -491,6 +491,18 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
     assert.equal(docs.get(`users/${uid}`).data.publicLocation, null);
     assert.equal(docs.get(`public_profiles/${uid}`).data.publicLocation, undefined);
   }
+  put("users/provider-with-incomplete-legacy-profile", {
+    role: "provider", subscriptionStatus: "expired", publicLocationEnabled: true,
+    publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" },
+  });
+  put("public_profiles/provider-with-incomplete-legacy-profile", {
+    uid: "provider-with-incomplete-legacy-profile", role: "provider",
+    displayName: "Stale profile", publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" },
+  });
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", { publicLocationEnabled: false }, "provider-with-incomplete-legacy-profile"));
+  assert.equal(privateResponse.status, 200);
+  assert.equal(docs.get("users/provider-with-incomplete-legacy-profile").data.publicLocation, null);
+  assert.equal(docs.has("public_profiles/provider-with-incomplete-legacy-profile"), false);
 
   // Sync is a safe projection refresh for both provider and driver private
   // edits; it is not a public-location publication request.
