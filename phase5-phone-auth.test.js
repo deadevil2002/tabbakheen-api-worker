@@ -227,8 +227,8 @@ function assertThreeCalendarMonthTrial(profile) {
   assert.deepEqual([r1, r2].sort(), [false, true]);
   assert.equal(docs.get("phoneLoginIndex/race").data.uid, r1 ? "a" : "b");
 
-  // Real login handler: successful same-UID token, wrong/unknown/conflicted
-  // generic failures, UID mismatch hard failure, runtime approvals on every request.
+  // Phone/password login stays disabled even if a legacy document has an
+  // enabled value and all former rollout prerequisites are present.
   reset();
   const env = baseEnv();
   const phone = "+966534333256";
@@ -238,23 +238,7 @@ function assertThreeCalendarMonthTrial(profile) {
   global.__passwordUid = "uid-1";
   let result = await hooks.handlePhonePasswordLogin(req("/auth/phone-password", { phone, password: "correct" }), env, "token");
   let payload = await result.json();
-  assert.equal(payload.success, true);
-  assert.equal(typeof payload.customToken, "string");
-  assert.equal(Object.prototype.hasOwnProperty.call(payload, "email"), false);
-  global.__passwordUid = "wrong-uid";
-  result = await hooks.handlePhonePasswordLogin(req("/auth/phone-password", { phone, password: "wrong" }), env, "token");
-  assert.deepEqual(await result.json(), { success: false, code: "INVALID_CREDENTIALS", error: "Invalid credentials" });
-  result = await hooks.handlePhonePasswordLogin(req("/auth/phone-password", { phone: "+966512345678", password: "wrong" }), env, "token");
-  assert.equal((await result.json()).code, "INVALID_CREDENTIALS");
-  put("phoneLoginIndex/" + await hooks.phoneLookupKey("+966500000000", env), { uid: "F23GUoy3VJVxWOZs5sZHZxifVVI3", status: "eligible" });
-  result = await hooks.handlePhonePasswordLogin(req("/auth/phone-password", { phone: "+966500000000", password: "wrong" }), env, "token");
-  assert.equal((await result.json()).code, "INVALID_CREDENTIALS");
-  for (let i = 0; i < 4; i++) await hooks.handlePhonePasswordLogin(req("/auth/phone-password", { phone, password: "wrong" }), env, "token");
-  result = await hooks.handlePhonePasswordLogin(req("/auth/phone-password", { phone, password: "wrong" }), env, "token");
-  assert.equal(result.status, 429);
-  const disabledRuntime = { ...env, PHONE_LOGIN_ACTIVATION_APPROVED: "false" };
-  result = await hooks.handlePhonePasswordLogin(req("/auth/phone-password", { phone, password: "correct" }), disabledRuntime, "token");
-  assert.equal((await result.json()).code, "INVALID_CREDENTIALS");
+  assert.deepEqual(payload, { success: false, code: "INVALID_CREDENTIALS", error: "Invalid credentials" });
 
   // Real activation check allows only the exact quarantined absent-index pair,
   // but rejects an unexpected duplicate.
