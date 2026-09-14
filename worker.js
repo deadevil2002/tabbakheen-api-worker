@@ -216,7 +216,9 @@
     function phoneAuthSettings(settings) {
       return {
         requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
-        phonePasswordLoginEnabled: !!(settings && settings.phonePasswordLoginEnabled === true)
+        // Phone/password sign-in is intentionally unavailable until its
+        // separately approved rollout. It must not be enabled from Admin.
+        phonePasswordLoginEnabled: false
       };
     }
     __name(phoneAuthSettings, "phoneAuthSettings");
@@ -4588,10 +4590,11 @@ async function renderSettings(c){
   appSettings=data.settings||{};
   var bannerUrl=appSettings.bannerImageUrl||"";
   var bannerEnabled=appSettings.bannerEnabled!==false;
+  var requirePhoneAtSignup=appSettings.requirePhoneAtSignup!==false;
   c.innerHTML='<h1 class="page-title">'+t("appSettings")+'</h1>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"أمان الحساب":"Account security")+'</h3>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup"'+(appSettings.requirePhoneAtSignup!==false?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+'</label></div>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-phonePasswordLoginEnabled"'+(appSettings.phonePasswordLoginEnabled===true?" checked":"")+'> '+(lang==="ar"?"تفعيل تسجيل الدخول برقم الجوال":"Enable phone number login")+'</label><p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"لا تفعّله قبل تطبيق قواعد Firestore والتحقق من الفهرسة الآمنة.":"Do not enable before Firestore Rules hardening and safe index verification.")+'</p></div>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup" onchange="updatePhoneSignupRequirementHint()"'+(requirePhoneAtSignup?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+' <span id="s-requirePhoneAtSignup-status">'+(requirePhoneAtSignup?"ON":"OFF")+'</span></label><p id="s-requirePhoneAtSignup-hint" style="font-size:12px;color:var(--text2);margin-top:8px">'+(requirePhoneAtSignup?(lang==="ar"?"عند التفعيل، يجب على المستخدم الجديد إدخال رقم الجوال عند إنشاء الحساب.":"When enabled, new users must enter a phone number when creating an account."):(lang==="ar"?"يمكن للمستخدم الجديد إنشاء حساب بدون رقم جوال.":"When disabled, new users may create an account without a phone number."))+'</p></div>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" disabled> '+(lang==="ar"?"تسجيل الدخول برقم الجوال":"Phone number login")+' <span>OFF</span></label><p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"غير مفعل حالياً":"Currently disabled")+'</p></div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("language")+'</h3>'+
     '<div class="lang-switch"><button class="'+(lang==="ar"?"active":"")+'" onclick="setLang(\\'ar\\')">'+t("arabic")+'</button><button class="'+(lang==="en"?"active":"")+'" onclick="setLang(\\'en\\')">'+t("english")+'</button></div>'+
@@ -4664,6 +4667,15 @@ async function renderSettings(c){
   setTimeout(updatePricingPreview,50);
 }
 
+function updatePhoneSignupRequirementHint(){
+  var input=document.getElementById("s-requirePhoneAtSignup");
+  var enabled=!input||input.checked;
+  var status=document.getElementById("s-requirePhoneAtSignup-status");
+  var hint=document.getElementById("s-requirePhoneAtSignup-hint");
+  if(status)status.textContent=enabled?"ON":"OFF";
+  if(hint)hint.textContent=enabled?(lang==="ar"?"عند التفعيل، يجب على المستخدم الجديد إدخال رقم الجوال عند إنشاء الحساب.":"When enabled, new users must enter a phone number when creating an account."):(lang==="ar"?"يمكن للمستخدم الجديد إنشاء حساب بدون رقم جوال.":"When disabled, new users may create an account without a phone number.");
+}
+
 async function uploadBanner(){
   var fileInput=document.getElementById("banner-file");
   if(!fileInput.files.length){toast(t("selectFile"),"error");return;}
@@ -4723,7 +4735,6 @@ async function saveSettings(){
     defaultLanguage:lang,
     subscriptionWarningDays:Math.max(0,integerValue("s-warningDays",7)),
     requirePhoneAtSignup:document.getElementById("s-requirePhoneAtSignup")?document.getElementById("s-requirePhoneAtSignup").checked:true,
-    phonePasswordLoginEnabled:document.getElementById("s-phonePasswordLoginEnabled")?document.getElementById("s-phonePasswordLoginEnabled").checked:false,
     notifyOnNewUser:document.getElementById("s-notifyNewUser")?document.getElementById("s-notifyNewUser").checked:false,
     notifyOnNewProvider:document.getElementById("s-notifyNewProvider")?document.getElementById("s-notifyNewProvider").checked:false,
     notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
@@ -5654,10 +5665,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/app-settings/auth" && request.method === "GET") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          return jsonResponse({ success: true, settings: phoneAuthSettings(await getFirestoreDoc("app_settings", "main", accessToken)) });
+          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+          return jsonResponse({ success: true, settings: { requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false } });
         } catch {
-          // Do not turn a settings outage into an unsafe phone-login fallback.
-          return jsonResponse({ success: true, settings: { requirePhoneAtSignup: true, phonePasswordLoginEnabled: false } });
+          // Settings outages preserve the safe signup requirement default.
+          return jsonResponse({ success: true, settings: { requirePhoneAtSignup: true } });
         }
       }
       if (path === "/auth/phone-password" && request.method === "POST") {
@@ -6237,17 +6249,22 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           if (path === "/admin/api/settings" && request.method === "GET") {
             const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-            return jsonResponse({ success: true, settings: settings || {} });
+            return jsonResponse({
+              success: true,
+              settings: {
+                ...(settings || {}),
+                // Missing values default to required; phone/password remains
+                // read-only and disabled regardless of legacy document state.
+                requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
+                phonePasswordLoginEnabled: false
+              }
+            });
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
-            for (const key of ["requirePhoneAtSignup", "phonePasswordLoginEnabled"]) {
-              if (key in body && typeof body[key] !== "boolean") return jsonResponse({ error: key + " must be boolean" }, 400);
-            }
-            if (body.phonePasswordLoginEnabled === true) {
-              const blocker = await phoneLoginActivationBlocker(env, accessToken);
-              if (blocker) return jsonResponse({ error: "Phone login activation prerequisites are not met", code: blocker }, 409);
-            }
+            if (!body || typeof body !== "object" || Array.isArray(body)) return jsonResponse({ error: "Settings must be an object" }, 400);
+            if ("requirePhoneAtSignup" in body && typeof body.requirePhoneAtSignup !== "boolean") return jsonResponse({ error: "requirePhoneAtSignup must be boolean" }, 400);
+            if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -6278,8 +6295,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "notifyOnFreelanceRequest",
               "providerSubscription",
               "driverSubscription",
-              "requirePhoneAtSignup",
-              "phonePasswordLoginEnabled"
+              "requirePhoneAtSignup"
             ];
             const fields = {};
             for (const key of allowedSettings) {
@@ -6289,17 +6305,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               return jsonResponse({ error: "No valid settings fields" }, 400);
             }
             const before = await getFirestoreDoc("app_settings", "main", accessToken) || {};
-            const changes = {};
-            for (const key of ["requirePhoneAtSignup", "phonePasswordLoginEnabled"]) {
-              const oldValue = key === "requirePhoneAtSignup" ? before[key] !== false : before[key] === true;
-              if (key in fields && oldValue !== fields[key]) changes[key] = { oldValue, newValue: fields[key] };
-            }
-            if (Object.keys(changes).length) {
+            const oldValue = before.requirePhoneAtSignup !== false;
+            if ("requirePhoneAtSignup" in fields && oldValue !== fields.requirePhoneAtSignup) {
               const changedAt = new Date().toISOString();
               const auditId = "settings-" + crypto.randomUUID();
               const committed = await phase4aCommit([
                 { update: phase4aDoc("app_settings", "main", fields), updateMask: { fieldPaths: Object.keys(fields) } },
-                { update: phase4aDoc("admin_audit_logs", auditId, { action: "app_settings_changed", changedAt, changedBy: "admin_token", changes }), updateMask: { fieldPaths: ["action", "changedAt", "changedBy", "changes"] }, currentDocument: { exists: false } }
+                { update: phase4aDoc("admin_audit_logs", auditId, { action: "app_settings_changed", setting: "requirePhoneAtSignup", oldValue, newValue: fields.requirePhoneAtSignup, changedAt, changedBy: "admin_token" }), updateMask: { fieldPaths: ["action", "setting", "oldValue", "newValue", "changedAt", "changedBy"] }, currentDocument: { exists: false } }
               ], accessToken);
               if (!committed) return jsonResponse({ error: "Settings changed concurrently; retry" }, 409);
             } else {
