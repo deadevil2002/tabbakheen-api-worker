@@ -9,7 +9,7 @@ run were performed. This document is a decision record, not a release approval.
 
 | Decision | Result | Why |
 | --- | --- | --- |
-| Authoritative Worker deployable source | **VERIFIED** | `0f3dfe8ff3d8b721cc7850a50b784132b16f3bc8` is the final Worker source-fix commit (`fix: preserve safe sync and consent withdrawal`); this readiness record is a later documentation-only commit. |
+| Authoritative Worker deployable source | **VERIFIED** | `632f9bb61112df4819cd83b2996f7578a895b939` is the final Worker source-fix commit (`fix: allow consent withdrawal for incomplete profiles`); this readiness record is a later documentation-only commit. |
 | Authoritative mobile source head | **VERIFIED** | GitHub `main` is `eb6d671313e6545941e57e693daa9e50a7357d6c` (`fix: use public locations in discovery views`). |
 | Current deployed Worker equals Worker candidate | **NO — VERIFIED** | Cloudflare's active `tabbakheen-api` content-v2 SHA-256 is exactly `d1e0161`'s `worker.js`, not `0f3dfe8`'s. The active script is the legacy pre-privacy Worker. |
 | Current store client build/source provenance | **PARTIAL** | App Store Connect verifies iOS `1.0.2` is `READY_FOR_SALE` and iOS `1.0.3` is `PREPARE_FOR_SUBMISSION`; neither is source-linked by the available EAS records. Google Play production-release evidence is still **NOTVERIFIED**. |
@@ -49,7 +49,7 @@ run were performed. This document is a decision record, not a release approval.
 
 ## Source findings at the verified candidate heads
 
-### Candidate Worker (`0f3dfe8`)
+### Candidate Worker (`632f9bb`)
 
 Positive source findings:
 
@@ -194,7 +194,7 @@ Location/driver assessment:
   required deploy safeguard.
 * Static source comparison from deployed `d1e0161` to the predecessor privacy
   candidate found all deployed literal routes retained and new privacy routes.
-  The reviewed final Worker candidate is `0f3dfe8`; its source corrections are
+  The reviewed final Worker candidate is `632f9bb`; its source corrections are
   additive safety tightening, not a deployment.
 
 **Firebase — VERIFIED current privacy boundary**
@@ -266,7 +266,7 @@ new Worker alone fixes a Firestore Rules exposure.
    emulator and review the Arabic/English consent wording. Keep every existing
    provider OFF unless that provider makes this new explicit choice.
 3. **Preflight Worker deployment readiness without changing it.** Confirm
-   exact candidate `0f3dfe8` is the reviewed artifact; enumerate required
+   exact candidate `632f9bb` is the reviewed artifact; enumerate required
    existing secret binding *names* and that `keep_vars = true` preserves them;
    verify Firebase service-account access, Firebase token verification,
    Worker CORS/client base URL, scheduled handler, and alert/rollback owner.
@@ -437,7 +437,7 @@ result blocks cutover.
    compatibility is **NOTVERIFIED**.
 3. The Cloudflare deployed script/version, binding names, and Firebase active
    Rules are now inventoried: active Worker source is `d1e0161`, not
-   `0f3dfe8`, and active Rules are broad. Obtain only the still-missing
+   `632f9bb`, and active Rules are broad. Obtain only the still-missing
    aggregate Firestore data inventory under an approved read-only procedure.
 4. Run, review, and approve the public-profile dry run. Do not turn the
    expected candidate count into an observed result, and do not publish legacy
