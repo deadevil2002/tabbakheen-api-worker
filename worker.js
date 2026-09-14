@@ -1446,6 +1446,14 @@
         writes.push({ update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, claims.sub, now.toISOString())), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } });
       }
       writes.push(phase4aDeletionFence(claims.sub, deletionSnapshot));
+      const publicProfile = publicProfileFromPrivateUser(claims.sub, fields);
+      if (publicProfile) {
+        writes.push({
+          update: phase4aDoc("public_profiles", claims.sub, publicProfile),
+          updateMask: { fieldPaths: Object.keys(publicProfile) },
+          currentDocument: { exists: false }
+        });
+      }
       const ok = await phase4aCommit(writes, accessToken);
       if (!ok) {
         const raced = await getFirestoreDoc("users", claims.sub, accessToken);
