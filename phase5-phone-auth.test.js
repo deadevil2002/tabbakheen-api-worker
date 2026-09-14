@@ -301,6 +301,44 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
   assert.equal(final.status, "completed");
   assert.equal(docs.has("phoneLoginIndex/" + deletionKey), false);
 
+  // Privacy separation tests invoke the actual Worker handlers (not a
+  // parallel authorization model). A customer may only obtain the assigned
+  // order participant's minimum contact/payment data.
+  reset();
+  put("orders/order-private", {
+    customerUid: "customer-1", providerUid: "provider-1", driverUid: "driver-1",
+    status: "ready_for_pickup", deliveryStatus: "driver_assigned", paymentMethod: "bank_transfer"
+  });
+  put("users/provider-1", {
+    role: "provider", phone: "+966500000001", email: "provider@example.test",
+    paymentMethods: { bankTransfer: { enabled: true, iban: "SA0000000000000000000000", accountName: "Provider", bankName: "Test Bank" } }
+  });
+  put("users/driver-1", { role: "driver", phone: "+966500000002", email: "driver@example.test" });
+  let privateResponse = await hooks.handleOrderContact({ orderId: "order-private", target: "driver", purpose: "contact" }, "customer-1", "token");
+  payload = await privateResponse.json();
+  assert.deepEqual(payload, { success: true, phone: "+966500000002" });
+  privateResponse = await hooks.handleOrderContact({ orderId: "order-private", target: "driver", purpose: "contact" }, "unrelated-user", "token");
+  assert.equal(privateResponse.status, 403);
+  privateResponse = await hooks.handleOrderPaymentInstructions({ orderId: "order-private", purpose: "payment_instructions" }, "customer-1", "token");
+  payload = await privateResponse.json();
+  assert.deepEqual(payload, {
+    success: true, method: "bank_transfer", bankName: "Test Bank", accountName: "Provider", iban: "SA0000000000000000000000"
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(payload, "email"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload, "phone"), false);
+
+  // Projection construction is allowlist-only and does not infer an
+  // ambiguous legacy location.
+  const profile = hooks.publicProfileFromPrivateUser("provider-1", {
+    role: "provider", displayName: "Provider", photoUrl: "avatar", phone: "+966500000001",
+    email: "provider@example.test", expoPushToken: "ExponentPushToken[private]", paymentMethods: { bankTransfer: {} },
+    location: { lat: 24.7, lng: 46.6 }, ratingAverage: 4.5, ratingCount: 2
+  });
+  assert.deepEqual(profile, {
+    uid: "provider-1", role: "provider", displayName: "Provider", photoUrl: "avatar",
+    ratingAverage: 4.5, ratingCount: 2, verificationStatus: "unverified", updatedAt: profile.updatedAt
+  });
+
   console.log("phase5 phone auth real-handler tests: PASS");
 })().catch((error) => {
   console.error(error.stack || error);

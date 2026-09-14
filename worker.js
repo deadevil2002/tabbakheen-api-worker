@@ -421,6 +421,129 @@
     }
     __name(compareAndSetFirestoreDocument, "compareAndSetFirestoreDocument");
     __name2(compareAndSetFirestoreDocument, "compareAndSetFirestoreDocument");
+    // This projection is deliberately constructed, never copied. Keep it in
+    // lockstep with the public mobile discovery DTO; private account documents
+    // are not a public API.
+    function publicProfileFromPrivateUser(uid, user) {
+      if (!user || !["provider", "driver"].includes(user.role)) return null;
+      const profile = {
+        uid,
+        role: user.role,
+        displayName: typeof user.displayName === "string" ? user.displayName : "",
+        photoUrl: typeof user.photoUrl === "string" ? user.photoUrl : "",
+        ratingAverage: Number.isFinite(user.ratingAverage) ? user.ratingAverage : 0,
+        ratingCount: Number.isFinite(user.ratingCount) ? user.ratingCount : 0,
+        verificationStatus: user.verificationStatus === "verified" ? "verified" : "unverified",
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      if (user.role === "provider") {
+        if (typeof user.city === "string") profile.city = user.city;
+        if (typeof user.socialLink === "string") profile.socialLink = user.socialLink;
+        // A legacy `location` has ambiguous/private semantics and MUST NOT be
+        // projected. Only the explicitly opted-in discoveryLocation is used.
+        const loc = user.discoveryLocation;
+        if (loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lng) && loc.lat >= -90 && loc.lat <= 90 && loc.lng >= -180 && loc.lng <= 180) {
+          profile.discoveryLocation = { lat: loc.lat, lng: loc.lng };
+        }
+      } else {
+        profile.isAvailable = user.isAvailable === true;
+        if (typeof user.vehicleType === "string") profile.vehicleType = user.vehicleType;
+      }
+      return profile;
+    }
+    __name(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
+    __name2(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
+    async function syncPublicProfile(uid, user, accessToken) {
+      const profile = publicProfileFromPrivateUser(uid, user);
+      if (!profile) return false;
+      await updateFirestoreDocument("public_profiles", uid, profile, accessToken);
+      return true;
+    }
+    __name(syncPublicProfile, "syncPublicProfile");
+    __name2(syncPublicProfile, "syncPublicProfile");
+    async function classifyPublicProfileProjection(accessToken) {
+      const users = await listAllUsers(accessToken);
+      const candidates = users.filter((user) => user && ["provider", "driver"].includes(user.role));
+      const missingRequiredFields = {};
+      let safeProjections = 0;
+      let ambiguousLocation = 0;
+      let otherBlockers = 0;
+      for (const user of candidates) {
+        const profile = publicProfileFromPrivateUser(user._id, user);
+        if (!profile) {
+          otherBlockers++;
+          continue;
+        }
+        const missing = ["displayName", "photoUrl"].filter((field) => !profile[field]);
+        for (const field of missing) missingRequiredFields[field] = (missingRequiredFields[field] || 0) + 1;
+        // Existing private `location` values are deliberately not copied. This
+        // count makes the required owner choice visible without returning PII.
+        if (user.location && !profile.discoveryLocation) ambiguousLocation++;
+        if (missing.length) otherBlockers++;
+        else safeProjections++;
+      }
+      return {
+        totalCandidates: candidates.length,
+        safeProjections,
+        ambiguousLocation,
+        missingRequiredFields,
+        otherBlockers,
+        executed: false
+      };
+    }
+    __name(classifyPublicProfileProjection, "classifyPublicProfileProjection");
+    __name2(classifyPublicProfileProjection, "classifyPublicProfileProjection");
+    function canRequestOrderContact(order, uid, target, purpose) {
+      if (!order || purpose !== "contact" || !["provider", "driver"].includes(target)) return false;
+      if (["cancelled", "rejected"].includes(order.status)) return false;
+      if (target === "provider") return uid === order.customerUid && !!order.providerUid;
+      // Driver contact is not disclosed until an actual driver is assigned,
+      // and only to the customer or provider serving this exact order.
+      return !!order.driverUid && (uid === order.customerUid || uid === order.providerUid);
+    }
+    __name(canRequestOrderContact, "canRequestOrderContact");
+    __name2(canRequestOrderContact, "canRequestOrderContact");
+    async function handleOrderContact(body, callerUid, accessToken) {
+      const orderId = typeof body?.orderId === "string" ? body.orderId.trim() : "";
+      const target = body?.target;
+      if (!orderId || !["provider", "driver"].includes(target) || body?.purpose !== "contact") {
+        return jsonResponse({ success: false, code: "invalid_request", error: "Invalid order contact request" }, 400);
+      }
+      const order = await getFirestoreDoc("orders", orderId, accessToken);
+      if (!order) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
+      if (!canRequestOrderContact(order, callerUid, target, body.purpose)) {
+        return jsonResponse({ success: false, code: "forbidden", error: "Order contact is not available" }, 403);
+      }
+      const targetUid = target === "provider" ? order.providerUid : order.driverUid;
+      const person = await getFirestoreDoc("users", targetUid, accessToken);
+      // Do not signal whether unrelated accounts exist and never return a
+      // profile; absence of a phone is a valid minimum-data result.
+      return jsonResponse({ success: true, phone: typeof person?.phone === "string" ? person.phone : "" });
+    }
+    __name(handleOrderContact, "handleOrderContact");
+    __name2(handleOrderContact, "handleOrderContact");
+    async function handleOrderPaymentInstructions(body, callerUid, accessToken) {
+      const orderId = typeof body?.orderId === "string" ? body.orderId.trim() : "";
+      if (!orderId || body?.purpose !== "payment_instructions") {
+        return jsonResponse({ success: false, code: "invalid_request", error: "Invalid payment request" }, 400);
+      }
+      const order = await getFirestoreDoc("orders", orderId, accessToken);
+      if (!order) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
+      if (callerUid !== order.customerUid || ["cancelled", "rejected"].includes(order.status) || !["stc_pay", "bank_transfer"].includes(order.paymentMethod)) {
+        return jsonResponse({ success: false, code: "forbidden", error: "Payment instructions are not available" }, 403);
+      }
+      const provider = await getFirestoreDoc("users", order.providerUid, accessToken);
+      const methods = provider?.paymentMethods || {};
+      if (order.paymentMethod === "stc_pay" && methods.stcPay?.enabled === true && typeof methods.stcPay.phone === "string") {
+        return jsonResponse({ success: true, method: "stc_pay", stcPayPhone: methods.stcPay.phone });
+      }
+      if (order.paymentMethod === "bank_transfer" && methods.bankTransfer?.enabled === true && typeof methods.bankTransfer.iban === "string") {
+        return jsonResponse({ success: true, method: "bank_transfer", bankName: typeof methods.bankTransfer.bankName === "string" ? methods.bankTransfer.bankName : "", accountName: typeof methods.bankTransfer.accountName === "string" ? methods.bankTransfer.accountName : "", iban: methods.bankTransfer.iban });
+      }
+      return jsonResponse({ success: false, code: "not_available", error: "Selected payment instructions are unavailable" }, 409);
+    }
+    __name(handleOrderPaymentInstructions, "handleOrderPaymentInstructions");
+    __name2(handleOrderPaymentInstructions, "handleOrderPaymentInstructions");
     function isDriverDeliveryMethod(method) {
       return method === "driver" || method === "driver_delivery";
     }
@@ -1829,7 +1952,7 @@
       let totalCandidateTokens = 0;
       let invalidTokensCount = 0;
       for (const user of users) {
-        const token = user && typeof user.expoPushToken === "string" ? user.expoPushToken.trim() : "";
+        const token = user?._id ? await getUserPushToken(user._id, accessToken) || "" : "";
         if (!token) continue;
         totalCandidateTokens++;
         if (!isExpoPushToken(token)) {
@@ -1892,7 +2015,7 @@
               const owners = tokenOwners.get(tokenChunk[i]) || [];
               for (const uid of owners) {
                 try {
-                  await updateFirestoreDocument("users", uid, { expoPushToken: null, pushNotificationsEnabled: false }, accessToken);
+                  await updateFirestoreDocument("private_devices", uid, { expoPushToken: null, pushNotificationsEnabled: false }, accessToken);
                 } catch (e) {
                   incrementReason(failureReasons, "StaleTokenCleanupFailed", e && e.message || "Could not clear stale token");
                 }
@@ -1921,24 +2044,43 @@
     }
     __name(sendAdminBroadcast, "sendAdminBroadcast");
     __name2(sendAdminBroadcast, "sendAdminBroadcast");
+    async function getPrivateDeviceToken(uid, accessToken) {
+      const device = await getFirestoreDoc("private_devices", uid, accessToken);
+      if (!device || device.pushNotificationsEnabled !== true) return null;
+      const token = typeof device.expoPushToken === "string" ? device.expoPushToken.trim() : "";
+      return token && isExpoPushToken(token) ? token : null;
+    }
+    __name(getPrivateDeviceToken, "getPrivateDeviceToken");
+    __name2(getPrivateDeviceToken, "getPrivateDeviceToken");
     async function getUserPushToken(uid, accessToken) {
+      const privateToken = await getPrivateDeviceToken(uid, accessToken);
+      if (privateToken) return privateToken;
+      // Legacy compatibility only: released clients wrote tokens to users.
+      // New clients register only through /devices/register; this fallback can
+      // be removed after the release transition and token migration.
       const user = await getFirestoreDoc("users", uid, accessToken);
-      if (!user) return null;
-      if (user.pushNotificationsEnabled !== true) return null;
+      if (!user || user.pushNotificationsEnabled !== true) return null;
       const token = typeof user.expoPushToken === "string" ? user.expoPushToken.trim() : "";
-      if (!token || !isExpoPushToken(token)) return null;
-      return token;
+      return token && isExpoPushToken(token) ? token : null;
     }
     __name(getUserPushToken, "getUserPushToken");
     __name2(getUserPushToken, "getUserPushToken");
     async function getDriverPushTokens(accessToken) {
       const drivers = await queryFirestore("users", "role", "EQUAL", "driver", accessToken);
-      return drivers.filter((d) => d && d.pushNotificationsEnabled === true && d.expoPushToken && isExpoPushToken(d.expoPushToken)).map((d) => d.expoPushToken);
+      const tokens = await Promise.all(drivers.map((driver) => driver?._id ? getUserPushToken(driver._id, accessToken) : null));
+      return tokens.filter(Boolean);
     }
     __name(getDriverPushTokens, "getDriverPushTokens");
     __name2(getDriverPushTokens, "getDriverPushTokens");
     async function clearDeviceNotRegisteredToken(token, accessToken) {
       if (!accessToken || !isExpoPushToken(token)) return;
+      const privateOwners = await queryFirestore("private_devices", "expoPushToken", "EQUAL", token, accessToken);
+      for (const owner of privateOwners) {
+        const snapshot = await getFirestoreSnapshot("private_devices", owner._id, accessToken);
+        if (snapshot && snapshot.data.expoPushToken === token) await compareAndSetFirestoreDocument("private_devices", owner._id, { expoPushToken: null, pushNotificationsEnabled: false }, snapshot.updateTime, accessToken);
+      }
+      // Existing deployed clients may still own legacy fields. Do not create
+      // new ones, but clear a rejected legacy token until Rules can land.
       const owners = await queryFirestore("users", "expoPushToken", "EQUAL", token, accessToken);
       for (const owner of owners) {
         const snapshot = await getFirestoreSnapshot("users", owner._id, accessToken);
@@ -4703,6 +4845,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         // Hash only: no phone is copied into the account-deletion record.
         phoneIndexKey,
         phoneIndexDeleted: !indexedPhoneMustBeRemoved,
+        publicProfileDeleted: false,
+        privateDeviceDeleted: false,
         userDeleted: false,
         verificationDeleted: false,
         cleanupLimitations: [...new Set(cleanupLimitations)]
@@ -4734,6 +4878,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       // preserve their resumability rather than turning an old deletion into a
       // permanently pending request.
       if (!Object.prototype.hasOwnProperty.call(manifest, "phoneIndexDeleted")) manifest.phoneIndexDeleted = true;
+      // Old manifests predate these private/public projections. Treat their
+      // absence as already-cleaned so an existing deletion can still resume.
+      if (!Object.prototype.hasOwnProperty.call(manifest, "publicProfileDeleted")) manifest.publicProfileDeleted = true;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "privateDeviceDeleted")) manifest.privateDeviceDeleted = true;
       const failures = [];
       if (manifest.phoneIndexDeleted !== true) {
         if (!manifest.phoneIndexKey) {
@@ -4778,6 +4926,24 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           failures.push("offer_delete_failed");
         }
       }
+      if (manifest.publicProfileDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument("public_profiles", uid, accessToken);
+          manifest.publicProfileDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("public_profile_delete_failed"); }
+      }
+      if (manifest.privateDeviceDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument("private_devices", uid, accessToken);
+          manifest.privateDeviceDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("private_device_delete_failed"); }
+      }
       if (manifest.userDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -4796,7 +4962,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("verification_delete_failed"); }
       }
-      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
+      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
       const final = await writeDeletionState(uid, owner, {
         status: complete ? "completed" : "cleanup_pending",
         cleanupManifest: manifest,
@@ -4938,7 +5104,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         executeAccountDeletionCleanup,
         classifyPhoneIndexBackfill,
         phoneLookupKey,
-        phase4aCommit
+        phase4aCommit,
+        publicProfileFromPrivateUser,
+        classifyPublicProfileProjection,
+        handleOrderContact,
+        handleOrderPaymentInstructions
       };
     }
     addEventListener("scheduled", (event) => {
@@ -5654,6 +5824,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const classification = await classifyPhoneIndexBackfill(accessToken, env);
             return jsonResponse({ success: true, counts: classification.counts, knownConflictExcluded: classification.knownConflictExcluded, dryRunFingerprint: classification.fingerprint });
           }
+          if (path === "/admin/api/public-profiles/dry-run" && request.method === "GET") {
+            // Read-only aggregate report; it never emits user IDs, phones,
+            // addresses, or coordinates and it never writes a projection.
+            return jsonResponse({ success: true, ...(await classifyPublicProfileProjection(accessToken)) });
+          }
           if (path === "/admin/api/phone-index/backfill" && request.method === "POST") {
             return await executePhoneIndexBackfill(request, env, accessToken);
           }
@@ -5974,6 +6149,77 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: false, code: "internal_error", error: "Internal error" }, 500);
         }
       }
+      if (path === "/order-contact" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderContact(await request.json(), callerUid, accessToken);
+        } catch (error) {
+          console.error("[OrderContact] Error:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to retrieve order contact" }, 500);
+        }
+      }
+      if (path === "/order-payment-instructions" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderPaymentInstructions(await request.json(), callerUid, accessToken);
+        } catch (error) {
+          console.error("[OrderPayment] Error:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to retrieve payment instructions" }, 500);
+        }
+      }
+      if (path === "/devices/register" && request.method === "POST") {
+        try {
+          const body = await request.json();
+          if (typeof body?.token !== "string" && body?.token !== null) {
+            return jsonResponse({ success: false, code: "invalid_request", error: "Invalid device token" }, 400);
+          }
+          if (typeof body?.token === "string" && !isExpoPushToken(body.token)) {
+            return jsonResponse({ success: false, code: "invalid_request", error: "Invalid Expo device token" }, 400);
+          }
+          await updateFirestoreDocument("private_devices", callerUid, {
+            expoPushToken: body.token,
+            pushNotificationsEnabled: typeof body.token === "string",
+            platform: body.platform === "web" ? "web" : "native",
+            updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+          }, await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY));
+          return jsonResponse({ success: true });
+        } catch (error) {
+          console.error("[DeviceRegistration] Error:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to register device" }, 500);
+        }
+      }
+      if (path === "/profile/public-discovery" && request.method === "POST") {
+        try {
+          const body = await request.json();
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const user = await getFirestoreDoc("users", callerUid, accessToken);
+          if (!user || !["provider", "driver"].includes(user.role)) {
+            return jsonResponse({ success: false, code: "forbidden", error: "Only provider and driver accounts have public profiles" }, 403);
+          }
+          if (body?.action === "sync") {
+            await syncPublicProfile(callerUid, user, accessToken);
+            return jsonResponse({ success: true, published: !!user.discoveryLocation });
+          }
+          if (body?.publishDiscoveryLocation === true) {
+            const loc = body.discoveryLocation;
+            if (!loc || !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng) || loc.lat < -90 || loc.lat > 90 || loc.lng < -180 || loc.lng > 180) {
+              return jsonResponse({ success: false, code: "invalid_request", error: "A valid discovery location is required to publish it" }, 400);
+            }
+            user.discoveryLocation = { lat: loc.lat, lng: loc.lng };
+            await updateFirestoreDocument("users", callerUid, { discoveryLocation: user.discoveryLocation }, accessToken);
+          } else if (body?.publishDiscoveryLocation === false) {
+            user.discoveryLocation = null;
+            await updateFirestoreDocument("users", callerUid, { discoveryLocation: null }, accessToken);
+          } else {
+            return jsonResponse({ success: false, code: "invalid_request", error: "publishDiscoveryLocation must be boolean" }, 400);
+          }
+          await syncPublicProfile(callerUid, user, accessToken);
+          return jsonResponse({ success: true, published: body.publishDiscoveryLocation === true });
+        } catch (error) {
+          console.error("[PublicProfile] Error:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to update public discovery profile" }, 500);
+        }
+      }
       if (path === "/order-transition" && request.method === "POST") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
@@ -6063,7 +6309,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if (targetDeletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(targetDeletion.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Rating target unavailable", 409);
             const aggregateFields = { ratingAverage: roundedAvg, ratingCount: count };
             const committed = await phase4aCommit([{ update: phase4aDoc("users", uid, aggregateFields), updateMask: { fieldPaths: ["ratingAverage", "ratingCount"] }, currentDocument: { updateTime: targetSnap.updateTime } }, phase4aDeletionFence(uid, targetDeletion)], accessToken);
-            if (committed) return Response.json({ success: true, ratingAverage: roundedAvg, ratingCount: count }, { headers: { "Access-Control-Allow-Origin": "*" } });
+            if (committed) {
+              const updatedUser = { ...targetSnap.data, ratingAverage: roundedAvg, ratingCount: count };
+              await syncPublicProfile(uid, updatedUser, accessToken);
+              return Response.json({ success: true, ratingAverage: roundedAvg, ratingCount: count }, { headers: { "Access-Control-Allow-Origin": "*" } });
+            }
           }
           return phase4aError("STATE_CONFLICT", "Rating aggregate changed; retry", 409);
         } catch (e) {
