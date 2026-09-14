@@ -90,16 +90,18 @@ available; phone changes from older clients will correctly be refused.
 2. Add Worker secrets `PHONE_LOGIN_HMAC_SECRET` (at least 32 random bytes) and
    `FIREBASE_WEB_API_KEY`. The latter is used only by the Worker for Firebase
    Identity Toolkit password verification.
-3. Deploy and verify the Rules above. Run the read-only phone-index dry-run and
-   resolve all duplicate ownership before backfill. Never modify an active
-   order as part of this operation.
+3. Deploy and verify the Rules above. Run the read-only phone-index dry-run.
+   The explicitly quarantined known duplicate pair must remain absent from the
+   index; resolve every *unexpected* duplicate before backfill. Never modify
+   an active order as part of this operation.
 4. Perform the separately approved backfill, verify all unique candidates have
    eligible index records, and then set the three deployment approvals:
    `PHONE_LOGIN_RULES_HARDENED=true`, `PHONE_LOGIN_INDEX_READY=true`, and
    `PHONE_LOGIN_ACTIVATION_APPROVED=true`.
 5. Only then can an authorized admin turn on `phonePasswordLoginEnabled`.
    The Worker independently checks the approvals, index completeness, and
-   duplicate count; the UI checkbox is not an activation bypass.
+   unexpected duplicate count, and the absence of an index for the quarantined
+   pair; the UI checkbox is not an activation bypass.
 
 ## Future OTP linkage
 

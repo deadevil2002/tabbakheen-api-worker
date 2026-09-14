@@ -190,7 +190,11 @@
     // display input; they must never create their own index key.
     function normalizeSaudiMobilePhone(value) {
       if (typeof value !== "string") return null;
-      let digits = value.trim().replace(/[^\d+]/g, "");
+      const raw = value.trim();
+      // Permit conventional display separators only. Never silently turn
+      // arbitrary text such as "call-053..." into an account identifier.
+      if (!/^\+?[\d\s().-]+$/.test(raw)) return null;
+      let digits = raw.replace(/[^\d+]/g, "");
       if (!digits) return null;
       if (digits.startsWith("+")) digits = digits.slice(1);
       if (digits.startsWith("00")) digits = digits.slice(2);
@@ -1117,6 +1121,11 @@
     }
     __name(isKnownDuplicatePhoneOwner, "isKnownDuplicatePhoneOwner");
     __name2(isKnownDuplicatePhoneOwner, "isKnownDuplicatePhoneOwner");
+    function isQuarantinedKnownDuplicate(conflict) {
+      return conflict && conflict.uids.length === 2 && conflict.uids[0] === "F23GUoy3VJVxWOZs5sZHZxifVVI3" && conflict.uids[1] === "KLonAzumgwNWg2RJLi5E4uupVGo1";
+    }
+    __name(isQuarantinedKnownDuplicate, "isQuarantinedKnownDuplicate");
+    __name2(isQuarantinedKnownDuplicate, "isQuarantinedKnownDuplicate");
     async function existingPhoneProfileOwners(phone, accessToken, exceptUid = "") {
       // Until Rules reject legacy direct phone writes, index creation must also
       // defend against an already-stored, unindexed canonical equivalent.
@@ -1278,19 +1287,18 @@
         if (input.role === "driver") fields.isAvailable = false;
       }
       const writes = [{ update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } }];
-      if (canonicalPhone && phoneIndexingIsConfigured(env)) {
+      if (canonicalPhone && !phoneIndexingIsConfigured(env)) {
+        // A phone-bearing registration must never be persisted without its
+        // create-only HMAC index reservation. This is an explicit deployment
+        // prerequisite, not a compatibility fallback.
+        return phase4aError("PHONE_INDEX_UNAVAILABLE", "Phone registration is temporarily unavailable", 503);
+      }
+      if (canonicalPhone) {
         const key = await phoneLookupKey(canonicalPhone, env);
         fields.phoneIndexStatus = "indexed";
         fields.phoneIndexSchemaVersion = 1;
         writes[0] = { update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } };
         writes.push({ update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, claims.sub, now.toISOString())), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } });
-      } else if (canonicalPhone) {
-        // Staged deployments must retain ordinary account registration even
-        // before the new HMAC secret is installed. Such records can never be
-        // used for phone login and are explicitly excluded from activation.
-        fields.phoneIndexStatus = "pending_hmac";
-        fields.phoneIndexSchemaVersion = 1;
-        writes[0] = { update: phase4aDoc("users", claims.sub, fields), currentDocument: { exists: false } };
       }
       const ok = await phase4aCommit(writes, accessToken);
       if (!ok) {
@@ -1342,6 +1350,11 @@
     }
     __name(verifyFirebasePassword, "verifyFirebasePassword");
     __name2(verifyFirebasePassword, "verifyFirebasePassword");
+    function phoneLoginRuntimeEnabled(env) {
+      return phoneIndexingIsConfigured(env) && !!env.FIREBASE_WEB_API_KEY && env.PHONE_LOGIN_RULES_HARDENED === "true" && env.PHONE_LOGIN_INDEX_READY === "true" && env.PHONE_LOGIN_ACTIVATION_APPROVED === "true";
+    }
+    __name(phoneLoginRuntimeEnabled, "phoneLoginRuntimeEnabled");
+    __name2(phoneLoginRuntimeEnabled, "phoneLoginRuntimeEnabled");
     async function handlePhonePasswordLogin(request, env, accessToken) {
       // This endpoint intentionally has one client-visible failure for malformed,
       // unknown, conflicted, disabled, and wrong-password attempts.
@@ -1350,6 +1363,9 @@
       if (!phase4aKeysOnly(body, ["phone", "password"]) || typeof body.phone !== "string" || typeof body.password !== "string" || body.phone.length > 80 || body.password.length < 1 || body.password.length > 1024) return genericPhoneLoginFailure();
       const settings = phoneAuthSettings(await getFirestoreDoc("app_settings", "main", accessToken));
       if (!settings.phonePasswordLoginEnabled) return genericPhoneLoginFailure();
+      // Deployment approvals are immutable Worker bindings, so validate them
+      // for every attempt rather than relying on a historical admin toggle.
+      if (!phoneLoginRuntimeEnabled(env)) return genericPhoneLoginFailure();
       const canonicalPhone = normalizeSaudiMobilePhone(body.phone);
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const ipSubject = await phoneLookupKey(ip, env, "phone-login-ip");
@@ -1425,11 +1441,15 @@
         if (uids.length === 1 && !isKnownDuplicatePhoneOwner(uids[0])) candidates.push({ uid: uids[0], phone });
         else conflicts.push({ phone, uids: [...uids].sort() });
       }
-      const knownConflictExcluded = conflicts.some((item) => item.uids.includes("F23GUoy3VJVxWOZs5sZHZxifVVI3") && item.uids.includes("KLonAzumgwNWg2RJLi5E4uupVGo1"));
+      const quarantinedConflicts = conflicts.filter(isQuarantinedKnownDuplicate);
+      const unexpectedConflicts = conflicts.filter((item) => !isQuarantinedKnownDuplicate(item));
+      const knownConflictExcluded = quarantinedConflicts.length === 1;
       const fingerprint = phoneIndexingIsConfigured(env) ? await phoneLookupKey(JSON.stringify({ candidates: candidates.map((item) => item.uid).sort(), conflicts: conflicts.map((item) => item.uids).sort() }), env, "phone-backfill") : null;
       return {
         counts: { UNIQUE_SAFE: candidates.length, DUPLICATE_CONFLICT: conflicts.reduce((count, item) => count + item.uids.length, 0), INVALID_PHONE: invalid.length, NO_PHONE: noPhone },
         candidates,
+        quarantinedConflicts,
+        unexpectedConflicts,
         knownConflictExcluded,
         fingerprint
       };
@@ -1451,14 +1471,27 @@
       let conflicts = 0;
       for (const candidate of classification.candidates) {
         const key = await phoneLookupKey(candidate.phone, env);
-        const existing = await getFirestoreDoc("phoneLoginIndex", key, accessToken);
+        const profileSnapshot = await getFirestoreSnapshot("users", candidate.uid, accessToken);
+        if (!profileSnapshot || normalizeSaudiMobilePhone(profileSnapshot.data.phone) !== candidate.phone) {
+          conflicts++;
+          continue;
+        }
+        const profileFields = { phone: candidate.phone, phoneVerified: false, phoneIndexStatus: "indexed", phoneIndexSchemaVersion: 1 };
+        const existing = await getFirestoreSnapshot("phoneLoginIndex", key, accessToken);
         if (existing) {
-          if (existing.uid === candidate.uid && existing.status === "eligible") alreadyIndexed++;
+          if (existing.data.uid === candidate.uid && existing.data.status === "eligible") {
+            const marked = await phase4aCommit([{ update: phase4aDoc("users", candidate.uid, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } }], accessToken);
+            if (marked) alreadyIndexed++;
+            else conflicts++;
+          }
           else conflicts++;
           continue;
         }
         const now = new Date().toISOString();
-        const committed = await phase4aCommit([{ update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, candidate.uid, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } }], accessToken);
+        const committed = await phase4aCommit([
+          { update: phase4aDoc("users", candidate.uid, profileFields), updateMask: { fieldPaths: Object.keys(profileFields) }, currentDocument: { updateTime: profileSnapshot.updateTime } },
+          { update: phase4aDoc("phoneLoginIndex", key, phoneIndexDocument(key, candidate.uid, now)), updateMask: { fieldPaths: ["uid", "status", "createdAt", "updatedAt", "schemaVersion"] }, currentDocument: { exists: false } }
+        ], accessToken);
         if (committed) indexed++;
         else conflicts++;
       }
@@ -1478,7 +1511,13 @@
       if (env.PHONE_LOGIN_INDEX_READY !== "true") return "PHONE_INDEX_NOT_APPROVED";
       if (env.PHONE_LOGIN_ACTIVATION_APPROVED !== "true") return "PHONE_LOGIN_NOT_APPROVED";
       const classification = await classifyPhoneIndexBackfill(accessToken, env);
-      if (classification.counts.DUPLICATE_CONFLICT > 0) return "DUPLICATE_PHONE_OWNERSHIP_UNRESOLVED";
+      if (classification.unexpectedConflicts.length > 0) return "DUPLICATE_PHONE_OWNERSHIP_UNRESOLVED";
+      // The one deliberately quarantined legacy pair is permitted only while
+      // no index exists for it. It remains email-only and cannot be silently
+      // made eligible by an index write.
+      for (const conflict of classification.quarantinedConflicts) {
+        if (await getFirestoreDoc("phoneLoginIndex", await phoneLookupKey(conflict.phone, env), accessToken)) return "QUARANTINED_DUPLICATE_INDEX_PRESENT";
+      }
       for (const candidate of classification.candidates) {
         const index = await getFirestoreDoc("phoneLoginIndex", await phoneLookupKey(candidate.phone, env), accessToken);
         if (!index || index.uid !== candidate.uid || index.status !== "eligible") return "PHONE_INDEX_INCOMPLETE";
@@ -4847,6 +4886,25 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(handleScheduledOutbox, "handleScheduledOutbox");
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
+    // Offline tests load the compiled Worker in Node with this explicit process
+    // flag. Cloudflare Workers have no `process`, so no test surface exists in
+    // production.
+    if (typeof process !== "undefined" && process?.env?.PHONE_AUTH_TEST_MODE === "1") {
+      globalThis.__PHONE_AUTH_TEST_HOOKS = {
+        normalizeSaudiMobilePhone,
+        handlePhase4cProfileRegistration,
+        handleRequest,
+        handlePhonePasswordLogin,
+        handleProfilePhoneUpdate,
+        phoneLoginRuntimeEnabled,
+        phoneLoginActivationBlocker,
+        executePhoneIndexBackfill,
+        executeAccountDeletionCleanup,
+        classifyPhoneIndexBackfill,
+        phoneLookupKey,
+        phase4aCommit
+      };
+    }
     addEventListener("scheduled", (event) => {
       const env = typeof globalThis !== "undefined" ? globalThis : {};
        event.waitUntil(Promise.all([handleScheduledOutbox(env), resumeAccountDeletions(env)]));
