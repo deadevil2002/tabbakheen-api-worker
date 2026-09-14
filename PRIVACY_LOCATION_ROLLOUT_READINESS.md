@@ -9,7 +9,7 @@ run were performed. This document is a decision record, not a release approval.
 
 | Decision | Result | Why |
 | --- | --- | --- |
-| Authoritative Worker source head | **VERIFIED** | GitHub `main` is `0f3dfe8ff3d8b721cc7850a50b784132b16f3bc8` (`fix: preserve safe sync and consent withdrawal`). |
+| Authoritative Worker deployable source | **VERIFIED** | `0f3dfe8ff3d8b721cc7850a50b784132b16f3bc8` is the final Worker source-fix commit (`fix: preserve safe sync and consent withdrawal`); this readiness record is a later documentation-only commit. |
 | Authoritative mobile source head | **VERIFIED** | GitHub `main` is `eb6d671313e6545941e57e693daa9e50a7357d6c` (`fix: use public locations in discovery views`). |
 | Current deployed Worker equals Worker candidate | **NO — VERIFIED** | Cloudflare's active `tabbakheen-api` content-v2 SHA-256 is exactly `d1e0161`'s `worker.js`, not `0f3dfe8`'s. The active script is the legacy pre-privacy Worker. |
 | Current store client build/source provenance | **PARTIAL** | App Store Connect verifies iOS `1.0.2` is `READY_FOR_SALE` and iOS `1.0.3` is `PREPARE_FOR_SUBMISSION`; neither is source-linked by the available EAS records. Google Play production-release evidence is still **NOTVERIFIED**. |
