@@ -2,105 +2,169 @@
 "use strict";
 
 /*
- * Server-only public-profile migration. It is intentionally inert unless both
- * --execute and a non-empty PUBLIC_PROFILE_MIGRATION_APPROVAL are supplied.
- * Default operation is a PII-free dry run.
+ * Controlled, server-only public-profile migration.
  *
- * Required environment:
- * FIREBASE_ADMIN_PROJECT_ID, FIREBASE_ADMIN_CLIENT_EMAIL,
- * FIREBASE_ADMIN_PRIVATE_KEY
- *
- * Run from a controlled admin host with firebase-admin installed:
- * node scripts/migratePublicProfiles.js
- * PUBLIC_PROFILE_MIGRATION_APPROVAL=CHG-123 node scripts/migratePublicProfiles.js --execute
+ * Default operation is a PII-free dry run. Execution additionally requires
+ * --execute and a change-approval identifier. Never run this from a client,
+ * CI preview, or production shell without an approved change.
  */
+const crypto = require("crypto");
 const execute = process.argv.includes("--execute");
 const approval = String(process.env.PUBLIC_PROFILE_MIGRATION_APPROVAL || "").trim();
-if (execute && !approval) throw new Error("Refusing execution: PUBLIC_PROFILE_MIGRATION_APPROVAL is required");
-const required = ["FIREBASE_ADMIN_PROJECT_ID", "FIREBASE_ADMIN_CLIENT_EMAIL", "FIREBASE_ADMIN_PRIVATE_KEY"];
-for (const key of required) if (!process.env[key]) throw new Error("Missing required server-only credential: " + key);
+const ACTIVE_DELETION_STATUSES = new Set(["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"]);
 
-let admin;
-try {
-  const loaded = require("firebase-admin");
-  admin = loaded.default || loaded;
-} catch {
-  throw new Error("firebase-admin is required on the controlled migration host");
+// worker.js is the deployable, authoritative implementation. Loading its
+// explicit test hook here intentionally makes the migration call the exact
+// same allowlist constructor as runtime synchronization; this is not a copy
+// of a security allowlist that can drift over time.
+function canonicalProjection() {
+  if (!global.crypto) global.crypto = crypto.webcrypto;
+  if (!global.addEventListener) global.addEventListener = () => {};
+  const previous = process.env.PHONE_AUTH_TEST_MODE;
+  process.env.PHONE_AUTH_TEST_MODE = "1";
+  require("../worker.js");
+  if (previous === undefined) delete process.env.PHONE_AUTH_TEST_MODE;
+  else process.env.PHONE_AUTH_TEST_MODE = previous;
+  const projection = global.__PHONE_AUTH_TEST_HOOKS?.publicProfileFromPrivateUser;
+  if (typeof projection !== "function") throw new Error("Canonical Worker public-profile projection is unavailable");
+  return projection;
 }
-if (!admin.getApps().length) {
-  admin.initializeApp({
-    credential: admin.cert({
+const publicProfileFromPrivateUser = canonicalProjection();
+
+function auditIdFor(approvedChange) {
+  return "migration_" + crypto.createHash("sha256").update(approvedChange).digest("hex").slice(0, 32);
+}
+function isDeletionActive(deletion) {
+  return !!deletion && ACTIVE_DELETION_STATUSES.has(deletion.status);
+}
+function increment(object, key) {
+  object[key] = (object[key] || 0) + 1;
+}
+function projectionContentEqual(prior, next) {
+  if (!prior || !next) return false;
+  const { updatedAt: ignoredPriorTimestamp, ...priorContent } = prior;
+  const { updatedAt: ignoredNextTimestamp, ...nextContent } = next;
+  return JSON.stringify(priorContent) === JSON.stringify(nextContent);
+}
+async function applyProjectionTransaction(db, uid) {
+  return db.runTransaction(async (transaction) => {
+    const userRef = db.collection("users").doc(uid);
+    const publicRef = db.collection("public_profiles").doc(uid);
+    const deletionRef = db.collection("account_deletion_requests").doc(uid);
+    const [userSnap, priorSnap, deletionSnap] = await Promise.all([
+      transaction.get(userRef), transaction.get(publicRef), transaction.get(deletionRef)
+    ]);
+    const user = userSnap.exists ? userSnap.data() : null;
+    const profile = !isDeletionActive(deletionSnap.exists ? deletionSnap.data() : null) && user
+      ? publicProfileFromPrivateUser(uid, user)
+      : null;
+    // Do not churn updatedAt or produce write charges on a rerun when the
+    // complete canonical allowlist already matches. A mismatch includes stale
+    // keys, so old unsafe fields are still removed by the replacement write.
+    if (profile) {
+      if (!projectionContentEqual(priorSnap.exists ? priorSnap.data() : null, profile)) {
+        transaction.set(publicRef, profile);
+        return "replaced";
+      }
+      return "unchanged";
+    }
+    if (priorSnap.exists) {
+      transaction.delete(publicRef);
+      return "deleted";
+    }
+    return "absent";
+  });
+}
+
+async function main() {
+  if (execute && !approval) throw new Error("Refusing execution: PUBLIC_PROFILE_MIGRATION_APPROVAL is required");
+  const required = ["FIREBASE_ADMIN_PROJECT_ID", "FIREBASE_ADMIN_CLIENT_EMAIL", "FIREBASE_ADMIN_PRIVATE_KEY"];
+  for (const key of required) if (!process.env[key]) throw new Error("Missing required server-only credential: " + key);
+  let admin;
+  try {
+    const loaded = require("firebase-admin");
+    admin = loaded.default || loaded;
+  } catch {
+    throw new Error("firebase-admin is required on the controlled migration host");
+  }
+  if (!admin.getApps().length) {
+    admin.initializeApp({ credential: admin.cert({
       projectId: process.env.FIREBASE_ADMIN_PROJECT_ID,
       clientEmail: process.env.FIREBASE_ADMIN_CLIENT_EMAIL,
       privateKey: process.env.FIREBASE_ADMIN_PRIVATE_KEY.replace(/\\n/g, "\n")
-    })
+    }) });
+  }
+  const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+  const db = getFirestore();
+  const [providers, drivers, existingPublic] = await Promise.all([
+    db.collection("users").where("role", "==", "provider").get(),
+    db.collection("users").where("role", "==", "driver").get(),
+    db.collection("public_profiles").get()
+  ]);
+  const users = new Map([...providers.docs, ...drivers.docs].map((doc) => [doc.id, doc]));
+  const publicDocs = new Map(existingPublic.docs.map((doc) => [doc.id, doc]));
+  const ids = new Set([...users.keys(), ...publicDocs.keys()]);
+  const report = {
+    executed: execute,
+    totalCandidates: users.size,
+    safeProjections: 0,
+    unchanged: 0,
+    publicDocsRemoved: 0,
+    orphanPublicDocs: 0,
+    deletedOrIneligiblePublicDocs: 0,
+    ambiguousLocation: 0,
+    missingRequiredFields: {},
+    otherBlockers: 0
+  };
+
+  for (const uid of ids) {
+    const user = users.get(uid)?.data();
+    const prior = publicDocs.get(uid)?.data();
+    const profile = user && publicProfileFromPrivateUser(uid, user);
+    if (user?.location && !profile?.discoveryLocation) report.ambiguousLocation++;
+    if (user && !profile) {
+      increment(report.missingRequiredFields, "displayName");
+      report.otherBlockers++;
+    }
+    if (profile) report.safeProjections++;
+    else if (prior) {
+      report.publicDocsRemoved++;
+      if (!user) report.orphanPublicDocs++;
+      else report.deletedOrIneligiblePublicDocs++;
+    }
+    if (profile && projectionContentEqual(prior, profile)) report.unchanged++;
+  }
+  if (!execute) {
+    console.log(JSON.stringify(report));
+    return;
+  }
+
+  // Each document has its own read-write transaction. It fences both current
+  // source and deletion state, and either replaces the complete allowlisted
+  // projection (removing stale keys) or removes an orphan/ineligible one.
+  for (const uid of ids) {
+    await applyProjectionTransaction(db, uid);
+  }
+  // A deterministic ID makes an approved migration's aggregate audit
+  // idempotent. It contains no user IDs, names, phones, locations, or tokens.
+  const auditRef = db.collection("public_profile_migration_audit").doc(auditIdFor(approval));
+  await db.runTransaction(async (transaction) => {
+    const prior = await transaction.get(auditRef);
+    transaction.set(auditRef, {
+      ...report,
+      approval,
+      executionCount: (prior.exists ? Number(prior.data().executionCount || 0) : 0) + 1,
+      createdAt: prior.exists ? prior.data().createdAt : FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+  });
+  console.log(JSON.stringify(report));
+}
+
+module.exports = { publicProfileFromPrivateUser, auditIdFor, isDeletionActive, projectionContentEqual, applyProjectionTransaction };
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error.stack || error.message || error);
+    process.exitCode = 1;
   });
 }
-const { getFirestore, FieldValue } = require("firebase-admin/firestore");
-const db = getFirestore();
-
-function projection(uid, user, now) {
-  if (!user || !["provider", "driver"].includes(user.role) || !String(user.displayName || "").trim()) return null;
-  const profile = {
-    uid,
-    role: user.role,
-    displayName: String(user.displayName).trim().slice(0, 120),
-    photoUrl: typeof user.photoUrl === "string" ? user.photoUrl.slice(0, 2048) : "",
-    ratingAverage: Number.isFinite(user.ratingAverage) ? Math.max(0, Math.min(5, user.ratingAverage)) : 0,
-    ratingCount: Number.isInteger(user.ratingCount) ? Math.max(0, user.ratingCount) : 0,
-    verificationStatus: typeof user.verificationStatus === "string" ? user.verificationStatus : "unverified",
-    updatedAt: now
-  };
-  // Only an explicit prior owner choice can be published. Never infer this
-  // from legacy users.location, latitude/longitude, or address.
-  if (user.discoveryLocation && Number.isFinite(user.discoveryLocation.lat) && Number.isFinite(user.discoveryLocation.lng)) {
-    profile.discoveryLocation = { lat: user.discoveryLocation.lat, lng: user.discoveryLocation.lng };
-  }
-  return profile;
-}
-function same(a, b) {
-  return JSON.stringify(a || {}) === JSON.stringify(b || {});
-}
-
-(async () => {
-  const snapshots = await Promise.all(["provider", "driver"].map((role) => db.collection("users").where("role", "==", role).get()));
-  const now = new Date().toISOString();
-  const report = { executed: execute, totalCandidates: 0, safeProjections: 0, unchanged: 0, ambiguousLocation: 0, missingRequiredFields: { displayName: 0 }, otherBlockers: 0 };
-  const candidates = snapshots.flatMap((snapshot) => snapshot.docs);
-  report.totalCandidates = candidates.length;
-  const writes = [];
-  for (const doc of candidates) {
-    const user = doc.data();
-    const next = projection(doc.id, user, now);
-    if (!next) {
-      report.missingRequiredFields.displayName++;
-      report.otherBlockers++;
-      continue;
-    }
-    if (user.location && !next.discoveryLocation) report.ambiguousLocation++;
-    const prior = await db.collection("public_profiles").doc(doc.id).get();
-    if (prior.exists && same({ ...prior.data(), updatedAt: now }, next)) {
-      report.unchanged++;
-      continue;
-    }
-    report.safeProjections++;
-    if (execute) writes.push({ ref: db.collection("public_profiles").doc(doc.id), data: next });
-  }
-  if (execute) {
-    for (let i = 0; i < writes.length; i += 400) {
-      const batch = db.batch();
-      for (const item of writes.slice(i, i + 400)) batch.set(item.ref, item.data, { merge: false });
-      await batch.commit();
-    }
-  }
-  if (execute) {
-    // Aggregate-only execution audit: no IDs, names, phones, addresses, or coordinates.
-    await db.collection("public_profile_migration_audit").add({
-      ...report, approval, createdAt: FieldValue.serverTimestamp()
-    });
-  }
-  console.log(JSON.stringify(report));
-})().catch((error) => {
-  console.error(error.stack || error.message || error);
-  process.exitCode = 1;
-});

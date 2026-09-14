@@ -424,21 +424,22 @@
     // This projection is deliberately constructed, never copied. Keep it in
     // lockstep with the public mobile discovery DTO; private account documents
     // are not a public API.
+    const PUBLIC_PROFILE_DELETION_STATUSES = ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"];
     function publicProfileFromPrivateUser(uid, user) {
-      if (!user || !["provider", "driver"].includes(user.role)) return null;
+      if (!user || !["provider", "driver"].includes(user.role) || typeof user.displayName !== "string" || !user.displayName.trim()) return null;
       const profile = {
         uid,
         role: user.role,
-        displayName: typeof user.displayName === "string" ? user.displayName : "",
-        photoUrl: typeof user.photoUrl === "string" ? user.photoUrl : "",
-        ratingAverage: Number.isFinite(user.ratingAverage) ? user.ratingAverage : 0,
-        ratingCount: Number.isFinite(user.ratingCount) ? user.ratingCount : 0,
+        displayName: user.displayName.trim().slice(0, 120),
+        photoUrl: typeof user.photoUrl === "string" ? user.photoUrl.slice(0, 2048) : "",
+        ratingAverage: Number.isFinite(user.ratingAverage) ? Math.max(0, Math.min(5, user.ratingAverage)) : 0,
+        ratingCount: Number.isInteger(user.ratingCount) ? Math.max(0, user.ratingCount) : 0,
         verificationStatus: user.verificationStatus === "verified" ? "verified" : "unverified",
         updatedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
       if (user.role === "provider") {
-        if (typeof user.city === "string") profile.city = user.city;
-        if (typeof user.socialLink === "string") profile.socialLink = user.socialLink;
+        if (typeof user.city === "string" && user.city.trim()) profile.city = user.city.trim().slice(0, 120);
+        if (typeof user.socialLink === "string" && user.socialLink.trim()) profile.socialLink = user.socialLink.trim().slice(0, 2048);
         // A legacy `location` has ambiguous/private semantics and MUST NOT be
         // projected. Only the explicitly opted-in discoveryLocation is used.
         const loc = user.discoveryLocation;
@@ -453,32 +454,41 @@
     }
     __name(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
     __name2(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
+    function publicProfileDeletionActive(snapshot) {
+      return !!snapshot && PUBLIC_PROFILE_DELETION_STATUSES.includes(snapshot.data?.status);
+    }
+    async function replacePublicProfileFromSource(uid, sourceSnapshot, publicSnapshot, deletionSnapshot, accessToken) {
+      const profile = !publicProfileDeletionActive(deletionSnapshot) && sourceSnapshot ? publicProfileFromPrivateUser(uid, sourceSnapshot.data) : null;
+      const writes = [];
+      // Every projection mutation is coupled to the source version and current
+      // deletion manifest. This prevents stale workers from resurrecting public
+      // identity after deletion, role change, or source deletion.
+      writes.push(sourceSnapshot ? { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid, currentDocument: { updateTime: sourceSnapshot.updateTime } } : { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid, currentDocument: { exists: false } });
+      writes.push(phase4aDeletionFence(uid, deletionSnapshot));
+      if (profile) {
+        writes.push({ update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } });
+      } else if (publicSnapshot) {
+        writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/public_profiles/" + uid, currentDocument: { updateTime: publicSnapshot.updateTime } });
+      } else {
+        return true;
+      }
+      return phase4aCommit(writes, accessToken);
+    }
     async function syncPublicProfile(uid, user, accessToken) {
       // Re-read and fence the authoritative source. This prevents a delayed
       // profile sync from recreating a projection after account deletion or
       // overwriting a newer private-profile change.
       const sourceSnapshot = await getFirestoreSnapshot("users", uid, accessToken);
-      if (!sourceSnapshot) return false;
-      const profile = publicProfileFromPrivateUser(uid, sourceSnapshot.data);
-      if (!profile) return false;
       const [publicSnapshot, deletionSnapshot] = await Promise.all([
         getFirestoreSnapshot("public_profiles", uid, accessToken),
         getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
       ]);
-      const writes = [
-        { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid, currentDocument: { updateTime: sourceSnapshot.updateTime } },
-        // No updateMask intentionally replaces the complete allowlist
-        // document, removing stale keys from earlier schema versions.
-        { update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } },
-        phase4aDeletionFence(uid, deletionSnapshot)
-      ];
-      return phase4aCommit(writes, accessToken);
+      return replacePublicProfileFromSource(uid, sourceSnapshot, publicSnapshot, deletionSnapshot, accessToken);
     }
     __name(syncPublicProfile, "syncPublicProfile");
     __name2(syncPublicProfile, "syncPublicProfile");
     async function syncPublicProfileByUid(uid, accessToken) {
-      const user = await getFirestoreDoc("users", uid, accessToken);
-      return user ? syncPublicProfile(uid, user, accessToken) : false;
+      return syncPublicProfile(uid, null, accessToken);
     }
     __name(syncPublicProfileByUid, "syncPublicProfileByUid");
     __name2(syncPublicProfileByUid, "syncPublicProfileByUid");
@@ -486,6 +496,62 @@
       try { await syncPublicProfileByUid(uid, accessToken); } catch (error) {
         console.error("[PublicProfile] projection sync failed:", error && error.message ? error.message : error);
       }
+    }
+    async function updatePublicDiscoveryLocation(uid, location, accessToken) {
+      const [sourceSnapshot, publicSnapshot, deletionSnapshot] = await Promise.all([
+        getFirestoreSnapshot("users", uid, accessToken),
+        getFirestoreSnapshot("public_profiles", uid, accessToken),
+        getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
+      ]);
+      if (!sourceSnapshot || !["provider", "driver"].includes(sourceSnapshot.data.role)) return { ok: false, code: "forbidden" };
+      if (publicProfileDeletionActive(deletionSnapshot)) return { ok: false, code: "account_deletion_blocked" };
+      const nextUser = { ...sourceSnapshot.data, discoveryLocation: location };
+      const profile = publicProfileFromPrivateUser(uid, nextUser);
+      if (!profile) return { ok: false, code: "invalid_profile" };
+      const writes = [
+        { update: phase4aDoc("users", uid, { discoveryLocation: location }), updateMask: { fieldPaths: ["discoveryLocation"] }, currentDocument: { updateTime: sourceSnapshot.updateTime } },
+        { update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } },
+        phase4aDeletionFence(uid, deletionSnapshot)
+      ];
+      return { ok: await phase4aCommit(writes, accessToken) };
+    }
+    async function setDriverAvailabilityAndSync(uid, isAvailable, accessToken) {
+      const [sourceSnapshot, publicSnapshot, deletionSnapshot] = await Promise.all([
+        getFirestoreSnapshot("users", uid, accessToken),
+        getFirestoreSnapshot("public_profiles", uid, accessToken),
+        getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
+      ]);
+      if (!sourceSnapshot || sourceSnapshot.data.role !== "driver") return { ok: false, code: "forbidden" };
+      if (publicProfileDeletionActive(deletionSnapshot)) return { ok: false, code: "account_deletion_blocked" };
+      const entitlement = evaluateSubscriptionEntitlement(sourceSnapshot.data);
+      if (isAvailable && !entitlement.eligible) return { ok: false, code: "subscription_required", entitlement };
+      const fields = { isAvailable, ...commercialAccessFields(entitlement) };
+      const nextUser = { ...sourceSnapshot.data, ...fields };
+      const profile = publicProfileFromPrivateUser(uid, nextUser);
+      const writes = [
+        { update: phase4aDoc("users", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: sourceSnapshot.updateTime } },
+        phase4aDeletionFence(uid, deletionSnapshot)
+      ];
+      if (profile) writes.push({ update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } });
+      else if (publicSnapshot) writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/public_profiles/" + uid, currentDocument: { updateTime: publicSnapshot.updateTime } });
+      return { ok: await phase4aCommit(writes, accessToken), entitlement };
+    }
+    async function registerPrivateDevice(uid, token, platform, accessToken) {
+      const [deviceSnapshot, deletionSnapshot] = await Promise.all([
+        getFirestoreSnapshot("private_devices", uid, accessToken),
+        getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
+      ]);
+      if (publicProfileDeletionActive(deletionSnapshot)) return false;
+      const fields = {
+        expoPushToken: token,
+        pushNotificationsEnabled: typeof token === "string",
+        platform: platform === "web" ? "web" : "native",
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      return phase4aCommit([
+        { update: phase4aDoc("private_devices", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: deviceSnapshot ? { updateTime: deviceSnapshot.updateTime } : { exists: false } },
+        phase4aDeletionFence(uid, deletionSnapshot)
+      ], accessToken);
     }
     __name(syncPublicProfileBestEffort, "syncPublicProfileBestEffort");
     __name2(syncPublicProfileBestEffort, "syncPublicProfileBestEffort");
@@ -523,7 +589,9 @@
     __name2(classifyPublicProfileProjection, "classifyPublicProfileProjection");
     function canRequestOrderContact(order, uid, target, purpose) {
       if (!order || purpose !== "contact" || !["provider", "driver"].includes(target)) return false;
-      if (["cancelled", "rejected"].includes(order.status)) return false;
+      // Contact is operational data, not a durable participant directory. It
+      // becomes available only while an accepted order is actively fulfilled.
+      if (!["accepted", "preparing", "ready_for_pickup", "searching_driver", "assigned_to_driver", "picked_up"].includes(order.status)) return false;
       if (target === "provider") return uid === order.customerUid && !!order.providerUid;
       // Driver contact is not disclosed until an actual driver is assigned,
       // and only to the customer or provider serving this exact order.
@@ -546,6 +614,7 @@
       const person = await getFirestoreDoc("users", targetUid, accessToken);
       // Do not signal whether unrelated accounts exist and never return a
       // profile; absence of a phone is a valid minimum-data result.
+      if (person?.role !== target) return jsonResponse({ success: false, code: "not_available", error: "Order contact is not available" }, 409);
       return jsonResponse({ success: true, phone: typeof person?.phone === "string" ? person.phone : "" });
     }
     __name(handleOrderContact, "handleOrderContact");
@@ -557,12 +626,13 @@
       }
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
-      const paymentMethod = String(order.paymentMethod || "").toLowerCase().replace("stc_pay", "stc_pay").replace("bank_transfer", "bank_transfer");
-      const canonicalMethod = paymentMethod === "stc_pay" ? "stc_pay" : paymentMethod === "bank_transfer" ? "bank_transfer" : "";
+      const paymentMethod = String(order.paymentMethod || "").trim().toUpperCase();
+      const canonicalMethod = paymentMethod === "STC_PAY" ? "stc_pay" : paymentMethod === "BANK_TRANSFER" ? "bank_transfer" : "";
       if (callerUid !== order.customerUid || !order.providerUid || ["cancelled", "rejected", "completed"].includes(order.status) || !canonicalMethod || !["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status)) {
         return jsonResponse({ success: false, code: "forbidden", error: "Payment instructions are not available" }, 403);
       }
       const provider = await getFirestoreDoc("users", order.providerUid, accessToken);
+      if (provider?.role !== "provider") return jsonResponse({ success: false, code: "not_available", error: "Selected payment instructions are unavailable" }, 409);
       const methods = provider?.paymentMethods || {};
       if (canonicalMethod === "stc_pay" && methods.stcPay?.enabled === true && typeof methods.stcPay.phone === "string") {
         return jsonResponse({ success: true, method: "stc_pay", stcPayPhone: methods.stcPay.phone });
@@ -571,6 +641,24 @@
         return jsonResponse({ success: true, method: "bank_transfer", bankName: typeof methods.bankTransfer.bankName === "string" ? methods.bankTransfer.bankName : "", accountName: typeof methods.bankTransfer.accountName === "string" ? methods.bankTransfer.accountName : "", iban: methods.bankTransfer.iban });
       }
       return jsonResponse({ success: false, code: "not_available", error: "Selected payment instructions are unavailable" }, 409);
+    }
+    function publicRatingDto(rating) {
+      if (!rating || !Number.isInteger(rating.stars) || rating.stars < 1 || rating.stars > 5) return null;
+      return {
+        stars: rating.stars,
+        comment: typeof rating.comment === "string" ? rating.comment.slice(0, 500) : "",
+        createdAt: typeof rating.createdAt === "string" ? rating.createdAt : ""
+      };
+    }
+    async function handlePublicRatings(uid, kind, accessToken) {
+      if (!phase4aSafeSegment(uid) || !["provider", "driver"].includes(kind)) return phase4aError("INVALID_REQUEST", "Invalid profile or rating kind");
+      const profile = await getFirestoreDoc("public_profiles", uid, accessToken);
+      if (!profile || profile.role !== kind) return phase4aError("NOT_FOUND", "Public profile not found", 404);
+      const collection = kind === "provider" ? "provider_ratings" : "driver_ratings";
+      const response = await fetch(FIRESTORE_BASE + "/" + collection + "/" + uid + "/ratings?pageSize=50", { headers: { "Authorization": "Bearer " + accessToken } });
+      if (!response.ok) throw new Error("Public ratings read failed: " + response.status);
+      const ratings = (await response.json()).documents || [];
+      return jsonResponse({ success: true, ratings: ratings.map((doc) => publicRatingDto(parseFirestoreDoc(doc))).filter(Boolean) });
     }
     __name(handleOrderPaymentInstructions, "handleOrderPaymentInstructions");
     __name2(handleOrderPaymentInstructions, "handleOrderPaymentInstructions");
@@ -1824,8 +1912,8 @@
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
       if (auth.user.role !== "customer") return phase4aError("forbidden", "Customer account required", 403);
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
-      if (!phase4aKeysOnly(body, ["requestId", "offerId", "quantity", "paymentMethod", "note"]) || !phase4aSafeSegment(body.requestId) || !phase4aSafeSegment(body.offerId)) return phase4aError("invalid_request", "Invalid order request");
-      const quantity = body.quantity, paymentMethod = String(body.paymentMethod || "");
+      if (!phase4aKeysOnly(body, ["requestId", "providerUid", "offerId", "quantity", "paymentMethod", "note"]) || !phase4aSafeSegment(body.requestId) || !phase4aSafeSegment(body.offerId) || !phase4aSafeSegment(body.providerUid)) return phase4aError("invalid_request", "Invalid order request");
+      const quantity = body.quantity, paymentMethod = String(body.paymentMethod || "").trim().toLowerCase();
       if (typeof quantity !== "number" || !Number.isInteger(quantity) || quantity !== 1) return phase4aError("invalid_quantity", "Quantity must be one");
       if (!["cash", "cod", "bank_transfer", "stc", "stc_pay"].includes(paymentMethod)) return phase4aError("invalid_payment_method", "Unsupported payment method");
       const canonicalPaymentMethod = { cash: "CASH", cod: "CASH", bank_transfer: "BANK_TRANSFER", stc: "STC_PAY", stc_pay: "STC_PAY" }[paymentMethod];
@@ -1836,27 +1924,40 @@
       const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
       const offer = offerSnap?.data;
       if (!offer) return phase4aError("offer_not_found", "Offer not found", 404);
+      const selectedProviderUid = offer.providerUid || offer.providerId;
+      // providerUid is retained in the mobile request as an explicit selected
+      // provider, but the offer remains authoritative. A mismatch is rejected
+      // before any provider/payment data is used.
+      if (body.providerUid !== selectedProviderUid) return phase4aError("invalid_offer", "Offer does not belong to selected provider", 409);
       if (offer.isAvailable !== undefined && typeof offer.isAvailable !== "boolean") return phase4aError("invalid_offer", "Offer availability is malformed");
       if (offer.isAvailable === false) return phase4aError("offer_unavailable", "Offer unavailable", 409);
-      const offerProvider = await getFirestoreDoc("users", offer.providerUid || offer.providerId, accessToken);
+      const offerProviderSnapshot = await getFirestoreSnapshot("users", selectedProviderUid, accessToken);
+      const offerProvider = offerProviderSnapshot?.data;
       if (offer.providerUid === auth.uid || offer.providerId === auth.uid) return phase4aError("invalid_offer", "Offer provider is not eligible");
       const offerAccess = phase4aProviderAccess(offerProvider);
       if (!offerAccess.ok) {
         await normalizeCommercialAccess(offer.providerUid || offer.providerId, offerProvider, offerAccess.entitlement, accessToken);
         return phase4aError(offerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403);
       }
+      // The order's selected method must be enabled by this exact provider.
+      // Cash is the product's universal COD option; destination methods are
+      // never assumed merely because a client named one.
+      const methods = offerProvider.paymentMethods || {};
+      if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) {
+        return phase4aError("payment_rejected", "Selected payment method is unavailable", 409);
+      }
       const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
       if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return phase4aError("invalid_offer", "Offer is malformed");
       const providerUid = offer.providerUid || offer.providerId, now = new Date().toISOString(), orderId = crypto.randomUUID();
       const orderNumber = "TB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 8).toUpperCase();
-      const customer = auth.user, provider = await getFirestoreDoc("users", providerUid, accessToken);
+      const customer = auth.user, provider = offerProvider;
       const orderRef = "TAB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 12).toUpperCase();
       const order = { id: orderId, orderNumber, orderRef, customerUid: auth.uid, providerUid, offerId: body.offerId, offerTitleSnapshot: offer.title.trim(), offerAvailabilityType: normalizedAvailability, offerPreparationTimeMinutes: normalizedAvailability === "preorder" ? offer.preparationTimeMinutes : null, title: offer.title.trim(), priceSnapshot: offer.price, unitPrice: offer.price, quantity, totalAmount: offer.price, paymentMethod: canonicalPaymentMethod, paymentStatus: "PENDING", status: "pending", driverUid: null, deliveryFee: 0, deliveryMethod: null, deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "", providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null, providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null, customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null, customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null, pickupAddress: provider && typeof provider.address === "string" ? provider.address : "", dropoffAddress: typeof customer.address === "string" ? customer.address : "", note: input.note, createdAt: now, updatedAt: now, stateVersion: 1, transactionalNotificationVersion: 1 };
       const eventId = notificationEventId(orderId, "order_created", 1);
       const event = { orderId, transition: "order_created", stateVersion: 1, status: "pending", createdAt: now };
       const providerDeletion = await getFirestoreSnapshot("account_deletion_requests", providerUid, accessToken);
       if (providerDeletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(providerDeletion.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Provider deletion is active", 409);
-      const ok = await phase4aCommit([{ update: phase4aDoc("offers", body.offerId, { lastOrderCreatedAt: now }), updateMask: { fieldPaths: ["lastOrderCreatedAt"] }, currentDocument: { updateTime: offerSnap.updateTime } }, { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } }, { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } }, { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash: JSON.stringify(input), createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } }, { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } }, auth.deletionFence, phase4aDeletionFence(providerUid, providerDeletion)], accessToken);
+      const ok = await phase4aCommit([{ update: phase4aDoc("offers", body.offerId, { lastOrderCreatedAt: now }), updateMask: { fieldPaths: ["lastOrderCreatedAt"] }, currentDocument: { updateTime: offerSnap.updateTime } }, { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + providerUid, currentDocument: { updateTime: offerProviderSnapshot.updateTime } }, { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } }, { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } }, { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash: JSON.stringify(input), createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } }, { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } }, auth.deletionFence, phase4aDeletionFence(providerUid, providerDeletion)], accessToken);
       if (!ok) { const retry = await getFirestoreDoc(idemPath, idemId, accessToken); if (retry && retry.intentHash === JSON.stringify(input)) { const replayOrder = await getFirestoreDoc("orders", retry.orderId, accessToken); return jsonResponse({ success: true, orderId: retry.orderId, order: replayOrder && { ...replayOrder, id: retry.orderId }, idempotent: true }); } return phase4aError("state_conflict", "Request conflicted; retry", 409); }
       return jsonResponse({ success: true, orderId, order });
     }
@@ -5161,7 +5262,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         publicProfileFromPrivateUser,
         classifyPublicProfileProjection,
         handleOrderContact,
-        handleOrderPaymentInstructions
+        handleOrderPaymentInstructions,
+        handlePublicRatings,
+        syncPublicProfile,
+        updatePublicDiscoveryLocation,
+        registerPrivateDevice,
+        setDriverAvailabilityAndSync,
+        publicRatingDto,
+        handlePhase4aOrderCreate
       };
     }
     addEventListener("scheduled", (event) => {
@@ -5311,6 +5419,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const profile = await getFirestoreDoc("users", uid, accessToken);
         return profile ? jsonResponse({ success: true, profile }) : phase4aError("NOT_FOUND", "Profile not found", 404);
       }
+      const publicRatingsMatch = path.match(/^\/profiles\/([A-Za-z0-9_-]{1,128})\/ratings$/);
+      if (publicRatingsMatch && request.method === "GET") {
+        try {
+          const kind = url.searchParams.get("kind");
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handlePublicRatings(publicRatingsMatch[1], kind, accessToken);
+        } catch (error) {
+          console.error("[PublicRatings] Error:", error && error.message ? error.message : error);
+          return phase4aError("RATINGS_UNAVAILABLE", "Public ratings are temporarily unavailable", 503);
+        }
+      }
       if (path === "/subscriptions/entitlement" && request.method === "GET") {
         const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
         const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
@@ -5350,9 +5469,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           await normalizeCommercialAccess(uid, user, entitlement, accessToken);
           return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
         }
-        await updateFirestoreDocument("users", uid, { isAvailable: body.isAvailable, ...commercialAccessFields(entitlement) }, accessToken);
-        await syncPublicProfileBestEffort(uid, accessToken);
-        return jsonResponse({ success: true, isAvailable: body.isAvailable, entitlement });
+        const updated = await setDriverAvailabilityAndSync(uid, body.isAvailable, accessToken);
+        if (updated.code === "account_deletion_blocked") return phase4aError("ACCOUNT_DELETION_BLOCKED", "Account deletion is in progress", 409);
+        if (updated.code === "subscription_required") return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
+        if (!updated.ok) return phase4aError("STATE_CONFLICT", "Driver availability changed; refresh and try again", 409);
+        return jsonResponse({ success: true, isAvailable: body.isAvailable, entitlement: updated.entitlement || entitlement });
       }
       if (path === "/deliveries/available" && request.method === "GET") {
         const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
@@ -6248,16 +6369,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "invalid_request", error: "Invalid Expo device token" }, 400);
           }
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          const deletion = await getFirestoreSnapshot("account_deletion_requests", callerUid, accessToken);
-          if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.data.status)) {
+          const registered = await registerPrivateDevice(callerUid, body.token, body.platform, accessToken);
+          if (!registered) {
             return jsonResponse({ success: false, code: "account_deletion_blocked", error: "Account deletion is in progress" }, 409);
           }
-          await updateFirestoreDocument("private_devices", callerUid, {
-            expoPushToken: body.token,
-            pushNotificationsEnabled: typeof body.token === "string",
-            platform: body.platform === "web" ? "web" : "native",
-            updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-          }, accessToken);
           return jsonResponse({ success: true });
         } catch (error) {
           console.error("[DeviceRegistration] Error:", error && error.message ? error.message : error);
@@ -6277,23 +6392,25 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "account_deletion_blocked", error: "Account deletion is in progress" }, 409);
           }
           if (body?.action === "sync") {
-            await syncPublicProfile(callerUid, user, accessToken);
+            const synced = await syncPublicProfile(callerUid, user, accessToken);
+            if (!synced) return jsonResponse({ success: false, code: "state_conflict", error: "Public profile changed; refresh and try again" }, 409);
             return jsonResponse({ success: true, published: !!user.discoveryLocation });
           }
+          let location;
           if (body?.publishDiscoveryLocation === true) {
             const loc = body.discoveryLocation;
             if (!loc || !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng) || loc.lat < -90 || loc.lat > 90 || loc.lng < -180 || loc.lng > 180) {
               return jsonResponse({ success: false, code: "invalid_request", error: "A valid discovery location is required to publish it" }, 400);
             }
-            user.discoveryLocation = { lat: loc.lat, lng: loc.lng };
-            await updateFirestoreDocument("users", callerUid, { discoveryLocation: user.discoveryLocation }, accessToken);
+            location = { lat: loc.lat, lng: loc.lng };
           } else if (body?.publishDiscoveryLocation === false) {
-            user.discoveryLocation = null;
-            await updateFirestoreDocument("users", callerUid, { discoveryLocation: null }, accessToken);
+            location = null;
           } else {
             return jsonResponse({ success: false, code: "invalid_request", error: "publishDiscoveryLocation must be boolean" }, 400);
           }
-          await syncPublicProfile(callerUid, user, accessToken);
+          const updated = await updatePublicDiscoveryLocation(callerUid, location, accessToken);
+          if (updated.code === "account_deletion_blocked") return jsonResponse({ success: false, code: "account_deletion_blocked", error: "Account deletion is in progress" }, 409);
+          if (!updated.ok) return jsonResponse({ success: false, code: updated.code === "invalid_profile" ? "invalid_profile" : "state_conflict", error: "Public profile changed; refresh and try again" }, updated.code === "invalid_profile" ? 400 : 409);
           return jsonResponse({ success: true, published: body.publishDiscoveryLocation === true });
         } catch (error) {
           console.error("[PublicProfile] Error:", error && error.message ? error.message : error);
@@ -6367,6 +6484,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             // changes the target after this read invalidates the final CAS.
             const targetSnap = await getFirestoreSnapshot("users", uid, accessToken);
             if (!targetSnap) return phase4aError("NOT_FOUND", "Rating target not found", 404);
+            if (targetSnap.data.role !== type) return phase4aError("FORBIDDEN", "Rating target role does not match", 403);
             const ratings = [];
             let ratingsPageToken = null;
             let ratingsPages = 0;

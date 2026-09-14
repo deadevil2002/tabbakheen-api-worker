@@ -98,6 +98,10 @@ global.fetch = async (url, init = {}) => {
     const documents = [...docs.entries()].filter(([path]) => path.startsWith("users/")).map(([path, record]) => firestoreDoc(path, record));
     return response({ documents });
   }
+  if (/^(provider_ratings|driver_ratings)\/[^/]+\/ratings$/.test(rawPath)) {
+    const documents = [...docs.entries()].filter(([path]) => path.startsWith(rawPath + "/")).map(([path, record]) => firestoreDoc(path, record));
+    return response({ documents });
+  }
   const existing = docs.get(rawPath);
   return existing ? response(firestoreDoc(rawPath, existing)) : response({ error: { status: "NOT_FOUND" } }, 404);
 };
@@ -338,6 +342,118 @@ const authorizedReq = (path, body, uid = "register-uid") => new Request("https:/
     uid: "provider-1", role: "provider", displayName: "Provider", photoUrl: "avatar",
     ratingAverage: 4.5, ratingCount: 2, verificationStatus: "unverified", updatedAt: profile.updatedAt
   });
+
+  // The controlled migration imports the exact Worker allowlist constructor,
+  // rather than maintaining a second copy that could leak a newly added field.
+  const migration = require("./scripts/migratePublicProfiles.js");
+  assert.strictEqual(migration.publicProfileFromPrivateUser, hooks.publicProfileFromPrivateUser);
+  // The migration's real transaction routine must replace stale content once
+  // and leave a correct projection intact on its second run.
+  const migrationDocs = new Map([
+    ["users/migrate-uid", { role: "provider", displayName: "Migrated" }],
+    ["public_profiles/migrate-uid", { uid: "migrate-uid", role: "provider", displayName: "Migrated", photoUrl: "", ratingAverage: 0, ratingCount: 0, verificationStatus: "unverified", stale: true, updatedAt: "old" }]
+  ]);
+  let migrationDeletes = 0, migrationSets = 0;
+  const migrationDb = {
+    collection: (collection) => ({ doc: (id) => ({ collection, id, key: collection + "/" + id }) }),
+    runTransaction: async (fn) => fn({
+      get: async (ref) => {
+        const data = migrationDocs.get(ref.key);
+        return { exists: !!data, data: () => data };
+      },
+      set: (ref, data) => { migrationSets++; migrationDocs.set(ref.key, data); },
+      delete: (ref) => { migrationDeletes++; migrationDocs.delete(ref.key); }
+    })
+  };
+  assert.equal(await migration.applyProjectionTransaction(migrationDb, "migrate-uid"), "replaced");
+  assert.equal(await migration.applyProjectionTransaction(migrationDb, "migrate-uid"), "unchanged");
+  assert.equal(migrationSets, 1);
+  assert.equal(migrationDeletes, 0);
+
+  // Projection writes replace (not merge) stale schema keys and are fenced by
+  // source/deletion versions, so neither delayed sync nor deletion can
+  // resurrect public identity.
+  reset();
+  put("users/projection-uid", { role: "provider", displayName: "  Public Name  ", phone: "+966500000009", ratingAverage: 9, ratingCount: -1 });
+  put("public_profiles/projection-uid", { uid: "projection-uid", stalePrivatePhone: "+966500000009", obsolete: true });
+  assert.equal(await hooks.syncPublicProfile("projection-uid", null, "token"), true);
+  assert.deepEqual(docs.get("public_profiles/projection-uid").data, {
+    uid: "projection-uid", role: "provider", displayName: "Public Name", photoUrl: "",
+    ratingAverage: 5, ratingCount: 0, verificationStatus: "unverified",
+    updatedAt: docs.get("public_profiles/projection-uid").data.updatedAt
+  });
+  global.__createDeletionBeforeNextCommit = "projection-uid";
+  assert.equal(await hooks.syncPublicProfile("projection-uid", null, "token"), false);
+  assert.equal(docs.has("public_profiles/projection-uid"), true);
+
+  // A deletion manifest appearing after registration/profile discovery/device
+  // reads invalidates the one atomic commit; no device or projection is added.
+  reset();
+  put("users/race-uid", { role: "provider", displayName: "Race" });
+  global.__createDeletionBeforeNextCommit = "race-uid";
+  assert.equal(await hooks.updatePublicDiscoveryLocation("race-uid", { lat: 24.7, lng: 46.6 }, "token").then((r) => r.ok), false);
+  assert.equal(docs.get("users/race-uid").data.discoveryLocation, undefined);
+  assert.equal(docs.has("public_profiles/race-uid"), false);
+  docs.delete("account_deletion_requests/race-uid");
+  global.__createDeletionBeforeNextCommit = "race-uid";
+  assert.equal(await hooks.registerPrivateDevice("race-uid", "ExponentPushToken[device-race]", "native", "token"), false);
+  assert.equal(docs.has("private_devices/race-uid"), false);
+
+  // Availability changes use the same atomic source/deletion/projection fence.
+  reset();
+  put("users/driver-race", {
+    role: "driver", displayName: "Driver", createdAt: "2025-12-01T00:00:00.000Z",
+    subscriptionStatus: "trialing", trialEndsAt: "2026-04-01T00:00:00.000Z", isAvailable: false
+  });
+  global.__createDeletionBeforeNextCommit = "driver-race";
+  assert.equal(await hooks.setDriverAvailabilityAndSync("driver-race", true, "token").then((r) => r.ok), false);
+  assert.equal(docs.get("users/driver-race").data.isAvailable, false);
+
+  // Contact and payment are role-, purpose-, and state-scoped. Uppercase
+  // persisted payment methods retain compatibility without broadening access.
+  reset();
+  put("orders/order-rules", { customerUid: "c", providerUid: "p", driverUid: "d", status: "accepted", deliveryStatus: "driver_assigned", paymentMethod: "STC_PAY" });
+  put("users/p", { role: "provider", paymentMethods: { stcPay: { enabled: true, phone: "+966500000003" } } });
+  put("users/d", { role: "driver", phone: "+966500000004" });
+  assert.equal((await hooks.handleOrderContact({ orderId: "order-rules", target: "provider", purpose: "contact" }, "p", "token")).status, 403);
+  assert.equal((await hooks.handleOrderContact({ orderId: "order-rules", target: "driver", purpose: "payment_instructions" }, "c", "token")).status, 400);
+  assert.deepEqual(await (await hooks.handleOrderPaymentInstructions({ orderId: "order-rules", purpose: "payment_instructions" }, "c", "token")).json(), { success: true, method: "stc_pay", stcPayPhone: "+966500000003" });
+  put("orders/order-rules", { customerUid: "c", providerUid: "p", status: "completed", paymentMethod: "STC_PAY" });
+  assert.equal((await hooks.handleOrderContact({ orderId: "order-rules", target: "provider", purpose: "contact" }, "c", "token")).status, 403);
+  assert.equal((await hooks.handleOrderPaymentInstructions({ orderId: "order-rules", purpose: "payment_instructions" }, "c", "token")).status, 403);
+
+  // Public ratings are a deliberately narrow projection: no raw document ID,
+  // customer UID, order ID, or arbitrary rating fields reach new consumers.
+  reset();
+  put("public_profiles/p", { uid: "p", role: "provider", displayName: "Provider" });
+  put("provider_ratings/p/ratings/order-secret", { stars: 5, comment: "Excellent", createdAt: "2026-01-01T00:00:00.000Z", customerUid: "customer-secret", orderId: "order-secret", internal: "nope" });
+  put("provider_ratings/p/ratings/invalid", { stars: 8, customerUid: "customer-secret" });
+  assert.deepEqual(await (await hooks.handlePublicRatings("p", "provider", "token")).json(), {
+    success: true, ratings: [{ stars: 5, comment: "Excellent", createdAt: "2026-01-01T00:00:00.000Z" }]
+  });
+
+  // Order creation normalizes legacy/uppercase client method names but rejects
+  // a destination method disabled by the selected provider before any order
+  // write. The provider snapshot is also verified in the final commit.
+  reset();
+  put("users/order-customer", { role: "customer", email: "user@example.test" });
+  put("users/order-provider", { role: "provider", displayName: "Provider", activatedByAdmin: true, paymentMethods: { bankTransfer: { enabled: false }, stcPay: { enabled: true } } });
+  put("offers/offer-payment", { providerUid: "order-provider", isAvailable: true, availabilityType: "immediate", title: "Meal", price: 25 });
+  privateResponse = await hooks.handlePhase4aOrderCreate(authorizedReq("/orders/create", { requestId: "payment-disabled", providerUid: "order-provider", offerId: "offer-payment", quantity: 1, paymentMethod: "BANK_TRANSFER" }, "order-customer"), baseEnv(), "token");
+  assert.equal((await privateResponse.json()).code, "PAYMENT_REJECTED");
+  assert.equal([...docs.keys()].some((key) => key.startsWith("orders/")), false);
+  privateResponse = await hooks.handlePhase4aOrderCreate(authorizedReq("/orders/create", { requestId: "payment-enabled", providerUid: "order-provider", offerId: "offer-payment", quantity: 1, paymentMethod: "stc_pay" }, "order-customer"), baseEnv(), "token");
+  payload = await privateResponse.json();
+  assert.equal(payload.success, true);
+  assert.equal(payload.order.paymentMethod, "STC_PAY");
+
+  // The legacy aggregate route cannot recompute a driver as a provider.
+  reset();
+  put("users/role-target", { role: "driver", ratingAverage: 4, ratingCount: 1 });
+  Object.assign(global, baseEnv());
+  privateResponse = await hooks.handleRequest(authorizedReq("/aggregate-rating", { type: "provider", uid: "role-target" }, "aggregate-customer"));
+  assert.equal(privateResponse.status, 403);
+  assert.equal(docs.get("users/role-target").data.ratingAverage, 4);
 
   console.log("phase5 phone auth real-handler tests: PASS");
 })().catch((error) => {
