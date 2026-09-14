@@ -1054,7 +1054,7 @@
       } else {
         if (!actor || actor.role !== "provider" || order.providerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Provider ownership required" }, 403);
         const providerEntitlement = evaluateSubscriptionEntitlement(actor);
-        if (!providerEntitlement.eligible) {
+        if (!isProviderAccountAllowed(actor)) {
           await normalizeCommercialAccess(uid, actor, providerEntitlement, accessToken);
           return jsonResponse({ success: false, code: "account_not_allowed", error: "Provider account is not active", entitlement: providerEntitlement }, 403);
         }
