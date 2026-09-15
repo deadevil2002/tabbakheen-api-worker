@@ -1231,7 +1231,12 @@
     // Order negotiation chat is deliberately Worker-only.  Clients have no
     // Firestore message reads/writes and every authorization decision is made
     // from the order snapshot, never request-supplied participant identifiers.
-    const ORDER_CHAT_WRITABLE_STATES = ["pending"];
+    // A provider retains custody until either (a) self-pickup is completed,
+    // which atomically writes status/deliveryStatus "delivered", or (b) the
+    // assigned driver records deliveryStatus "picked_up".  The legacy order
+    // states remain supported because they also precede that physical handoff.
+    const ORDER_CHAT_PROVIDER_CUSTODY_ORDER_STATES = ["pending", "accepted", "preparing", "ready_for_pickup", "searching_driver", "assigned_to_driver"];
+    const ORDER_CHAT_PRE_HANDOFF_DELIVERY_STATES = ["", "pending_driver", "ready_for_driver", "self_pickup_selected", "driver_assigned", "driver_rejected"];
     const ORDER_CHAT_RATE_WINDOW_MS = 60 * 1e3;
     const ORDER_CHAT_RATE_MAX = 5;
     function orderChatInput(body) {
@@ -1243,7 +1248,8 @@
       return { orderId: body.orderId, requestId: body.requestId, text };
     }
     function orderChatIsWritable(order) {
-      return !!order && ORDER_CHAT_WRITABLE_STATES.includes(order.status) && typeof order.customerUid === "string" && typeof order.providerUid === "string" && !!order.customerUid && !!order.providerUid;
+      const deliveryStatus = typeof order?.deliveryStatus === "string" ? order.deliveryStatus : "";
+      return !!order && ORDER_CHAT_PROVIDER_CUSTODY_ORDER_STATES.includes(order.status) && ORDER_CHAT_PRE_HANDOFF_DELIVERY_STATES.includes(deliveryStatus) && typeof order.customerUid === "string" && typeof order.providerUid === "string" && !!order.customerUid && !!order.providerUid;
     }
     function orderChatRateId(orderId, uid) {
       return orderId + "_" + uid;

@@ -591,9 +591,9 @@ function assertThreeCalendarMonthTrial(profile) {
   assert.equal(privateResponse.status, 403);
   assert.equal(docs.get("users/role-target").data.ratingAverage, 4);
 
-  // Pre-decision chat is server-authoritative: participants and canonical
-  // pending state are required, unknown payload fields are rejected, controls
-  // are removed before the immutable message write, and retry uses requestId.
+  // Order chat is server-authoritative: participants and canonical custody
+  // states are required, unknown payload fields are rejected, controls are
+  // removed before the immutable message write, and retry uses requestId.
   reset();
   put("users/chat-customer", { role: "customer" });
   put("users/chat-provider", { role: "provider", activatedByAdmin: true });
@@ -638,11 +638,80 @@ function assertThreeCalendarMonthTrial(profile) {
   assert.equal(privateResponse.status, 400);
   privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "unicode-limit", text: "\u{1F600}".repeat(501) }, "chat-customer"), baseEnv(), "token");
   assert.equal(privateResponse.status, 400);
-  put("orders/chat-order", { customerUid: "chat-customer", providerUid: "chat-provider", status: "accepted" });
-  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "message-1", text: "مرحبا" }, "chat-customer"), baseEnv(), "token");
-  assert.equal((await privateResponse.json()).idempotent, true);
-  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-order", requestId: "after-decision", text: "no" }, "chat-customer"), baseEnv(), "token");
+  // The write window follows provider custody, not the acceptance decision.
+  // These are all pre-handoff canonical/legacy-compatible states. Exercise
+  // the real send handler and both permitted participant roles.
+  const writableChatStates = [
+    ["pending", undefined, undefined, "chat-customer"],
+    ["accepted", undefined, undefined, "chat-provider"],
+    ["preparing", undefined, undefined, "chat-customer"],
+    ["ready_for_pickup", undefined, undefined, "chat-provider"],
+    ["ready_for_pickup", "self_pickup_selected", "self_pickup", "chat-customer"],
+    ["ready_for_pickup", "ready_for_driver", "driver", "chat-provider"],
+    ["ready_for_pickup", "driver_assigned", "driver", "chat-customer"],
+    ["searching_driver", "pending_driver", "driver", "chat-provider"],
+    ["assigned_to_driver", "driver_assigned", "driver", "chat-customer"],
+  ];
+  for (const [index, [status, deliveryStatus, deliveryMethod, senderUid]] of writableChatStates.entries()) {
+    reset();
+    put("users/chat-customer", { role: "customer" });
+    put("users/chat-provider", { role: "provider", activatedByAdmin: true });
+    const order = { customerUid: "chat-customer", providerUid: "chat-provider", status };
+    if (deliveryStatus) order.deliveryStatus = deliveryStatus;
+    if (deliveryMethod) order.deliveryMethod = deliveryMethod;
+    put(`orders/chat-custody-${index}`, order);
+    privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: `chat-custody-${index}`, requestId: `custody-${index}`, text: "still held by provider" }, senderUid), baseEnv(), "token");
+    assert.equal(privateResponse.status, 200, `${status}/${deliveryStatus || "no delivery status"} remains writable before handoff`);
+  }
+
+  // These statuses are terminal or strictly after provider custody. In
+  // particular, self-pickup closes at delivered and driver delivery closes at
+  // picked_up, rather than at later arrival/customer-confirmation stages.
+  const readOnlyChatStates = [
+    ["rejected", undefined, undefined],
+    ["cancelled", undefined, undefined],
+    ["delivered", "delivered", "self_pickup"],
+    ["completed", undefined, undefined],
+    ["ready_for_pickup", "picked_up", "driver"],
+    ["ready_for_pickup", "in_transit", "driver"],
+    ["ready_for_pickup", "arrived", "driver"],
+    ["ready_for_pickup", "delivered_pending_confirmation", "driver"],
+    ["ready_for_pickup", "delivered", "driver"],
+    ["ready_for_pickup", "cancelled", "driver"],
+    ["picked_up", "picked_up", "driver"],
+  ];
+  for (const [index, [status, deliveryStatus, deliveryMethod]] of readOnlyChatStates.entries()) {
+    reset();
+    put("users/chat-customer", { role: "customer" });
+    put("users/chat-provider", { role: "provider", activatedByAdmin: true });
+    const order = { customerUid: "chat-customer", providerUid: "chat-provider", status };
+    if (deliveryStatus) order.deliveryStatus = deliveryStatus;
+    if (deliveryMethod) order.deliveryMethod = deliveryMethod;
+    put(`orders/chat-closed-${index}`, order);
+    privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: `chat-closed-${index}`, requestId: `closed-${index}`, text: "after handoff" }, "chat-customer"), baseEnv(), "token");
+    assert.equal(privateResponse.status, 403, `${status}/${deliveryStatus || "no delivery status"} is read-only`);
+  }
+
+  // Closure removes only the composer: participants retain immutable history.
+  reset();
+  put("users/chat-customer", { role: "customer" });
+  put("users/chat-provider", { role: "provider", activatedByAdmin: true });
+  put("users/chat-driver", { role: "driver" });
+  put("users/chat-unrelated", { role: "customer" });
+  put("orders/chat-handoff-history", { customerUid: "chat-customer", providerUid: "chat-provider", status: "ready_for_pickup", deliveryStatus: "driver_assigned" });
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-handoff-history", requestId: "before-handoff", text: "driver is on the way" }, "chat-provider"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 200);
+  put("orders/chat-handoff-history", { customerUid: "chat-customer", providerUid: "chat-provider", status: "ready_for_pickup", deliveryStatus: "picked_up" });
+  privateResponse = await hooks.handleOrderChatList(authorizedGet("/orders/chat-handoff-history/chat?limit=30", "chat-customer"), "token", "chat-handoff-history");
+  payload = await privateResponse.json();
+  assert.equal(payload.writable, false);
+  assert.equal(payload.messages.length, 1);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-handoff-history", requestId: "after-handoff", text: "closed" }, "chat-customer"), baseEnv(), "token");
   assert.equal(privateResponse.status, 403);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "chat-handoff-history", requestId: "unrelated", text: "no access" }, "chat-unrelated"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 403);
+  privateResponse = await hooks.handleOrderChatSend(authorizedReq("/orders/chat/send", { orderId: "missing-chat-order", requestId: "missing-order", text: "not found" }, "chat-customer"), baseEnv(), "token");
+  assert.equal(privateResponse.status, 404);
 
   // The per-user/order limiter persists in Firestore and a report is visible
   // only through the authenticated complaint/admin path.
