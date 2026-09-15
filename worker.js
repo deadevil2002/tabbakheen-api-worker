@@ -6817,6 +6817,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               order_preparing: callerUid === authOrder.providerUid && authOrder.status === "preparing",
               order_ready: callerUid === authOrder.providerUid && authOrder.status === "ready_for_pickup",
               customer_cancelled: callerUid === authOrder.customerUid && authOrder.status === "cancelled" && authOrder.cancelledBy === "customer",
+              order_cancelled: (callerUid === authOrder.customerUid || callerUid === authOrder.providerUid) && authOrder.status === "cancelled",
               self_pickup_selected: callerUid === authOrder.customerUid && authOrder.deliveryMethod === "self_pickup" && authOrder.deliveryStatus === "self_pickup_selected",
               self_pickup_completed: (callerUid === authOrder.customerUid || callerUid === authOrder.providerUid) && authOrder.deliveryMethod === "self_pickup" && authOrder.deliveryStatus === "delivered",
               driver_delivery_requested: callerUid === authOrder.customerUid && isDriverDeliveryMethod(authOrder.deliveryMethod) && authOrder.deliveryStatus === "ready_for_driver",
