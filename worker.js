@@ -3295,6 +3295,84 @@
     }
     __name(pdfEscape, "pdfEscape");
     __name2(pdfEscape, "pdfEscape");
+    function escapeHtml(value) {
+      return (value == null ? "" : String(value)).replace(/[&<>"']/g, (character) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      })[character]);
+    }
+    __name(escapeHtml, "escapeHtml");
+    __name2(escapeHtml, "escapeHtml");
+    var INVOICE_TEXT_LIMITS = {
+      userName: 200,
+      userEmail: 320,
+      userPhone: 64,
+      subscriptionPlan: 200,
+      description: 500,
+      period: 200,
+      paymentMethod: 100,
+      paymentMethodLabel: 100,
+      notes: 2e3,
+      invoiceNumber: 100,
+      currency: 16,
+      startDate: 64,
+      endDate: 64,
+      createdAt: 64,
+      userId: 256
+    };
+    function validateInvoicePayload(payload) {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Invalid invoice payload");
+      }
+      const invoice = {};
+      for (const [field, maxLength] of Object.entries(INVOICE_TEXT_LIMITS)) {
+        if (!Object.prototype.hasOwnProperty.call(payload, field)) continue;
+        const value = payload[field];
+        if (typeof value !== "string" || value.length > maxLength) {
+          throw new Error(`Invalid invoice ${field}`);
+        }
+        invoice[field] = value;
+      }
+      if (Object.prototype.hasOwnProperty.call(payload, "amount")) {
+        if (typeof payload.amount !== "number" || !Number.isFinite(payload.amount)) {
+          throw new Error("Invalid invoice amount");
+        }
+        invoice.amount = payload.amount;
+      }
+      return invoice;
+    }
+    __name(validateInvoicePayload, "validateInvoicePayload");
+    __name2(validateInvoicePayload, "validateInvoicePayload");
+    function createCspNonce() {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      return btoa(String.fromCharCode(...bytes));
+    }
+    __name(createCspNonce, "createCspNonce");
+    __name2(createCspNonce, "createCspNonce");
+    function htmlSecurityHeaders(contentSecurityPolicy) {
+      return {
+        "Content-Type": "text/html;charset=UTF-8",
+        "Content-Security-Policy": contentSecurityPolicy,
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "X-Frame-Options": "DENY"
+      };
+    }
+    __name(htmlSecurityHeaders, "htmlSecurityHeaders");
+    __name2(htmlSecurityHeaders, "htmlSecurityHeaders");
+    function adminContentSecurityPolicy() {
+      return "base-uri 'self'; object-src 'none'; frame-ancestors 'none'";
+    }
+    __name(adminContentSecurityPolicy, "adminContentSecurityPolicy");
+    __name2(adminContentSecurityPolicy, "adminContentSecurityPolicy");
+    function invoiceContentSecurityPolicy(nonce) {
+      return "default-src 'none'; img-src https:; style-src 'unsafe-inline'; script-src 'nonce-" + nonce + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    }
+    __name(invoiceContentSecurityPolicy, "invoiceContentSecurityPolicy");
+    __name2(invoiceContentSecurityPolicy, "invoiceContentSecurityPolicy");
     var LOGO_URL = "https://pub-e001eb4506b145aa938b5d3badbff6a5.r2.dev/attachments/mp58h8z5x4szfl3c5f7xm";
     function generatePDFBytes(invoice, lang) {
       const isAr = lang === "ar";
@@ -3529,9 +3607,10 @@ endobj
     }
     __name(generatePDFBytes, "generatePDFBytes");
     __name2(generatePDFBytes, "generatePDFBytes");
-    function generateInvoiceHTML(invoice, lang) {
+    function generateInvoiceHTML(invoice, lang, nonce = "") {
       const isAr = lang === "ar";
       const dir = isAr ? "rtl" : "ltr";
+      const safeLang = isAr ? "ar" : "en";
       const biz = {
         name: "\u0645\u0624\u0633\u0633\u0629 \u0633\u0627\u0644\u0645 \u0628\u0646 \u0639\u0644\u064A \u0627\u0644\u0646\u0639\u064A\u0645\u064A",
         nameEn: "Salem Bin Ali Al-Nuaimi Est.",
@@ -3547,9 +3626,19 @@ endobj
         country: "\u0627\u0644\u0645\u0645\u0644\u0643\u0629 \u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u0627\u0644\u0633\u0639\u0648\u062F\u064A\u0629",
         countryEn: "Kingdom of Saudi Arabia"
       };
-      const invoiceNum = invoice.invoiceNumber || "N/A";
+      const invoiceNum = escapeHtml(invoice.invoiceNumber || "N/A");
       const created = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "N/A";
-      return `<!DOCTYPE html><html dir="${dir}" lang="${lang}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629" : "Invoice"} ${invoiceNum}</title><style>
+      const userName = escapeHtml(invoice.userName || "N/A");
+      const userEmail = escapeHtml(invoice.userEmail || "");
+      const userPhone = escapeHtml(invoice.userPhone || "");
+      const subscriptionPlan = escapeHtml(invoice.subscriptionPlan || "Basic");
+      const startDate = escapeHtml(invoice.startDate || "");
+      const endDate = escapeHtml(invoice.endDate || "");
+      const amount = escapeHtml(invoice.amount || 0);
+      const currency = escapeHtml(invoice.currency || "SAR");
+      const paymentMethod = escapeHtml(invoice.paymentMethod || "");
+      const notes = escapeHtml(invoice.notes || "");
+      return `<!DOCTYPE html><html dir="${dir}" lang="${safeLang}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629" : "Invoice"} ${invoiceNum}</title><style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:#f0f0f0;color:#1a1a2e}
 .invoice{max-width:800px;margin:0 auto;background:#fff;border-radius:12px;overflow:visible;box-shadow:0 4px 24px rgba(0,0,0,.12)}
@@ -3606,23 +3695,23 @@ td{padding:12px 16px;border-bottom:1px solid #f1f5f9;font-size:14px}
 </div>
 <div class="detail-box">
 <h3>${isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629 \u0625\u0644\u0649" : "INVOICE TO"}</h3>
-<p class="name">${invoice.userName || "N/A"}</p>
-${invoice.userEmail ? "<p>" + invoice.userEmail + "</p>" : ""}
-${invoice.userPhone ? "<p>" + invoice.userPhone + "</p>" : ""}
+<p class="name">${userName}</p>
+${invoice.userEmail ? "<p>" + userEmail + "</p>" : ""}
+${invoice.userPhone ? "<p>" + userPhone + "</p>" : ""}
 </div></div>
 <table><thead><tr>
 <th>${isAr ? "\u0627\u0644\u0628\u064A\u0627\u0646" : "Description"}</th>
 <th>${isAr ? "\u0627\u0644\u0641\u062A\u0631\u0629" : "Period"}</th>
 <th>${isAr ? "\u0627\u0644\u0645\u0628\u0644\u063A" : "Amount"}</th>
 </tr></thead><tbody>
-<tr><td>${isAr ? "\u0627\u0634\u062A\u0631\u0627\u0643" : "Subscription"} - ${invoice.subscriptionPlan || "Basic"}</td>
-<td>${invoice.startDate || ""} - ${invoice.endDate || ""}</td>
-<td>${invoice.amount || 0} ${invoice.currency || "SAR"}</td></tr>
+<tr><td>${isAr ? "\u0627\u0634\u062A\u0631\u0627\u0643" : "Subscription"} - ${subscriptionPlan}</td>
+<td>${startDate} - ${endDate}</td>
+<td>${amount} ${currency}</td></tr>
 <tr class="total-row"><td colspan="2">${isAr ? "\u0627\u0644\u0625\u062C\u0645\u0627\u0644\u064A" : "Total"}</td>
-<td>${invoice.amount || 0} ${invoice.currency || "SAR"}</td></tr>
+<td>${amount} ${currency}</td></tr>
 </tbody></table>
-${invoice.paymentMethod ? '<div class="meta-info"><strong>' + (isAr ? "\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639" : "Payment Method") + ":</strong> " + invoice.paymentMethod + "</div>" : ""}
-${invoice.notes ? '<div class="meta-info"><strong>' + (isAr ? "\u0645\u0644\u0627\u062D\u0638\u0627\u062A" : "Notes") + ":</strong> " + invoice.notes + "</div>" : ""}
+${paymentMethod ? '<div class="meta-info"><strong>' + (isAr ? "\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639" : "Payment Method") + ":</strong> " + paymentMethod + "</div>" : ""}
+${notes ? '<div class="meta-info"><strong>' + (isAr ? "\u0645\u0644\u0627\u062D\u0638\u0627\u062A" : "Notes") + ":</strong> " + notes + "</div>" : ""}
 <div class="bilingual">
 <h4>${isAr ? "\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u0645\u0624\u0633\u0633\u0629" : "Business Details (Arabic)"}</h4>
 <p><strong>${biz.name}</strong></p>
@@ -3638,9 +3727,10 @@ ${invoice.notes ? '<div class="meta-info"><strong>' + (isAr ? "\u0645\u0644\u062
 </div>
 </div>
 <div class="actions">
-<button class="btn btn-primary" onclick="window.print()">${isAr ? "\u0637\u0628\u0627\u0639\u0629 / \u062D\u0641\u0638 PDF" : "Print / Save as PDF"}</button>
-<button class="btn btn-secondary" onclick="window.close()">${isAr ? "\u0625\u063A\u0644\u0627\u0642" : "Close"}</button>
+<button class="btn btn-primary" id="invoice-print">${isAr ? "\u0637\u0628\u0627\u0639\u0629 / \u062D\u0641\u0638 PDF" : "Print / Save as PDF"}</button>
+<button class="btn btn-secondary" id="invoice-close">${isAr ? "\u0625\u063A\u0644\u0627\u0642" : "Close"}</button>
 </div>
+<script nonce="${nonce}">document.getElementById("invoice-print").addEventListener("click",function(){window.print();});document.getElementById("invoice-close").addEventListener("click",function(){window.close();});</script>
 </body></html>`;
     }
     __name(generateInvoiceHTML, "generateInvoiceHTML");
@@ -3659,8 +3749,18 @@ ${invoice.notes ? '<div class="meta-info"><strong>' + (isAr ? "\u0645\u0644\u062
         countryEn: "Kingdom of Saudi Arabia"
       };
       const dir = isAr ? "rtl" : "ltr";
-      const invoiceNum = invoice.invoiceNumber || "";
+      const invoiceNum = escapeHtml(invoice.invoiceNumber || "");
       const created = invoice.createdAt ? new Date(invoice.createdAt).toLocaleDateString(isAr ? "ar-SA" : "en-US") : "";
+      const userName = escapeHtml(invoice.userName || "");
+      const userEmail = escapeHtml(invoice.userEmail || "");
+      const userPhone = escapeHtml(invoice.userPhone || "");
+      const subscriptionPlan = escapeHtml(invoice.subscriptionPlan || "Basic");
+      const startDate = escapeHtml(invoice.startDate || "");
+      const endDate = escapeHtml(invoice.endDate || "");
+      const amount = escapeHtml(invoice.amount || 0);
+      const currency = escapeHtml(invoice.currency || "SAR");
+      const paymentMethod = escapeHtml(invoice.paymentMethod || "");
+      const notes = escapeHtml(invoice.notes || "");
       return `<div dir="${dir}" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;background:#f0f0f0;padding:20px">
 <div style="background:#fff;border-radius:12px;overflow:visible">
 <div style="background:#e8722a;padding:30px 30px 55px;border-radius:12px 12px 0 0;position:relative;text-align:center">
@@ -3694,18 +3794,18 @@ ${invoice.notes ? '<div class="meta-info"><strong>' + (isAr ? "\u0645\u0644\u062
 <td style="width:4%"></td>
 <td style="width:48%;vertical-align:top;background:#f8fafc;border-radius:10px;padding:16px;border:1px solid #e8ecf0">
 <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#e8722a;font-weight:700;margin-bottom:8px">${isAr ? "\u0641\u0627\u062A\u0648\u0631\u0629 \u0625\u0644\u0649" : "INVOICE TO"}</div>
-<div style="font-size:13px;font-weight:700;color:#222;margin-bottom:3px">${invoice.userName || ""}</div>
-${invoice.userEmail ? '<div style="font-size:12px;color:#555">' + invoice.userEmail + "</div>" : ""}
-${invoice.userPhone ? '<div style="font-size:12px;color:#555">' + invoice.userPhone + "</div>" : ""}
+<div style="font-size:13px;font-weight:700;color:#222;margin-bottom:3px">${userName}</div>
+${invoice.userEmail ? '<div style="font-size:12px;color:#555">' + userEmail + "</div>" : ""}
+${invoice.userPhone ? '<div style="font-size:12px;color:#555">' + userPhone + "</div>" : ""}
 </td>
 </tr></table>
 <table style="width:100%;border-collapse:collapse;margin:16px 0">
 <tr style="background:#f1f5f9"><th style="padding:10px 14px;text-align:${isAr ? "right" : "left"};font-size:11px;color:#555;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid #e2e8f0">${isAr ? "\u0627\u0644\u0628\u064A\u0627\u0646" : "Description"}</th><th style="padding:10px 14px;text-align:${isAr ? "right" : "left"};font-size:11px;color:#555;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid #e2e8f0">${isAr ? "\u0627\u0644\u0641\u062A\u0631\u0629" : "Period"}</th><th style="padding:10px 14px;text-align:${isAr ? "right" : "left"};font-size:11px;color:#555;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid #e2e8f0">${isAr ? "\u0627\u0644\u0645\u0628\u0644\u063A" : "Amount"}</th></tr>
-<tr><td style="padding:12px 14px;font-size:13px;border-bottom:1px solid #f1f5f9">${isAr ? "\u0627\u0634\u062A\u0631\u0627\u0643" : "Subscription"} - ${invoice.subscriptionPlan || "Basic"}</td><td style="padding:12px 14px;font-size:13px;border-bottom:1px solid #f1f5f9">${invoice.startDate || ""} - ${invoice.endDate || ""}</td><td style="padding:12px 14px;font-size:13px;border-bottom:1px solid #f1f5f9">${invoice.amount || 0} ${invoice.currency || "SAR"}</td></tr>
-<tr style="background:#fff8f0"><td colspan="2" style="padding:12px 14px;font-size:14px;font-weight:700;border-top:2px solid #e8722a;color:#333">${isAr ? "\u0627\u0644\u0625\u062C\u0645\u0627\u0644\u064A" : "Total"}</td><td style="padding:12px 14px;font-size:15px;font-weight:700;border-top:2px solid #e8722a;color:#e8722a">${invoice.amount || 0} ${invoice.currency || "SAR"}</td></tr>
+<tr><td style="padding:12px 14px;font-size:13px;border-bottom:1px solid #f1f5f9">${isAr ? "\u0627\u0634\u062A\u0631\u0627\u0643" : "Subscription"} - ${subscriptionPlan}</td><td style="padding:12px 14px;font-size:13px;border-bottom:1px solid #f1f5f9">${startDate} - ${endDate}</td><td style="padding:12px 14px;font-size:13px;border-bottom:1px solid #f1f5f9">${amount} ${currency}</td></tr>
+<tr style="background:#fff8f0"><td colspan="2" style="padding:12px 14px;font-size:14px;font-weight:700;border-top:2px solid #e8722a;color:#333">${isAr ? "\u0627\u0644\u0625\u062C\u0645\u0627\u0644\u064A" : "Total"}</td><td style="padding:12px 14px;font-size:15px;font-weight:700;border-top:2px solid #e8722a;color:#e8722a">${amount} ${currency}</td></tr>
 </table>
-${invoice.paymentMethod ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>' + (isAr ? "\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639" : "Payment Method") + ":</strong> " + invoice.paymentMethod + "</div>" : ""}
-${invoice.notes ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>' + (isAr ? "\u0645\u0644\u0627\u062D\u0638\u0627\u062A" : "Notes") + ":</strong> " + invoice.notes + "</div>" : ""}
+${paymentMethod ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>' + (isAr ? "\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639" : "Payment Method") + ":</strong> " + paymentMethod + "</div>" : ""}
+${notes ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>' + (isAr ? "\u0645\u0644\u0627\u062D\u0638\u0627\u062A" : "Notes") + ":</strong> " + notes + "</div>" : ""}
 </div>
 <div style="padding:16px 30px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:11px;color:#888;text-align:center;border-radius:0 0 12px 12px">
 <p style="margin:2px 0"><strong>${isAr ? biz.name : biz.nameEn}</strong></p>
@@ -3976,6 +4076,8 @@ html[dir="rtl"] .drill-close{float:left}
 <div id="toast" class="toast"></div>
 
 <script>
+function escapeHtml(value){return (value==null?"":String(value)).replace(/[&<>"']/g,function(character){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[character];});}
+function esc(s){return escapeHtml(s);}
 var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",verification:"\u0627\u0644\u062A\u0648\u062B\u064A\u0642",crVerifications:"\u062A\u0648\u062B\u064A\u0642 \u0627\u0644\u0633\u062C\u0644 \u0627\u0644\u062A\u062C\u0627\u0631\u064A",freelanceRequests:"\u0637\u0644\u0628\u0627\u062A \u0634\u0647\u0627\u062F\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u062D\u0631",certNumber:"\u0631\u0642\u0645 \u0627\u0644\u0634\u0647\u0627\u062F\u0629",submittedAt:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u062A\u0642\u062F\u064A\u0645",reviewStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",approve:"\u0627\u0639\u062A\u0645\u0627\u062F",reject:"\u0631\u0641\u0636",pendingReview:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",verifiedStatus:"\u0645\u0648\u062B\u0651\u0642",unverifiedStatus:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",notVerified:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",viewDocument:"\u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0648\u062B\u064A\u0642\u0629",viewImage:"\u0639\u0631\u0636 \u0627\u0644\u0635\u0648\u0631\u0629",rejectReason:"\u0633\u0628\u0628 \u0627\u0644\u0631\u0641\u0636 (\u062F\u0627\u062E\u0644\u064A)",verificationApproved:"\u062A\u0645 \u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062A\u0648\u062B\u064A\u0642",verificationRejected:"\u062A\u0645 \u0631\u0641\u0636 \u0627\u0644\u062A\u0648\u062B\u064A\u0642",notifyCrVerification:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0648\u062B\u064A\u0642 \u0633\u062C\u0644 \u062A\u062C\u0627\u0631\u064A \u062C\u062F\u064A\u062F",notifyFreelanceRequest:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u0637\u0644\u0628 \u0634\u0647\u0627\u062F\u0629 \u0639\u0645\u0644 \u062D\u0631 \u062C\u062F\u064A\u062F",noVerificationData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u0648\u062B\u064A\u0642",source:"\u0627\u0644\u0645\u0635\u062F\u0631",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",notifications:"\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastTitle:"\u0639\u0646\u0648\u0627\u0646 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastMessage:"\u0646\u0635 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastAudience:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u0633\u062A\u0647\u062F\u0641",audienceCustomers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",audienceProviders:"\u0645\u0642\u062F\u0645\u0648 \u0627\u0644\u062E\u062F\u0645\u0629",audienceDrivers:"\u0645\u0646\u0627\u062F\u064A\u0628 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",audienceAll:"\u0627\u0644\u0643\u0644",broadcastSend:"\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastHistory:"\u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastConfirm:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastConfirmMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u062C\u0645\u064A\u0639 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0645\u062D\u062F\u062F\u064A\u0646.",broadcastResult:"\u0646\u062A\u064A\u062C\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastMatched:"\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0645\u0637\u0627\u0628\u0642\u0648\u0646",broadcastTokens:"\u0631\u0645\u0648\u0632 \u0635\u0627\u0644\u062D\u0629",broadcastSentCount:"\u062A\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastFailed:"\u0641\u0634\u0644 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",noBroadcastHistory:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0633\u062C\u0644 \u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastAudienceLabel:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631",deleteNotif:"\u062D\u0630\u0641",resendNotif:"\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResend:"\u062A\u0639\u062F\u064A\u0644 \u0648\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResendSend:"\u0625\u0631\u0633\u0627\u0644 \u0646\u0633\u062E\u0629 \u0645\u0639\u062F\u0644\u0629",confirmDelete:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u062D\u0630\u0641",confirmDeleteMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u062D\u0630\u0641 \u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0641\u0642\u0637 \u062F\u0648\u0646 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0631\u0633\u0644\u0629.",confirmResend:"\u062A\u0623\u0643\u064A\u062F \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",confirmResendMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u062D\u062F\u062F.",notifDeleted:"\u062A\u0645 \u062D\u0630\u0641 \u0627\u0644\u0633\u062C\u0644",deleteFailed:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0630\u0641",resendSuccess:"\u062A\u0645\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",resendFailed:"\u0641\u0634\u0644\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",providerSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0632\u0648\u062F \u0627\u0644\u062E\u062F\u0645\u0629",driverSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0633\u0627\u0626\u0642",subActive:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0641\u0639\u0651\u0644",subPrice:"\u0633\u0639\u0631 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 (SAR)",subPeriod:"\u0641\u062A\u0631\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",periodWeekly:"\u0623\u0633\u0628\u0648\u0639\u064A",periodMonthly:"\u0634\u0647\u0631\u064A",periodQuarterly:"\u0631\u0628\u0639 \u0633\u0646\u0648\u064A",periodYearly:"\u0633\u0646\u0648\u064A",freeTrialEnabledLabel:"\u0627\u0644\u062A\u062C\u0631\u0628\u0629 \u0627\u0644\u0645\u062C\u0627\u0646\u064A\u0629 \u0645\u0641\u0639\u0651\u0644\u0629",freeTrialTextArLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0639\u0631\u0628\u064A)",freeTrialTextEnLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0625\u0646\u062C\u0644\u064A\u0632\u064A)"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",verification:"Verification",crVerifications:"CR Verification",freelanceRequests:"Freelance Certificate Requests",certNumber:"Certificate #",submittedAt:"Submitted At",reviewStatus:"Review Status",approve:"Approve",reject:"Reject",pendingReview:"Pending Review",verifiedStatus:"Verified",unverifiedStatus:"Unverified",notVerified:"Not Verified",viewDocument:"Verify Document",viewImage:"View Image",rejectReason:"Reject reason (internal)",verificationApproved:"Verification approved",verificationRejected:"Verification rejected",notifyCrVerification:"Notify on new CR verification",notifyFreelanceRequest:"Notify on new freelance request",noVerificationData:"No verification data",source:"Source",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices",notifications:"Notifications",broadcastTitle:"Notification Title",broadcastMessage:"Message",broadcastAudience:"Target Audience",audienceCustomers:"Customers",audienceProviders:"Providers",audienceDrivers:"Drivers",audienceAll:"All",broadcastSend:"Send Notification",broadcastHistory:"Notification History",broadcastConfirm:"Confirm Send",broadcastConfirmMsg:"Are you sure? This notification will be sent to all targeted users.",broadcastResult:"Send Result",broadcastMatched:"Users Matched",broadcastTokens:"Valid Tokens",broadcastSentCount:"Sent",broadcastFailed:"Failed",noBroadcastHistory:"No notification history",broadcastAudienceLabel:"Audience",deleteNotif:"Delete",resendNotif:"Resend",editResend:"Edit & Resend",editResendSend:"Send Edited Copy",confirmDelete:"Confirm Delete",confirmDeleteMsg:"Are you sure? Only the history record will be deleted. Sent notifications are not recalled.",confirmResend:"Confirm Resend",confirmResendMsg:"Are you sure? This notification will be resent to the targeted audience.",notifDeleted:"Record deleted",deleteFailed:"Delete failed",resendSuccess:"Resend successful",resendFailed:"Resend failed",providerSubSettings:"Provider Subscription Settings",driverSubSettings:"Driver Subscription Settings",subActive:"Subscription Active",subPrice:"Subscription Price (SAR)",subPeriod:"Subscription Period",periodWeekly:"Weekly",periodMonthly:"Monthly",periodQuarterly:"Quarterly",periodYearly:"Yearly",freeTrialEnabledLabel:"Free Trial Enabled",freeTrialTextArLabel:"Free Trial Text (Arabic)",freeTrialTextEnLabel:"Free Trial Text (English)"}};
 var lang=localStorage.getItem("tbk_admin_lang")||"ar";
 function t(k){return(T[lang]&&T[lang][k])||T.en[k]||k;}
@@ -4084,22 +4186,20 @@ function navigate(page){
 function toast(msg,type){type=type||"success";var el=document.getElementById("toast");el.textContent=msg;el.className="toast show "+type;setTimeout(function(){el.className="toast";},3000);}
 function closeModal(){document.getElementById("modal-overlay").classList.remove("show");}
 function openModal(html){document.getElementById("modal-content").innerHTML=html;document.getElementById("modal-overlay").classList.add("show");}
-function esc(s){if(!s)return"";var d=document.createElement("div");d.textContent=s;return d.innerHTML;}
-
 function roleBadge(role){
   var m={customer:"blue",provider:"orange",driver:"purple"};
   var l={customer:t("customer"),provider:t("provider"),driver:t("driver")};
-  return '<span class="badge badge-'+(m[role]||"gray")+'">'+( l[role]||role)+'</span>';
+  return '<span class="badge badge-'+(m[role]||"gray")+'">'+esc(l[role]||role)+'</span>';
 }
 function statusBadge(status){
   var m={active:"green",trial:"yellow",suspended:"yellow",disabled:"red"};
   var l={active:t("active"),trial:t("trial"),suspended:t("suspend"),disabled:t("disabled")};
-  return '<span class="badge badge-'+(m[status]||"gray")+'">'+( l[status]||status||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||status||t("na"))+'</span>';
 }
 function subBadge(status){
   var m={active:"green",trialing:"blue",expired:"red",canceled:"gray",past_due:"yellow"};
   var l={active:t("active"),trialing:t("trialing"),expired:t("expired"),canceled:t("canceledSub"),past_due:t("pastDue")};
-  return '<span class="badge badge-'+(m[status]||"gray")+'">'+( l[status]||status||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||status||t("na"))+'</span>';
 }
 
 function getSubDaysRemaining(u){
@@ -4122,12 +4222,12 @@ function subStatusLabel(u){
 function verifBadge(s){
   var m={verified:"green",pending_review:"yellow",unverified:"red",none:"gray"};
   var l={verified:t("verifiedStatus"),pending_review:t("pendingReview"),unverified:t("unverifiedStatus"),none:t("notVerified")};
-  return '<span class="badge badge-'+(m[s]||"gray")+'">'+(l[s]||s||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||s||t("na"))+'</span>';
 }
 function flReviewBadge(s){
   var m={approved:"green",pending:"yellow",pending_review:"yellow",rejected:"red"};
   var l={approved:t("verifiedStatus"),pending:t("pendingReview"),pending_review:t("pendingReview"),rejected:t("unverifiedStatus")};
-  return '<span class="badge badge-'+(m[s]||"gray")+'">'+(l[s]||s||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||s||t("na"))+'</span>';
 }
 function complaintStatusBadge(status){
   var m={pending:"yellow",resolved:"green",closed:"gray"};
@@ -4254,7 +4354,7 @@ async function renderVerification(c){
     var img=fc.fileUrl||"";
     var rs=fc.reviewStatus||"pending";
     var imgBtn=img?'<a class="btn btn-sm btn-secondary" href="'+esc(img)+'" target="_blank" rel="noopener">'+t("viewImage")+'</a> ':"";
-    var act=(rs==="approved"||rs==="rejected")?"":'<button class="btn btn-sm btn-success" onclick="approveFreelance(\\''+esc(it.uid)+'\\')">'+t("approve")+'</button> <button class="btn btn-sm btn-warning" onclick="rejectFreelance(\\''+esc(it.uid)+'\\')">'+t("reject")+'</button>';
+    var act=(rs==="approved"||rs==="rejected")?"":'<button class="btn btn-sm btn-success" data-user-id="'+esc(it.uid||"")+'" onclick="approveFreelance(this.dataset.userId)">'+t("approve")+'</button> <button class="btn btn-sm btn-warning" data-user-id="'+esc(it.uid||"")+'" onclick="rejectFreelance(this.dataset.userId)">'+t("reject")+'</button>';
     return '<tr><td>'+esc(it.displayName||t("noName"))+'<div style="font-size:12px;color:var(--text2)">'+esc(it.email||"")+'</div></td>'+
       '<td>'+esc(fc.certificateNumber||"-")+'</td>'+
       '<td>'+flReviewBadge(rs)+'</td>'+
@@ -4271,7 +4371,7 @@ async function approveFreelance(uid){
   if(data&&data.success){toast(t("verificationApproved"));renderPage();}else{toast((data&&data.error)||t("failedUpdate"),"error");}
 }
 function rejectFreelance(uid){
-  openModal('<h3>'+t("reject")+'</h3><div class="form-group"><label>'+t("rejectReason")+'</label><textarea id="rej-note" rows="3" style="width:100%"></textarea></div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-warning" onclick="confirmRejectFreelance(\\''+esc(uid)+'\\')">'+t("reject")+'</button></div>');
+  openModal('<h3>'+t("reject")+'</h3><div class="form-group"><label>'+t("rejectReason")+'</label><textarea id="rej-note" rows="3" style="width:100%"></textarea></div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="confirmRejectFreelance(this.dataset.userId)">'+t("reject")+'</button></div>');
 }
 async function confirmRejectFreelance(uid){
   var el=document.getElementById("rej-note");
@@ -4403,7 +4503,7 @@ function filterUsers(){
       "<td>"+subBadge(u.subscriptionStatus)+"</td>"+
       "<td>"+subStatusLabel(u)+"</td>"+
       "<td style=\\"font-size:12px;color:var(--text2)\\">"+created+"</td>"+
-      "<td><button class=\\"btn btn-sm btn-primary\\" onclick=\\"editUser('"+u._id+"')\\">"+t("edit")+"</button></td>"+
+      "<td><button class=\\"btn btn-sm btn-primary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button></td>"+
     "</tr>";
   }).join("");
 }
@@ -4424,13 +4524,13 @@ function editUser(uid){
   };
   openModal(
     '<h3>'+t("editUser")+": "+esc(u.displayName||u.email||uid)+'</h3>'+
-    '<div style="margin-bottom:12px;font-size:13px;color:var(--text2)">UID: '+uid+"<br>"+t("role")+": "+(u.role||"N/A")+" | "+t("email")+": "+esc(u.email||"")+"</div>"+
+    '<div style="margin-bottom:12px;font-size:13px;color:var(--text2)">UID: '+esc(uid)+"<br>"+t("role")+": "+esc(u.role||"N/A")+" | "+t("email")+": "+esc(u.email||"")+"</div>"+
     daysInfo+
     '<div class="form-group"><label>'+t("accountStatus")+"</label>"+sel("eu-accountStatus",u.accountStatus,[{v:"active",l:t("active")},{v:"trial",l:t("trial")},{v:"suspended",l:t("suspend")},{v:"disabled",l:t("disabled")}])+"</div>"+
     '<div class="form-group"><label>'+t("subscriptionStatus")+"</label>"+sel("eu-subscriptionStatus",u.subscriptionStatus,[{v:"trialing",l:t("trialing")},{v:"active",l:t("active")},{v:"expired",l:t("expired")},{v:"canceled",l:t("canceledSub")},{v:"past_due",l:t("pastDue")}])+"</div>"+
     '<div class="form-group"><label>'+t("subscriptionPlan")+'</label><input id="eu-subscriptionPlan" value="'+esc(u.subscriptionPlan||"")+'"></div>'+
-    '<div class="form-group"><label>'+t("trialEndsAt")+'</label><input type="date" id="eu-trialEndsAt" value="'+trialDate+'"></div>'+
-    '<div class="form-group"><label>'+t("subscriptionEndsAt")+'</label><input type="date" id="eu-subscriptionEndsAt" value="'+subDate+'"></div>'+
+    '<div class="form-group"><label>'+t("trialEndsAt")+'</label><input type="date" id="eu-trialEndsAt" value="'+esc(trialDate)+'"></div>'+
+    '<div class="form-group"><label>'+t("subscriptionEndsAt")+'</label><input type="date" id="eu-subscriptionEndsAt" value="'+esc(subDate)+'"></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="eu-activatedByAdmin"'+(u.activatedByAdmin?" checked":"")+'> '+t("activatedByAdmin")+'</label></div>'+
     '<div class="form-group"><label>'+t("disabledReason")+'</label><textarea id="eu-disabledReason" rows="2">'+esc(u.disabledReason||"")+'</textarea></div>'+
     '<hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">'+
@@ -4444,14 +4544,14 @@ function editUser(uid){
     '<div class="form-group"><label>'+t("notes")+'</label><input id="eu-subNotes" value=""></div>'+
     '</div>'+
     '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">'+
-    '<button class="btn btn-sm btn-orange" onclick="generateInvoice(\\''+uid+'\\')">'+t("generateInvoice")+'</button>'+
-    (u.role!=="customer"?'<button class="btn btn-sm btn-warning" onclick="sendSubReminder(\\''+uid+'\\')">'+t("sendReminder")+'</button>':"")+
+    '<button class="btn btn-sm btn-orange" data-user-id="'+esc(uid)+'" onclick="generateInvoice(this.dataset.userId)">'+t("generateInvoice")+'</button>'+
+    (u.role!=="customer"?'<button class="btn btn-sm btn-warning" data-user-id="'+esc(uid)+'" onclick="sendSubReminder(this.dataset.userId)">'+t("sendReminder")+'</button>':"")+
     '</div>'+
     '<div class="modal-actions">'+
     '<button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button>'+
-    '<button class="btn btn-success" onclick="quickAction(\\''+uid+'\\',\\'activate\\')">'+t("activate")+'</button>'+
-    '<button class="btn btn-warning" onclick="quickAction(\\''+uid+'\\',\\'suspend\\')">'+t("suspend")+'</button>'+
-    '<button class="btn btn-primary" onclick="saveUser(\\''+uid+'\\')">'+t("save")+'</button>'+
+    '<button class="btn btn-success" data-user-id="'+esc(uid)+'" onclick="quickAction(this.dataset.userId,\\'activate\\')">'+t("activate")+'</button>'+
+    '<button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="quickAction(this.dataset.userId,\\'suspend\\')">'+t("suspend")+'</button>'+
+    '<button class="btn btn-primary" data-user-id="'+esc(uid)+'" onclick="saveUser(this.dataset.userId)">'+t("save")+'</button>'+
     '</div>'
   );
 }
@@ -4520,11 +4620,11 @@ function showInvoiceActions(invoiceId,invoice){
     '<h3>'+t("invoiceSaved")+'</h3>'+
     '<div style="margin-bottom:16px"><p style="font-size:14px;color:var(--text2);margin-bottom:4px">'+t("invoiceNumber")+': <strong>'+esc(invoice.invoiceNumber)+'</strong></p>'+
     '<p style="font-size:14px;color:var(--text2)">'+t("name")+': <strong>'+esc(invoice.userName)+'</strong></p>'+
-    '<p style="font-size:14px;color:var(--text2)">'+t("amount")+': <strong>'+invoice.amount+' '+invoice.currency+'</strong></p></div>'+
+    '<p style="font-size:14px;color:var(--text2)">'+t("amount")+': <strong>'+esc(invoice.amount)+' '+esc(invoice.currency)+'</strong></p></div>'+
     '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">'+
-    '<button class="btn btn-primary" onclick="viewInvoiceHTML(\\''+invoiceId+'\\')">'+t("viewInvoice")+'</button>'+
-    '<button class="btn btn-orange" onclick="downloadInvoicePdf(\\''+invoiceId+'\\')">'+t("downloadPdf")+'</button>'+
-    (invoice.userEmail?'<button class="btn btn-success" onclick="emailInvoice(\\''+invoiceId+'\\')">'+t("sendByEmail")+'</button>':"")+
+    '<button class="btn btn-primary" data-invoice-id="'+esc(invoiceId)+'" onclick="viewInvoiceHTML(this.dataset.invoiceId)">'+t("viewInvoice")+'</button>'+
+    '<button class="btn btn-orange" data-invoice-id="'+esc(invoiceId)+'" onclick="downloadInvoicePdf(this.dataset.invoiceId)">'+t("downloadPdf")+'</button>'+
+    (invoice.userEmail?'<button class="btn btn-success" data-invoice-id="'+esc(invoiceId)+'" onclick="emailInvoice(this.dataset.invoiceId)">'+t("sendByEmail")+'</button>':"")+
     '</div>'+
     '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("close")+'</button></div>'
   );
@@ -4578,13 +4678,13 @@ async function renderInvoices(c){
     return "<tr>"+
       "<td><strong>"+esc(inv.invoiceNumber||inv._id)+"</strong></td>"+
       "<td>"+esc(inv.userName||"")+"</td>"+
-      "<td>"+(inv.amount||0)+" "+(inv.currency||"SAR")+"</td>"+
+      "<td>"+esc(inv.amount||0)+" "+esc(inv.currency||"SAR")+"</td>"+
       "<td style=\\"font-size:12px;color:var(--text2)\\">"+dt+"</td>"+
       "<td><span class=\\"badge badge-green\\">"+t("issued")+"</span></td>"+
       "<td style=\\"white-space:nowrap\\">"+
-        "<button class=\\"btn btn-sm btn-primary\\" style=\\"margin:2px\\" onclick=\\"viewInvoiceHTML('"+inv._id+"')\\">"+t("viewInvoice")+"</button> "+
-        "<button class=\\"btn btn-sm btn-orange\\" style=\\"margin:2px\\" onclick=\\"downloadInvoicePdf('"+inv._id+"')\\">PDF</button> "+
-        (inv.userEmail?"<button class=\\"btn btn-sm btn-success\\" style=\\"margin:2px\\" onclick=\\"emailInvoice('"+inv._id+"')\\">\u2709</button>":"")+
+        "<button class=\\"btn btn-sm btn-primary\\" style=\\"margin:2px\\" data-invoice-id=\\""+esc(inv._id||"")+"\\" onclick=\\"viewInvoiceHTML(this.dataset.invoiceId)\\">"+t("viewInvoice")+"</button> "+
+        "<button class=\\"btn btn-sm btn-orange\\" style=\\"margin:2px\\" data-invoice-id=\\""+esc(inv._id||"")+"\\" onclick=\\"downloadInvoicePdf(this.dataset.invoiceId)\\">PDF</button> "+
+        (inv.userEmail?"<button class=\\"btn btn-sm btn-success\\" style=\\"margin:2px\\" data-invoice-id=\\""+esc(inv._id||"")+"\\" onclick=\\"emailInvoice(this.dataset.invoiceId)\\">\u2709</button>":"")+
       "</td></tr>";
   }).join("")+
   "</tbody></table></div>";
@@ -5529,6 +5629,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     // production.
     if (typeof process !== "undefined" && process?.env?.PHONE_AUTH_TEST_MODE === "1") {
       globalThis.__PHONE_AUTH_TEST_HOOKS = {
+        escapeHtml,
+        validateInvoicePayload,
+        generateInvoiceHTML,
+        generateInvoiceEmailHTML,
+        generatePDFBytes,
+        getAdminHTML,
+        htmlSecurityHeaders,
+        adminContentSecurityPolicy,
+        invoiceContentSecurityPolicy,
         normalizeSaudiMobilePhone,
         handlePhase4cProfileRegistration,
         handleRequest,
@@ -5973,7 +6082,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       }
       if (path === "/admin" || path === "/admin/") {
         return new Response(getAdminHTML(), {
-          headers: { "Content-Type": "text/html;charset=UTF-8" }
+          headers: htmlSecurityHeaders(adminContentSecurityPolicy())
         });
       }
       const invoiceViewMatch = path.match(/^\/admin\/invoice\/([^/]+)$/);
@@ -5991,9 +6100,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return new Response("Invoice not found", { status: 404 });
           }
           const invoiceLang = url.searchParams.get("lang") || "ar";
-          const html = generateInvoiceHTML(invoice, invoiceLang);
+          const nonce = createCspNonce();
+          const html = generateInvoiceHTML(invoice, invoiceLang, nonce);
           return new Response(html, {
-            headers: { "Content-Type": "text/html;charset=UTF-8" }
+            headers: htmlSecurityHeaders(invoiceContentSecurityPolicy(nonce))
           });
         } catch (e) {
           return new Response("Error: " + e.message, { status: 500 });
@@ -6378,15 +6488,20 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: true, invoices });
           }
           if (path === "/admin/api/invoices" && request.method === "POST") {
+            let invoice;
             try {
-              const invoice = await request.json();
+              invoice = validateInvoicePayload(await request.json());
+            } catch (e) {
+              return jsonResponse({ error: e.message || "Invalid invoice payload" }, 400);
+            }
+            try {
               const invoiceId = "inv_" + Date.now();
               invoice.status = "issued";
               await createFirestoreDocument("invoices", invoiceId, invoice, accessToken);
               console.log("[Admin] Invoice created:", invoiceId);
               return jsonResponse({ success: true, invoiceId });
             } catch (e) {
-              return jsonResponse({ error: e.message }, 500);
+              return jsonResponse({ error: e.message || "Failed" }, 500);
             }
           }
           const invoiceTokenMatch = path.match(/^\/admin\/api\/invoices\/([^/]+)\/token$/);
