@@ -1,0 +1,267 @@
+/*
+ * TABBAKHEEN FINAL FIRESTORE RULES CANDIDATE
+ *
+ * STATUS: UNDEPLOYED / NOT READY — NOT CUTOVER APPROVAL.
+ *
+ * This complete replacement policy is deliberately strict. It may be manually
+ * published only after the release-adoption and emulator gates in
+ * FINAL_RULES_EMULATOR_AND_CUTOVER.md are satisfied. Replace the complete
+ * active ruleset; do not add these matches beside any legacy allow, because
+ * Firestore allow rules are additive.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function owns(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function validPrivateLocation(location) {
+      return location is map
+        && location.keys().hasOnly(['lat', 'lng'])
+        && location.lat is number && location.lng is number
+        && location.lat >= -90 && location.lat <= 90
+        && location.lng >= -180 && location.lng <= 180;
+    }
+
+    function validPaymentMethods(methods) {
+      return methods is map
+        && methods.keys().hasOnly(['stcPay', 'bankTransfer'])
+        && methods.keys().hasAll(['stcPay', 'bankTransfer'])
+        && methods.stcPay is map
+        && methods.stcPay.keys().hasOnly(['enabled', 'phone'])
+        && methods.stcPay.keys().hasAll(['enabled', 'phone'])
+        && methods.stcPay.enabled is bool
+        && methods.stcPay.phone is string
+        && methods.stcPay.phone.size() <= 40
+        && methods.bankTransfer is map
+        && methods.bankTransfer.keys().hasOnly(
+          ['enabled', 'iban', 'accountName', 'bankName'])
+        && methods.bankTransfer.keys().hasAll(
+          ['enabled', 'iban', 'accountName', 'bankName'])
+        && methods.bankTransfer.enabled is bool
+        && methods.bankTransfer.iban is string
+        && methods.bankTransfer.iban.size() <= 64
+        && methods.bankTransfer.accountName is string
+        && methods.bankTransfer.accountName.size() <= 160
+        && methods.bankTransfer.bankName is string
+        && methods.bankTransfer.bankName.size() <= 160;
+    }
+
+    /*
+     * This is the only direct profile-update allowlist. It is derived from
+     * current profile/settings screens and deliberately excludes:
+     * role, uid, email, createdAt, phone and phone-index fields, all account/
+     * entitlement/admin/verification/rating fields, isAvailable, and the
+     * public-discovery consent/location fields. `pushNotificationsEnabled` is
+     * only the owner's local preference; push tokens/devices stay server-only.
+     *
+     * `location` is the owner's private location. `publicLocation` and
+     * `publicLocationEnabled` are Worker-only: the Worker applies explicit
+     * consent and atomically refreshes public_profiles.
+     */
+    function validOwnerProfileUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly([
+          'displayName',
+          'photoUrl',
+          'socialLink',
+          'address',
+          'city',
+          'location',
+          'vehicleType',
+          'vehiclePlateNumber',
+          'vehicleImageUrl',
+          'maxDistanceKm',
+          'paymentMethods',
+          'hasAcceptedTerms',
+          'pushNotificationsEnabled'
+        ])
+        && (!changed.hasAny(['displayName'])
+          || (request.resource.data.displayName is string
+            && request.resource.data.displayName.size() > 0
+            && request.resource.data.displayName.size() <= 120))
+        && (!changed.hasAny(['photoUrl'])
+          || (request.resource.data.photoUrl is string
+            && request.resource.data.photoUrl.size() <= 2048))
+        && (!changed.hasAny(['socialLink'])
+          || (request.resource.data.socialLink is string
+            && request.resource.data.socialLink.size() <= 2048))
+        && (!changed.hasAny(['address'])
+          || (request.resource.data.address is string
+            && request.resource.data.address.size() <= 500))
+        && (!changed.hasAny(['city'])
+          || (request.resource.data.city is string
+            && request.resource.data.city.size() <= 120))
+        && (!changed.hasAny(['location'])
+          || validPrivateLocation(request.resource.data.location))
+        && (!changed.hasAny(['vehicleType'])
+          || (request.resource.data.vehicleType is string
+            && request.resource.data.vehicleType in ['car', 'motorcycle', 'bicycle']))
+        && (!changed.hasAny(['vehiclePlateNumber'])
+          || (request.resource.data.vehiclePlateNumber is string
+            && request.resource.data.vehiclePlateNumber.size() <= 40))
+        && (!changed.hasAny(['vehicleImageUrl'])
+          || (request.resource.data.vehicleImageUrl is string
+            && request.resource.data.vehicleImageUrl.size() <= 2048))
+        && (!changed.hasAny(['maxDistanceKm'])
+          || (request.resource.data.maxDistanceKm is int
+            && request.resource.data.maxDistanceKm >= 1
+            && request.resource.data.maxDistanceKm <= 200))
+        && (!changed.hasAny(['paymentMethods'])
+          || validPaymentMethods(request.resource.data.paymentMethods))
+        && (!changed.hasAny(['hasAcceptedTerms'])
+          || request.resource.data.hasAcceptedTerms is bool)
+        && (!changed.hasAny(['pushNotificationsEnabled'])
+          || request.resource.data.pushNotificationsEnabled is bool);
+    }
+
+    /* Owner-private account. Deliberately get-only: no users collection list. */
+    match /users/{uid} {
+      allow get: if owns(uid);
+      allow create, delete: if false;
+      allow update: if owns(uid) && validOwnerProfileUpdate();
+
+      /* Notification records are Worker-managed; mobile uses native delivery. */
+      match /notifications/{notificationId} {
+        allow read, write: if false;
+      }
+    }
+
+    match /public_profiles/{uid} {
+      /*
+       * This is a trusted, Worker/Admin-built public projection. Rules cannot
+       * redact documents; the Worker projection tests plus production inventory
+       * are the privacy control. Clients can never create or alter it.
+       */
+      allow get, list: if true;
+      allow create, update, delete: if false;
+    }
+
+    match /offers/{offerId} {
+      /*
+       * Legacy and Worker offer documents may have private or inconsistent
+       * shapes. The mobile catalogue uses Worker GET /offers/public instead.
+       */
+      allow read, write: if false;
+    }
+
+    /*
+     * Query authorization is constrained by the stored participant field:
+     * customerUid == auth UID, providerUid == auth UID, or assigned
+     * driverUid == auth UID. A broad query and an unassigned-driver query
+     * cannot satisfy this predicate. All mutations are Worker-only.
+     */
+    match /orders/{orderId} {
+      allow get, list: if signedIn()
+        && (
+          resource.data.customerUid == request.auth.uid
+          || resource.data.providerUid == request.auth.uid
+          || resource.data.driverUid == request.auth.uid
+        );
+      allow create, update, delete: if false;
+    }
+
+    /* Owner can obtain only their own minimized verification result/document. */
+    match /verifications/{uid} {
+      allow get: if owns(uid);
+      allow list, create, update, delete: if false;
+    }
+
+    /*
+     * app_settings/main is broad/admin. The mobile client uses the Worker
+     * /app-settings/public runtime DTO; every direct Firestore settings path
+     * remains denied.
+     */
+    match /app_settings/public {
+      allow read, write: if false;
+    }
+
+    match /app_settings/{docId} {
+      allow read, write: if false;
+    }
+
+    /* Raw ratings, complaints, deletion state, and every sensitive subsystem. */
+    match /provider_ratings/{providerUid}/ratings/{ratingId} {
+      allow read, write: if false;
+    }
+    match /driver_ratings/{driverUid}/ratings/{ratingId} {
+      allow read, write: if false;
+    }
+    match /delivery_complaints/{complaintId} {
+      allow read, write: if false;
+    }
+    match /account_deletion_requests/{requestId} {
+      allow read, write: if false;
+    }
+    match /private_devices/{uid} {
+      allow read, write: if false;
+    }
+    match /phoneLoginIndex/{key} {
+      allow read, write: if false;
+    }
+    match /phoneLoginRateLimits/{key} {
+      allow read, write: if false;
+    }
+    match /admin_audit_logs/{id} {
+      allow read, write: if false;
+    }
+    match /phone_index_backfill_audit/{id} {
+      allow read, write: if false;
+    }
+    match /public_profile_migration_audit/{id} {
+      allow read, write: if false;
+    }
+    match /order_transition_events/{id} {
+      allow read, write: if false;
+    }
+    match /order_numbers/{id} {
+      allow read, write: if false;
+    }
+    match /order_creation_requests/{id} {
+      allow read, write: if false;
+    }
+    match /offer_creation_requests/{id} {
+      allow read, write: if false;
+    }
+    match /offer_mutation_rate_limits/{id} {
+      allow read, write: if false;
+    }
+    match /apple_transaction_claims/{id} {
+      allow read, write: if false;
+    }
+    match /invoices/{id} {
+      allow read, write: if false;
+    }
+    match /admin_broadcast_notifications/{id} {
+      allow read, write: if false;
+    }
+    match /app_config/{id} {
+      allow read, write: if false;
+    }
+    match /provider_profiles/{uid} {
+      allow read, write: if false;
+    }
+    match /driver_profiles/{uid} {
+      allow read, write: if false;
+    }
+    match /order_messages/{orderId} {
+      allow read, write: if false;
+      match /messages/{messageId} {
+        allow read, write: if false;
+      }
+    }
+    match /order_message_rate_limits/{key} {
+      allow read, write: if false;
+    }
+
+    /* Unknown present and future collections are client-denied by default. */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

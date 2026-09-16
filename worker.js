@@ -221,6 +221,152 @@
         phonePasswordLoginEnabled: false
       };
     }
+    const CLIENT_VERSION_GATE_DEFAULT = {
+      enabled: false,
+      ios: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
+      android: { minimumVersion: "", minimumBuild: "", storeUrl: "" }
+    };
+    function cloneClientVersionGateDefault() {
+      return {
+        enabled: false,
+        ios: { ...CLIENT_VERSION_GATE_DEFAULT.ios },
+        android: { ...CLIENT_VERSION_GATE_DEFAULT.android }
+      };
+    }
+    function validClientSemver(value) {
+      return typeof value === "string" && value.length <= 64 && (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/).test(value);
+    }
+    function validClientBuild(value) {
+      return typeof value === "string" && (/^(0|[1-9]\d{0,8})$/).test(value);
+    }
+    function validOfficialStoreUrl(platform, value) {
+      if (typeof value !== "string" || value.length > 2048) return false;
+      if (!value) return true;
+      try {
+        const url = new URL(value);
+        if (url.protocol !== "https:" || url.username || url.password || url.hash) return false;
+        return platform === "ios" ? url.hostname === "apps.apple.com" && /^\/(?:[a-z]{2}(?:-[A-Z]{2})?\/)?app\//.test(url.pathname) : url.hostname === "play.google.com" && url.pathname === "/store/apps/details" && !!url.searchParams.get("id");
+      } catch {
+        return false;
+      }
+    }
+    // Gate data is public configuration, so it is normalized before every
+    // response. A malformed legacy value fails open (disabled), never blocks
+    // a client, and is never repaired by a read.
+    function normalizedClientVersionGate(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.enabled !== "boolean") return cloneClientVersionGateDefault();
+      const normalized = { enabled: value.enabled, ios: {}, android: {} };
+      for (const platform of ["ios", "android"]) {
+        const config = value[platform];
+        if (!config || typeof config !== "object" || Array.isArray(config)) return cloneClientVersionGateDefault();
+        const minimumVersion = typeof config.minimumVersion === "string" ? config.minimumVersion : "";
+        const minimumBuild = typeof config.minimumBuild === "string" ? config.minimumBuild : "";
+        const storeUrl = typeof config.storeUrl === "string" ? config.storeUrl : "";
+        if (minimumVersion && !validClientSemver(minimumVersion) || minimumBuild && !validClientBuild(minimumBuild) || !validOfficialStoreUrl(platform, storeUrl) || minimumBuild && !minimumVersion) return cloneClientVersionGateDefault();
+        normalized[platform] = { minimumVersion, minimumBuild, storeUrl };
+      }
+      return normalized;
+    }
+    function validateClientVersionGate(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 3 || typeof value.enabled !== "boolean") return null;
+      const normalized = normalizedClientVersionGate(value);
+      // Normalization returning the safe default is ambiguous with a valid
+      // default, so compare every submitted member to require the exact schema.
+      for (const platform of ["ios", "android"]) {
+        const config = value[platform];
+        if (!config || typeof config !== "object" || Array.isArray(config) || Object.keys(config).length !== 3 || typeof config.minimumVersion !== "string" || typeof config.minimumBuild !== "string" || typeof config.storeUrl !== "string") return null;
+        if (normalized[platform].minimumVersion !== config.minimumVersion || normalized[platform].minimumBuild !== config.minimumBuild || normalized[platform].storeUrl !== config.storeUrl) return null;
+      }
+      if (normalized.enabled && !normalized.ios.minimumVersion && !normalized.android.minimumVersion) return null;
+      return normalized;
+    }
+    const PUBLIC_APP_SETTINGS_DEFAULT = {
+      bannerImageUrl: "",
+      bannerEnabled: false,
+      bannerWhatsapp: "",
+      supportEmail: "",
+      supportWhatsapp: "",
+      deliveryPricing: { currency: "SAR", baseFee: 5, perKmInsideCity: 2, perKmOutsideCity: 2, maxFee: 50 },
+      defaultLanguage: "ar",
+      subscriptionWarningDays: 7
+    };
+    function validPublicHttpsUrl(value, maximumLength = 2048) {
+      if (typeof value !== "string" || !value || value.length > maximumLength) return false;
+      try {
+        const url = new URL(value);
+        return url.protocol === "https:" && !url.username && !url.password;
+      } catch {
+        return false;
+      }
+    }
+    function publicAppSettingsDto(value) {
+      const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+      // Banner uploads may be served by Cloudinary, Unsplash, or the Admin's
+      // configured public R2 host. A credential-free bounded HTTPS URL is the
+      // existing Admin contract; do not narrow it on this read migration.
+      const imageUrl = validPublicHttpsUrl(source.bannerImageUrl) ? source.bannerImageUrl : "";
+      const bannerWhatsapp = normalizeInternationalWhatsApp(source.bannerWhatsapp);
+      const supportWhatsapp = normalizeSaudiWhatsApp(source.supportWhatsapp);
+      const supportEmail = typeof source.supportEmail === "string" && source.supportEmail.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(source.supportEmail.trim()) ? source.supportEmail.trim() : "";
+      const pricing = source.deliveryPricing && typeof source.deliveryPricing === "object" && !Array.isArray(source.deliveryPricing) ? source.deliveryPricing : {};
+      const finiteAmount = (candidate, fallback, upperBound) => typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 && candidate <= upperBound ? candidate : fallback;
+      const currency = typeof pricing.currency === "string" && /^[A-Z]{3}$/.test(pricing.currency) ? pricing.currency : PUBLIC_APP_SETTINGS_DEFAULT.deliveryPricing.currency;
+      return {
+        bannerImageUrl: imageUrl,
+        // A legacy record enabled a valid banner by omission. Keep that
+        // behavior while refusing to expose an invalid image URL.
+        bannerEnabled: imageUrl !== "" && source.bannerEnabled !== false,
+        bannerWhatsapp: bannerWhatsapp === null ? "" : bannerWhatsapp,
+        supportEmail,
+        supportWhatsapp: supportWhatsapp === null ? "" : supportWhatsapp,
+        deliveryPricing: {
+          currency,
+          baseFee: finiteAmount(pricing.baseFee, PUBLIC_APP_SETTINGS_DEFAULT.deliveryPricing.baseFee, 1e4),
+          perKmInsideCity: finiteAmount(pricing.perKmInsideCity, PUBLIC_APP_SETTINGS_DEFAULT.deliveryPricing.perKmInsideCity, 1e4),
+          perKmOutsideCity: finiteAmount(pricing.perKmOutsideCity, PUBLIC_APP_SETTINGS_DEFAULT.deliveryPricing.perKmOutsideCity, 1e4),
+          maxFee: finiteAmount(pricing.maxFee, PUBLIC_APP_SETTINGS_DEFAULT.deliveryPricing.maxFee, 1e5)
+        },
+        defaultLanguage: source.defaultLanguage === "en" ? "en" : "ar",
+        subscriptionWarningDays: Number.isInteger(source.subscriptionWarningDays) && source.subscriptionWarningDays >= 0 && source.subscriptionWarningDays <= 90 ? source.subscriptionWarningDays : PUBLIC_APP_SETTINGS_DEFAULT.subscriptionWarningDays
+      };
+    }
+    function publicOfferDto(offer) {
+      if (!offer || !phase4aSafeSegment(offer._id)) return null;
+      const providerId = resolveOfferProviderUid(offer);
+      if (!phase4aSafeSegment(providerId) || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || typeof offer.description !== "string" || offer.description.length > 500 || typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.category !== "string" || !offer.category.trim() || offer.category.trim().length > 80 || typeof offer.imageUrl !== "string" || offer.imageUrl.length > 2048 || offer.imageUrl !== "" && !/^https:\/\/(res\.cloudinary\.com\/|images\.unsplash\.com\/)/i.test(offer.imageUrl) || typeof offer.isAvailable !== "boolean" || typeof offer.createdAt !== "string" || offer.createdAt.length > 80) return null;
+      const availabilityType = offer.availabilityType === undefined ? "immediate" : offer.availabilityType;
+      if (!["immediate", "preorder"].includes(availabilityType)) return null;
+      const preparationTimeMinutes = availabilityType === "preorder" ? offer.preparationTimeMinutes : null;
+      if (availabilityType === "preorder" && (!Number.isInteger(preparationTimeMinutes) || preparationTimeMinutes < 15 || preparationTimeMinutes > 1440)) return null;
+      return {
+        id: offer._id,
+        providerId,
+        title: offer.title.trim(),
+        description: offer.description,
+        price: offer.price,
+        category: offer.category.trim(),
+        imageUrl: offer.imageUrl,
+        isAvailable: offer.isAvailable,
+        createdAt: offer.createdAt,
+        availabilityType,
+        preparationTimeMinutes
+      };
+    }
+    async function handlePublicOffers(request, accessToken) {
+      const url = new URL(request.url);
+      if ([...url.searchParams.keys()].some((key) => key !== "pageSize" && key !== "pageToken")) return phase4aError("invalid_request", "Unsupported query parameter");
+      const rawPageSize = url.searchParams.get("pageSize");
+      const pageSize = rawPageSize === null ? 100 : Number(rawPageSize);
+      const pageToken = url.searchParams.get("pageToken");
+      if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100 || pageToken !== null && (!/^[\x21-\x7E]{1,2048}$/.test(pageToken))) return phase4aError("invalid_request", "Invalid pagination");
+      let endpoint = FIRESTORE_BASE + "/offers?pageSize=" + pageSize + "&orderBy=createdAt%20desc";
+      if (pageToken) endpoint += "&pageToken=" + encodeURIComponent(pageToken);
+      const response = await fetch(endpoint, { headers: { Authorization: "Bearer " + accessToken } });
+      if (!response.ok) throw new Error("Public offer listing unavailable");
+      const payload = await response.json();
+      const offers = (payload.documents || []).slice(0, pageSize).map(parseFirestoreDoc).map(publicOfferDto).filter(Boolean);
+      return jsonResponse({ success: true, offers, nextPageToken: typeof payload.nextPageToken === "string" && payload.nextPageToken.length <= 2048 ? payload.nextPageToken : null });
+    }
     __name(phoneAuthSettings, "phoneAuthSettings");
     __name2(phoneAuthSettings, "phoneAuthSettings");
     function phoneIndexingIsConfigured(env) {
@@ -1510,6 +1656,19 @@
     function phase4aSafeSegment(value) {
       return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
     }
+    // Offer documents created before providerUid became canonical can contain
+    // either identifier. A record containing both must agree; never select
+    // whichever field happens to favor the caller.
+    function resolveOfferProviderUid(offer) {
+      if (!offer || typeof offer !== "object") return null;
+      const hasUid = offer.providerUid != null;
+      const hasId = offer.providerId != null;
+      if (hasUid && (typeof offer.providerUid !== "string" || !phase4aSafeSegment(offer.providerUid))) return null;
+      if (hasId && (typeof offer.providerId !== "string" || !phase4aSafeSegment(offer.providerId))) return null;
+      if (!hasUid && !hasId) return null;
+      if (hasUid && hasId && offer.providerUid !== offer.providerId) return null;
+      return hasUid ? offer.providerUid : offer.providerId;
+    }
     function phase4aDeletionFence(uid, snapshot) {
       return { verify: "projects/tabbakheen-99883/databases/(default)/documents/account_deletion_requests/" + uid, currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
     }
@@ -1518,6 +1677,9 @@
       const entitlement = evaluateSubscriptionEntitlement(user);
       return entitlement.eligible ? { ok: true, entitlement } : { ok: false, code: entitlement.reason === "account_inactive" ? "FORBIDDEN" : "SUBSCRIPTION_REQUIRED", entitlement };
     }
+    // This is the legacy offer validator. Its input and acceptance behavior is
+    // retained byte-for-byte for the released /offers/create and /offers/update
+    // aliases. Canonical REST endpoints use the separate validator below.
     function phase4aOfferInput(body) {
       if (!phase4aKeysOnly(body, ["requestId", "title", "description", "price", "category", "imageUrl", "availabilityType", "preparationTimeMinutes", "isAvailable"])) return null;
       const title = typeof body.title === "string" ? body.title.trim() : "";
@@ -1540,6 +1702,90 @@
       }
       if (body.isAvailable !== undefined && typeof body.isAvailable !== "boolean") return null;
       return { title, description, price, category, imageUrl, availabilityType, preparationTimeMinutes, isAvailable: body.isAvailable === undefined ? true : body.isAvailable };
+    }
+    const CANONICAL_OFFER_MUTABLE_FIELDS = ["title", "description", "price", "category", "imageUrl", "availabilityType", "preparationTimeMinutes", "isAvailable"];
+    const CANONICAL_OFFER_BODY_MAX_BYTES = 16 * 1024;
+    const CANONICAL_OFFER_RATE_WINDOW_MS = 60 * 1e3;
+    const CANONICAL_OFFER_RATE_MAX = 20;
+    function phase4aHasEnabledPublicLocation(user) {
+      const loc = user?.publicLocation;
+      const city = typeof loc?.city === "string" ? loc.city.trim() : "";
+      return user?.publicLocationEnabled === true && !!loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lng) && loc.lat >= 12 && loc.lat <= 34 && loc.lng >= 34 && loc.lng <= 61 && !(loc.lat === 0 && loc.lng === 0) && city.length > 0 && city.length <= 120;
+    }
+    async function readBoundedOfferJson(request) {
+      const contentLength = request.headers.get("content-length");
+      if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > CANONICAL_OFFER_BODY_MAX_BYTES)) {
+        const error = new Error("REQUEST_TOO_LARGE"); error.code = "REQUEST_TOO_LARGE"; throw error;
+      }
+      if (!request.body || typeof request.body.getReader !== "function") {
+        const error = new Error("INVALID_REQUEST_BODY"); error.code = "INVALID_REQUEST_BODY"; throw error;
+      }
+      const reader = request.body.getReader();
+      const chunks = [];
+      let size = 0;
+      try {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) break;
+          size += next.value.byteLength;
+          if (size > CANONICAL_OFFER_BODY_MAX_BYTES) {
+            await reader.cancel();
+            const error = new Error("REQUEST_TOO_LARGE"); error.code = "REQUEST_TOO_LARGE"; throw error;
+          }
+          chunks.push(next.value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch {
+        const error = new Error("INVALID_REQUEST_BODY"); error.code = "INVALID_REQUEST_BODY"; throw error;
+      }
+    }
+    function canonicalOfferInput(body, requireRequestId = true) {
+      const allowed = requireRequestId ? ["requestId", ...CANONICAL_OFFER_MUTABLE_FIELDS] : CANONICAL_OFFER_MUTABLE_FIELDS;
+      if (!phase4aKeysOnly(body, allowed)) return null;
+      const title = typeof body.title === "string" ? body.title.trim() : "";
+      const description = typeof body.description === "string" ? body.description.trim() : "";
+      const category = body.category === undefined ? "main" : typeof body.category === "string" ? body.category.trim() : "";
+      const price = body.price;
+      const availabilityType = body.availabilityType === undefined ? "immediate" : body.availabilityType;
+      // The released Expo form makes description optional. Canonical REST
+      // accepts the explicit empty string while retaining its type and bound;
+      // the legacy validator above intentionally keeps its historic min-10.
+      if (!title || typeof body.description !== "string" || title.length > 120 || description.length > 500 || !["main", "dessert", "appetizer", "pastry", "drinks", "other"].includes(category)) return null;
+      if (typeof price !== "number" || !Number.isFinite(price) || price <= 0 || price > 1000000) return null;
+      if (!["immediate", "preorder"].includes(availabilityType)) return null;
+      let preparationTimeMinutes = null;
+      if (availabilityType === "preorder") {
+        if (!Number.isInteger(body.preparationTimeMinutes) || body.preparationTimeMinutes < 15 || body.preparationTimeMinutes > 1440) return null;
+        preparationTimeMinutes = body.preparationTimeMinutes;
+      } else if (body.preparationTimeMinutes !== undefined && body.preparationTimeMinutes !== null) {
+        return null;
+      }
+      let imageUrl = "";
+      if (body.imageUrl != null) {
+        if (typeof body.imageUrl !== "string" || body.imageUrl.length > 2048 || !/^https:\/\/(res\.cloudinary\.com\/|images\.unsplash\.com\/)/i.test(body.imageUrl)) return null;
+        imageUrl = body.imageUrl;
+      }
+      if (body.isAvailable !== undefined && typeof body.isAvailable !== "boolean") return null;
+      return { title, description, price, category, imageUrl, availabilityType, preparationTimeMinutes, isAvailable: body.isAvailable === undefined ? true : body.isAvailable };
+    }
+    async function canonicalOfferMutationRate(uid, accessToken) {
+      const snapshot = await getFirestoreSnapshot("offer_mutation_rate_limits", uid, accessToken);
+      const previous = snapshot?.data || {};
+      const now = new Date();
+      const startedAt = new Date(previous.windowStartedAt || 0).getTime();
+      const inWindow = Number.isFinite(startedAt) && now.getTime() - startedAt >= 0 && now.getTime() - startedAt < CANONICAL_OFFER_RATE_WINDOW_MS;
+      const count = inWindow ? Number(previous.count || 0) : 0;
+      if (!Number.isInteger(count) || count < 0 || count >= CANONICAL_OFFER_RATE_MAX) return { allowed: false };
+      return {
+        allowed: true,
+        snapshot,
+        fields: { uid, windowStartedAt: inWindow ? previous.windowStartedAt : now.toISOString(), count: count + 1, updatedAt: now.toISOString() }
+      };
     }
     async function phase4aAuth(request, accessToken) {
       let uid;
@@ -2166,6 +2412,73 @@
       if (!ok) { const retry = await getFirestoreDoc(idemPath, idemId, accessToken); if (retry && retry.intentHash === JSON.stringify(input)) { const replayOffer = await getFirestoreDoc("offers", retry.offerId, accessToken); return jsonResponse({ success: true, offerId: retry.offerId, offer: replayOffer && { ...replayOffer, id: retry.offerId }, idempotent: true }); } return phase4aError("state_conflict", "Request conflicted; retry", 409); }
       return jsonResponse({ success: true, offerId, offer });
     }
+    async function handleCanonicalOfferCreate(request, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      let body; try { body = await readBoundedOfferJson(request); } catch (error) { return phase4aError(error?.code === "REQUEST_TOO_LARGE" ? "request_too_large" : "invalid_request", error?.code === "REQUEST_TOO_LARGE" ? "Request body too large" : "Invalid request", error?.code === "REQUEST_TOO_LARGE" ? 413 : 400); }
+      const input = canonicalOfferInput(body);
+      if (!input || typeof body.requestId !== "string" || !body.requestId.trim() || !phase4aSafeSegment(body.requestId.trim())) return phase4aError("invalid_offer", "Invalid offer");
+      const requestId = body.requestId.trim();
+      const idemPath = "offer_creation_requests", idemId = auth.uid + "_" + requestId;
+      const prior = await getFirestoreDoc(idemPath, idemId, accessToken);
+      if (prior) {
+        if (prior.intentHash !== JSON.stringify(input)) return phase4aError("idempotency_conflict", "Request id already used", 409);
+        return jsonResponse({ success: true, offerId: prior.offerId });
+      }
+      const providerAccess = phase4aProviderAccess(auth.user);
+      if (!providerAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, providerAccess.entitlement, accessToken); return phase4aError(providerAccess.code, "Provider subscription required", 403); }
+      if (!phase4aHasEnabledPublicLocation(auth.user)) return phase4aError("public_location_required", "A public provider location is required", 403);
+      const rate = await canonicalOfferMutationRate(auth.uid, accessToken);
+      if (!rate.allowed) return phase4aError("rate_limited", "Please wait before changing another offer", 429);
+      const offerId = crypto.randomUUID(), now = new Date().toISOString();
+      // Only the authenticated UID is persisted as the public relationship;
+      // no private provider profile fields are accepted or copied.
+      const offer = { id: offerId, ...input, providerUid: auth.uid, providerId: auth.uid, createdAt: now, updatedAt: now, rating: 0, ratingCount: 0, successfulOrders: 0 };
+      const ok = await phase4aCommit([
+        { update: phase4aDoc("offers", offerId, offer), currentDocument: { exists: false } },
+        { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, offerId, intentHash: JSON.stringify(input), createdAt: now }), currentDocument: { exists: false } },
+        { update: phase4aDoc("offer_mutation_rate_limits", auth.uid, rate.fields), updateMask: { fieldPaths: Object.keys(rate.fields) }, currentDocument: rate.snapshot ? { updateTime: rate.snapshot.updateTime } : { exists: false } },
+        auth.deletionFence
+      ], accessToken);
+      if (!ok) {
+        const retry = await getFirestoreDoc(idemPath, idemId, accessToken);
+        if (retry && retry.intentHash === JSON.stringify(input)) return jsonResponse({ success: true, offerId: retry.offerId });
+        return phase4aError("state_conflict", "Request conflicted; retry", 409);
+      }
+      return jsonResponse({ success: true, offerId });
+    }
+    async function handleCanonicalOfferUpdate(request, env, accessToken, offerId) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (auth.user.role !== "provider" || !phase4aSafeSegment(offerId)) return phase4aError("forbidden", "Provider ownership required", 403);
+      const updateAccess = phase4aProviderAccess(auth.user);
+      if (!updateAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, updateAccess.entitlement, accessToken); return phase4aError(updateAccess.code, "Provider subscription required", 403); }
+      let body; try { body = await readBoundedOfferJson(request); } catch (error) { return phase4aError(error?.code === "REQUEST_TOO_LARGE" ? "request_too_large" : "invalid_request", error?.code === "REQUEST_TOO_LARGE" ? "Request body too large" : "Invalid request", error?.code === "REQUEST_TOO_LARGE" ? 413 : 400); }
+      if (!phase4aKeysOnly(body, CANONICAL_OFFER_MUTABLE_FIELDS) || Object.keys(body).length === 0) return phase4aError("invalid_offer", "Invalid offer fields");
+      const offerSnap = await getFirestoreSnapshot("offers", offerId, accessToken);
+      if (!offerSnap) return phase4aError("offer_not_found", "Offer not found", 404);
+      if (resolveOfferProviderUid(offerSnap.data) !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
+      if (body.isAvailable === true && !phase4aHasEnabledPublicLocation(auth.user)) return phase4aError("public_location_required", "A public provider location is required", 403);
+      const merged = {
+        title: body.title ?? offerSnap.data.title,
+        description: body.description ?? offerSnap.data.description,
+        price: body.price ?? offerSnap.data.price,
+        category: body.category ?? offerSnap.data.category,
+        imageUrl: body.imageUrl ?? offerSnap.data.imageUrl,
+        availabilityType: body.availabilityType ?? offerSnap.data.availabilityType,
+        preparationTimeMinutes: body.preparationTimeMinutes ?? offerSnap.data.preparationTimeMinutes,
+        isAvailable: body.isAvailable ?? offerSnap.data.isAvailable
+      };
+      if (body.availabilityType === "immediate" && body.preparationTimeMinutes != null) return phase4aError("invalid_offer", "Invalid offer");
+      if (merged.availabilityType === "immediate") merged.preparationTimeMinutes = null;
+      const input = canonicalOfferInput(merged, false);
+      if (!input) return phase4aError("invalid_offer", "Invalid offer");
+      for (const field of CANONICAL_OFFER_MUTABLE_FIELDS) if (!(field in body)) delete input[field];
+      if (merged.availabilityType === "immediate" && ("availabilityType" in body || "preparationTimeMinutes" in body)) input.preparationTimeMinutes = null;
+      input.updatedAt = new Date().toISOString();
+      const rate = await canonicalOfferMutationRate(auth.uid, accessToken);
+      if (!rate.allowed) return phase4aError("rate_limited", "Please wait before changing another offer", 429);
+      if (!(await phase4aCommit([{ update: phase4aDoc("offers", offerId, input), updateMask: { fieldPaths: Object.keys(input) }, currentDocument: { updateTime: offerSnap.updateTime } }, { update: phase4aDoc("offer_mutation_rate_limits", auth.uid, rate.fields), updateMask: { fieldPaths: Object.keys(rate.fields) }, currentDocument: rate.snapshot ? { updateTime: rate.snapshot.updateTime } : { exists: false } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Offer changed; refresh and retry", 409);
+      return jsonResponse({ success: true });
+    }
     async function handlePhase4aOrderCreate(request, env, accessToken) {
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
       if (auth.user.role !== "customer") return phase4aError("forbidden", "Customer account required", 403);
@@ -2182,7 +2495,8 @@
       const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
       const offer = offerSnap?.data;
       if (!offer) return phase4aError("offer_not_found", "Offer not found", 404);
-      const selectedProviderUid = offer.providerUid || offer.providerId;
+      const selectedProviderUid = resolveOfferProviderUid(offer);
+      if (!selectedProviderUid) return phase4aError("invalid_offer", "Offer provider is malformed", 403);
       // providerUid is retained in the mobile request as an explicit selected
       // provider, but the offer remains authoritative. A mismatch is rejected
       // before any provider/payment data is used.
@@ -2191,10 +2505,10 @@
       if (offer.isAvailable === false) return phase4aError("offer_unavailable", "Offer unavailable", 409);
       const offerProviderSnapshot = await getFirestoreSnapshot("users", selectedProviderUid, accessToken);
       const offerProvider = offerProviderSnapshot?.data;
-      if (offer.providerUid === auth.uid || offer.providerId === auth.uid) return phase4aError("invalid_offer", "Offer provider is not eligible");
+      if (selectedProviderUid === auth.uid) return phase4aError("invalid_offer", "Offer provider is not eligible");
       const offerAccess = phase4aProviderAccess(offerProvider);
       if (!offerAccess.ok) {
-        await normalizeCommercialAccess(offer.providerUid || offer.providerId, offerProvider, offerAccess.entitlement, accessToken);
+        await normalizeCommercialAccess(selectedProviderUid, offerProvider, offerAccess.entitlement, accessToken);
         return phase4aError(offerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403);
       }
       // The order's selected method must be enabled by this exact provider.
@@ -2206,7 +2520,7 @@
       }
       const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
       if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return phase4aError("invalid_offer", "Offer is malformed");
-      const providerUid = offer.providerUid || offer.providerId, now = new Date().toISOString(), orderId = crypto.randomUUID();
+      const providerUid = selectedProviderUid, now = new Date().toISOString(), orderId = crypto.randomUUID();
       const orderNumber = "TB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 8).toUpperCase();
       const customer = auth.user, provider = offerProvider;
       const orderRef = "TAB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 12).toUpperCase();
@@ -4697,10 +5011,19 @@ async function renderSettings(c){
   var bannerUrl=appSettings.bannerImageUrl||"";
   var bannerEnabled=appSettings.bannerEnabled!==false;
   var requirePhoneAtSignup=appSettings.requirePhoneAtSignup!==false;
+  var clientVersionGate=appSettings.clientVersionGate||{enabled:false,ios:{minimumVersion:"",minimumBuild:"",storeUrl:""},android:{minimumVersion:"",minimumBuild:"",storeUrl:""}};
+  var iosGate=clientVersionGate.ios||{minimumVersion:"",minimumBuild:"",storeUrl:""};
+  var androidGate=clientVersionGate.android||{minimumVersion:"",minimumBuild:"",storeUrl:""};
   c.innerHTML='<h1 class="page-title">'+t("appSettings")+'</h1>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"أمان الحساب":"Account security")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup" onchange="updatePhoneSignupRequirementHint()"'+(requirePhoneAtSignup?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+' <span id="s-requirePhoneAtSignup-status">'+(requirePhoneAtSignup?"ON":"OFF")+'</span></label><p id="s-requirePhoneAtSignup-hint" style="font-size:12px;color:var(--text2);margin-top:8px">'+(requirePhoneAtSignup?(lang==="ar"?"عند التفعيل، يجب على المستخدم الجديد إدخال رقم الجوال عند إنشاء الحساب.":"When enabled, new users must enter a phone number when creating an account."):(lang==="ar"?"يمكن للمستخدم الجديد إنشاء حساب بدون رقم جوال.":"When disabled, new users may create an account without a phone number."))+'</p></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" disabled> '+(lang==="ar"?"تسجيل الدخول برقم الجوال":"Phone number login")+' <span>OFF</span></label><p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"غير مفعل حالياً":"Currently disabled")+'</p></div>'+
+    '</div>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"بوابة تحديث التطبيق":"App update gate")+'</h3>'+
+    '<p style="font-size:12px;color:var(--warning);margin-bottom:16px">'+(lang==="ar"?"اتركها متوقفة حتى يصبح الإصدار الجديد متاحاً في المتجر. عند التفعيل لا يمكن للتطبيقات الأقدم تجاوز شاشة التحديث.":"Leave this disabled until the new release is available in the store. Once enabled, older clients cannot bypass the update screen.")+'</p>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-cvg-enabled"'+(clientVersionGate.enabled?" checked":"")+'> '+(lang==="ar"?"فرض التحديث الأدنى":"Enforce minimum app version")+'</label></div>'+
+    '<div class="grid-2"><div><strong>iOS</strong><div class="form-group"><label>'+(lang==="ar"?"أدنى إصدار (x.y.z)":"Minimum version (x.y.z)")+'</label><input id="s-cvg-ios-version" value="'+esc(iosGate.minimumVersion||"")+'" placeholder="1.0.5"></div><div class="form-group"><label>'+(lang==="ar"?"أدنى رقم بناء":"Minimum build")+'</label><input id="s-cvg-ios-build" inputmode="numeric" value="'+esc(iosGate.minimumBuild||"")+'" placeholder="5"></div><div class="form-group"><label>App Store URL</label><input id="s-cvg-ios-url" type="url" value="'+esc(iosGate.storeUrl||"")+'" placeholder="https://apps.apple.com/.../app/..."></div></div>'+
+    '<div><strong>Android</strong><div class="form-group"><label>'+(lang==="ar"?"أدنى إصدار (x.y.z)":"Minimum version (x.y.z)")+'</label><input id="s-cvg-android-version" value="'+esc(androidGate.minimumVersion||"")+'" placeholder="1.0.5"></div><div class="form-group"><label>'+(lang==="ar"?"أدنى رقم بناء":"Minimum build")+'</label><input id="s-cvg-android-build" inputmode="numeric" value="'+esc(androidGate.minimumBuild||"")+'" placeholder="5"></div><div class="form-group"><label>Google Play URL</label><input id="s-cvg-android-url" type="url" value="'+esc(androidGate.storeUrl||"")+'" placeholder="https://play.google.com/store/apps/details?id=..."></div></div></div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("language")+'</h3>'+
     '<div class="lang-switch"><button class="'+(lang==="ar"?"active":"")+'" onclick="setLang(\\'ar\\')">'+t("arabic")+'</button><button class="'+(lang==="en"?"active":"")+'" onclick="setLang(\\'en\\')">'+t("english")+'</button></div>'+
@@ -4825,6 +5148,20 @@ async function saveSettings(){
     var parsed=el?parseInt(el.value,10):fallback;
     return Number.isFinite(parsed)?parsed:fallback;
   }
+  function stringValue(id){var el=document.getElementById(id);return el?el.value.trim():"";}
+  function validGatePlatform(platform,version,build,storeUrl){
+    if(version&&!/^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$/.test(version))return false;
+    if(build&&!/^(0|[1-9]\\d{0,8})$/.test(build))return false;
+    if(build&&!version)return false;
+    if(!storeUrl)return true;
+    try{var u=new URL(storeUrl);return u.protocol==="https:"&&!u.username&&!u.password&&!u.hash&&(platform==="ios"?u.hostname==="apps.apple.com"&&/^\\/(?:[a-z]{2}(?:-[A-Z]{2})?\\/)?app\\//.test(u.pathname):u.hostname==="play.google.com"&&u.pathname==="/store/apps/details"&&!!u.searchParams.get("id"));}catch(e){return false;}
+  }
+  var clientVersionGate={
+    enabled:document.getElementById("s-cvg-enabled")?document.getElementById("s-cvg-enabled").checked:false,
+    ios:{minimumVersion:stringValue("s-cvg-ios-version"),minimumBuild:stringValue("s-cvg-ios-build"),storeUrl:stringValue("s-cvg-ios-url")},
+    android:{minimumVersion:stringValue("s-cvg-android-version"),minimumBuild:stringValue("s-cvg-android-build"),storeUrl:stringValue("s-cvg-android-url")}
+  };
+  if(!validGatePlatform("ios",clientVersionGate.ios.minimumVersion,clientVersionGate.ios.minimumBuild,clientVersionGate.ios.storeUrl)||!validGatePlatform("android",clientVersionGate.android.minimumVersion,clientVersionGate.android.minimumBuild,clientVersionGate.android.storeUrl)){toast(lang==="ar"?"استخدم إصدار x.y.z ورقم بناء رقمي وروابط المتاجر الرسمية HTTPS فقط.":"Use x.y.z versions, numeric builds, and official HTTPS store URLs only.","error");return;}
   var fields={
     bannerImageUrl:document.getElementById("s-bannerImageUrl")?document.getElementById("s-bannerImageUrl").value:"",
     bannerEnabled:document.getElementById("s-bannerEnabled")?document.getElementById("s-bannerEnabled").checked:true,
@@ -4846,6 +5183,7 @@ async function saveSettings(){
     notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
     notifyOnCrVerification:document.getElementById("s-notifyCrVerification")?document.getElementById("s-notifyCrVerification").checked:false,
     notifyOnFreelanceRequest:document.getElementById("s-notifyFreelanceRequest")?document.getElementById("s-notifyFreelanceRequest").checked:false,
+    clientVersionGate:clientVersionGate,
     providerSubscription:{
       active:document.getElementById("s-ps-active")?document.getElementById("s-ps-active").checked:false,
       price:Math.max(0,numberValue("s-ps-price",15)),
@@ -5661,6 +5999,20 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         setDriverAvailabilityAndSync,
         publicRatingDto,
         handlePhase4aOrderCreate,
+         handlePhase4aOfferCreate,
+         handleCanonicalOfferCreate,
+         handleCanonicalOfferUpdate,
+         phase4aOfferInput,
+         resolveOfferProviderUid,
+         canonicalOfferInput,
+         canonicalOfferMutationRate,
+         readBoundedOfferJson,
+         phase4aHasEnabledPublicLocation,
+         normalizedClientVersionGate,
+         validateClientVersionGate,
+         publicAppSettingsDto,
+         publicOfferDto,
+         handlePublicOffers,
         orderChatInput,
         orderChatIsWritable,
         orderChatMessageDto,
@@ -5769,7 +6121,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         return new Response(null, {
           headers: {
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Methods": "POST, GET, PATCH, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, x-api-key, Authorization"
           }
         });
@@ -5785,6 +6137,37 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch {
           // Settings outages preserve the safe signup requirement default.
           return jsonResponse({ success: true, settings: { requirePhoneAtSignup: true } });
+        }
+      }
+      if (path === "/app-settings" && request.method === "GET") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+          return jsonResponse({ success: true, settings: { clientVersionGate: normalizedClientVersionGate(settings?.clientVersionGate) } });
+        } catch {
+          // Never turn an already-enforced cached gate off because Firestore
+          // is unavailable. Missing configuration is handled above as the
+          // true disabled default; outages are explicit and retryable.
+          return jsonResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
+        }
+      }
+      if (path === "/app-settings/public" && request.method === "GET") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+          return jsonResponse({ success: true, settings: publicAppSettingsDto(settings) });
+        } catch {
+          // Do not leak stale/raw settings or silently substitute a business
+          // configuration during an infrastructure failure.
+          return jsonResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
+        }
+      }
+      if (path === "/offers/public" && request.method === "GET") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handlePublicOffers(request, accessToken);
+        } catch {
+          return jsonResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
         }
       }
       if (path === "/auth/phone-password" && request.method === "POST") {
@@ -5993,6 +6376,29 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
          await syncPublicProfile(targetUid, { ...targetSnap.data, ...aggregateFields }, accessToken);
         return jsonResponse({ success: true, ratingId, rating });
       }
+      // Canonical offer mutations for the new mobile client. The legacy POST
+      // aliases below remain intact for released Bridge-Rules clients.
+      if (path === "/offers" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleCanonicalOfferCreate(request, env, accessToken);
+        } catch (e) {
+          console.error("[Phase4A] REST offer create error:", e);
+          return phase4aError("internal_error", "Internal error", 500);
+        }
+      }
+      const restOfferPatchMatch = path.match(/^\/offers\/([^/]+)$/);
+      if (restOfferPatchMatch && request.method === "PATCH") {
+        try {
+          let offerId;
+          try { offerId = decodeURIComponent(restOfferPatchMatch[1]); } catch { return phase4aError("invalid_request", "Invalid offer id"); }
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleCanonicalOfferUpdate(request, env, accessToken, offerId);
+        } catch (e) {
+          console.error("[Phase4A] REST offer update error:", e);
+          return phase4aError("internal_error", "Internal error", 500);
+        }
+      }
       if (["/orders/create", "/offers/create", "/offers/update", "/orders/payment-proof", "/orders/payment-confirm", "/orders/payment-reject"].includes(path) && request.method === "POST") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
@@ -6005,9 +6411,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const updateAccess = phase4aProviderAccess(auth.user); if (!updateAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, updateAccess.entitlement, accessToken); return phase4aError(updateAccess.code, "Provider subscription required", 403); }
             const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
             if (!offerSnap) return phase4aError("offer_not_found", "Offer not found", 404);
-            if (offerSnap.data.providerUid !== auth.uid && offerSnap.data.providerId !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
+            if (resolveOfferProviderUid(offerSnap.data) !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
             const allowed = ["offerId", "title", "description", "price", "category", "imageUrl", "availabilityType", "preparationTimeMinutes", "isAvailable"];
             if (!phase4aKeysOnly(body, allowed)) return phase4aError("invalid_offer", "Invalid offer fields");
+            if (body.isAvailable === true && !phase4aHasEnabledPublicLocation(auth.user)) return phase4aError("public_location_required", "A public provider location is required", 403);
             const merged = { requestId: undefined, title: body.title ?? offerSnap.data.title, description: body.description ?? offerSnap.data.description, price: body.price ?? offerSnap.data.price, category: body.category ?? offerSnap.data.category, imageUrl: body.imageUrl ?? offerSnap.data.imageUrl, availabilityType: body.availabilityType ?? offerSnap.data.availabilityType, preparationTimeMinutes: body.preparationTimeMinutes ?? offerSnap.data.preparationTimeMinutes, isAvailable: offerSnap.data.isAvailable };
             if ("isAvailable" in body) merged.isAvailable = body.isAvailable;
             if (merged.availabilityType === "immediate") merged.preparationTimeMinutes = undefined;
@@ -6062,13 +6469,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!phase4aSafeSegment(offerId)) return phase4aError("INVALID_REQUEST", "Invalid offer id", 400);
           const snap = await getFirestoreSnapshot("offers", offerId, accessToken);
           if (!snap) return phase4aError("offer_not_found", "Offer not found", 404);
-          if (snap.data.providerUid !== auth.uid && snap.data.providerId !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
+          if (resolveOfferProviderUid(snap.data) !== auth.uid) return phase4aError("forbidden", "Provider ownership required", 403);
           let body = {}; try { body = await request.json(); } catch {}
           const mutationAccess = phase4aProviderAccess(auth.user);
           const turningOff = !!offerAvailabilityMatch && body.isAvailable === false;
           if (!turningOff && !mutationAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, mutationAccess.entitlement, accessToken); return phase4aError(mutationAccess.code, "Provider subscription required", 403); }
           if (offerAvailabilityMatch) {
             if (!phase4aKeysOnly(body, ["isAvailable"]) || typeof body.isAvailable !== "boolean") return phase4aError("invalid_request", "Only isAvailable is accepted");
+            if (body.isAvailable && !phase4aHasEnabledPublicLocation(auth.user)) return phase4aError("public_location_required", "A public provider location is required", 403);
             const fields = { isAvailable: body.isAvailable, updatedAt: new Date().toISOString() };
             if (!(await phase4aCommit([{ update: phase4aDoc("offers", offerId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Offer changed; retry", 409);
             return jsonResponse({ success: true, offerId, isAvailable: body.isAvailable });
@@ -6365,22 +6773,31 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           if (path === "/admin/api/settings" && request.method === "GET") {
             const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-            return jsonResponse({
-              success: true,
-              settings: {
-                ...(settings || {}),
-                // Missing values default to required; phone/password remains
-                // read-only and disabled regardless of legacy document state.
-                requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
-                phonePasswordLoginEnabled: false
-              }
-            });
+            const adminSettings = {
+              ...(settings || {}),
+              // Missing values default to required; phone/password remains
+              // read-only and disabled regardless of legacy document state.
+              requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
+              phonePasswordLoginEnabled: false
+            };
+            // Preserve the exact legacy missing-settings DTO. The Admin UI has
+            // its own disabled default and receives this field once an admin
+            // explicitly saves the new configuration.
+            if (settings && Object.prototype.hasOwnProperty.call(settings, "clientVersionGate")) {
+              adminSettings.clientVersionGate = normalizedClientVersionGate(settings.clientVersionGate);
+            }
+            return jsonResponse({ success: true, settings: adminSettings });
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
             if (!body || typeof body !== "object" || Array.isArray(body)) return jsonResponse({ error: "Settings must be an object" }, 400);
             if ("requirePhoneAtSignup" in body && typeof body.requirePhoneAtSignup !== "boolean") return jsonResponse({ error: "requirePhoneAtSignup must be boolean" }, 400);
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
+            if ("clientVersionGate" in body) {
+              const gate = validateClientVersionGate(body.clientVersionGate);
+              if (!gate) return jsonResponse({ error: "clientVersionGate must use enabled plus valid iOS/Android semver, numeric build, and official HTTPS store URLs" }, 400);
+              body.clientVersionGate = gate;
+            }
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -6411,7 +6828,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "notifyOnFreelanceRequest",
               "providerSubscription",
               "driverSubscription",
-              "requirePhoneAtSignup"
+              "requirePhoneAtSignup",
+              "clientVersionGate"
             ];
             const fields = {};
             for (const key of allowedSettings) {
