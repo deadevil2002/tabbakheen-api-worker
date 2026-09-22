@@ -855,18 +855,22 @@
       if (role === "customer") return { eligible: true, reason: "customer_unrestricted", role, source: "customer", endsAt: null };
       if (role !== "provider" && role !== "driver") return { eligible: false, reason: "unknown_invalid", role: role || null, source: null, endsAt: null };
       if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return { eligible: false, reason: "account_inactive", role, source: null, endsAt: null };
-      if (user.subscriptionPlatform === "apple" && user.subscriptionEnvironment === "Sandbox" && user.activatedByAdmin !== true) return { eligible: false, reason: "apple_sandbox_forbidden", role, source: "apple", endsAt: null };
+      // Store test purchases (Apple Sandbox, Google license testers) only count
+      // for admin-activated accounts or UIDs the Worker allowlisted at sync time.
+      const storeTestAllowed = user.activatedByAdmin === true || user.subscriptionTestAccount === true;
+      if (user.subscriptionPlatform === "apple" && user.subscriptionEnvironment === "Sandbox" && !storeTestAllowed) return { eligible: false, reason: "apple_sandbox_forbidden", role, source: "apple", endsAt: null };
+      if (user.subscriptionPlatform === "google" && user.subscriptionEnvironment === "Test" && !storeTestAllowed) return { eligible: false, reason: "google_test_purchase_forbidden", role, source: "google", endsAt: null };
       const createdAt = entitlementTime(user.createdAt);
       // Admin activation is an explicit, current override and may bypass
       // missing commercial dates. Normal trial/paid access never does.
       if (user.activatedByAdmin === true) return { eligible: true, reason: "admin_override", role, source: "admin", endsAt: null };
       if (!Number.isFinite(createdAt) || createdAt > nowMs + 5 * 60 * 1e3) return { eligible: false, reason: "unknown_invalid", role, source: null, endsAt: null };
-      // Protected mutations use this synchronous evaluator. Apple is
+      // Protected mutations use this synchronous evaluator. Store purchases are
       // revalidated on entitlement reads; between reads, fail closed after
       // 24h rather than making every mutation perform a network round trip.
-      if (user.subscriptionPlatform === "apple") {
+      if (user.subscriptionPlatform === "apple" || user.subscriptionPlatform === "google") {
         const verifiedAt = entitlementTime(user.subscriptionLastVerifiedAt);
-        if (!Number.isFinite(verifiedAt) || nowMs - verifiedAt > 24 * 60 * 60 * 1e3) return { eligible: false, reason: "apple_verification_stale", role, source: "apple", endsAt: null };
+        if (!Number.isFinite(verifiedAt) || nowMs - verifiedAt > 24 * 60 * 60 * 1e3) return { eligible: false, reason: user.subscriptionPlatform + "_verification_stale", role, source: user.subscriptionPlatform, endsAt: null };
       }
       if (user.subscriptionStatus === "active") {
         const end = entitlementTime(user.subscriptionEndsAt);
@@ -2047,9 +2051,9 @@
       const now = new Date();
       const fields = { ...input, uid: claims.sub, email, createdAt: now.toISOString(), phoneVerified: false };
       if (input.role === "provider" || input.role === "driver") {
-        fields.trialStartedAt = now.toISOString();
-        fields.trialEndsAt = addUtcCalendarMonths(now, 3).toISOString();
-        fields.subscriptionStatus = "trialing";
+        // The free period is the App Store / Google Play introductory offer.
+        // New commercial accounts start inactive until a store purchase syncs.
+        fields.subscriptionStatus = "inactive";
         Object.assign(fields, commercialAccessFields(evaluateSubscriptionEntitlement(fields, now)));
         if (input.role === "driver") fields.isAvailable = false;
         if (input.role === "provider") fields.publicLocationEnabled = false;
@@ -2361,7 +2365,8 @@
       // retry, 4=grace period, and 5=revoked all fail closed.
       const transaction = status.transactions.filter((item) => item.status === 1 && item.originalTransactionId === original && item.appAccountToken === expectedToken && expectedRole[item.productId] === user.role && item.environment === status.environment).sort((a, b) => (b.expiresDate || 0) - (a.expiresDate || 0))[0];
       const now = new Date().toISOString();
-      const allowedEnvironment = status.environment === "Production" || user.activatedByAdmin === true;
+      const appleTestAccount = status.environment === "Sandbox" && (user.activatedByAdmin === true || storeTestUid(uid, env));
+      const allowedEnvironment = status.environment === "Production" || appleTestAccount;
       const active = !!transaction && allowedEnvironment && transaction.expiresDate > Date.now() && transaction.revocationDate == null;
       const candidate = { ...user, subscriptionStatus: active ? "active" : "expired", subscriptionEndsAt: transaction && Number.isFinite(transaction.expiresDate) ? new Date(transaction.expiresDate).toISOString() : user.subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionEnvironment: status.environment, subscriptionLastVerifiedAt: now };
       const fields = {
@@ -2369,7 +2374,8 @@
         subscriptionPlatform: "apple",
         subscriptionEnvironment: status.environment,
         subscriptionLastVerifiedAt: now,
-        ...commercialAccessFields(evaluateSubscriptionEntitlement(candidate))
+        subscriptionTestAccount: appleTestAccount,
+        ...commercialAccessFields(evaluateSubscriptionEntitlement({ ...candidate, subscriptionEnvironment: status.environment, subscriptionTestAccount: appleTestAccount, subscriptionLastVerifiedAt: now }))
       };
       if (candidate.subscriptionEndsAt) fields.subscriptionEndsAt = candidate.subscriptionEndsAt;
       const snap = await getFirestoreSnapshot("users", uid, accessToken);
@@ -2383,6 +2389,140 @@
       chars[12] = "4";
       chars[16] = (8 + parseInt(chars[16], 16) % 4).toString(16);
       return chars.slice(0, 8).join("") + "-" + chars.slice(8, 12).join("") + "-" + chars.slice(12, 16).join("") + "-" + chars.slice(16, 20).join("") + "-" + chars.slice(20).join("");
+    }
+    // ===== Google Play subscriptions =====
+    // Same product IDs as the App Store. Each base plan ("monthly") carries the
+    // "free-3-months" introductory offer; Google decides offer eligibility.
+    const STORE_PRODUCT_ROLES = { tabbakheen_providers_monthly: "provider", tabbakheen_drivers_monthly: "driver" };
+    const GOOGLE_PLAY_PACKAGE = "com.tabbakheen.app";
+    const GOOGLE_PLAY_API = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/" + GOOGLE_PLAY_PACKAGE;
+    // CANCELED means auto-renew is off but the paid period has not ended yet.
+    // Grace period, account hold, paused and pending fail closed, as Apple does.
+    const GOOGLE_ENTITLED_STATES = ["SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_CANCELED"];
+    function storeTestUid(uid, env) {
+      const list = env && typeof env.STORE_TEST_UIDS === "string" ? env.STORE_TEST_UIDS : "";
+      return !!uid && list.split(",").map((item) => item.trim()).filter(Boolean).includes(uid);
+    }
+    function googlePurchaseTokenValid(token) {
+      return typeof token === "string" && token.length >= 20 && token.length <= 4096 && /^[A-Za-z0-9._:-]+$/.test(token);
+    }
+    async function googlePlayAccountId(uid) {
+      // Sent by the app as obfuscatedAccountIdAndroid; binds a purchase to one account.
+      return (await sha256Hex("tabbakheen-google-account:" + uid)).slice(0, 64);
+    }
+    async function googlePlayAccessToken(env) {
+      if (!env.GOOGLE_PLAY_CLIENT_EMAIL || !env.GOOGLE_PLAY_PRIVATE_KEY) throw new Error("GOOGLE_PLAY_CREDENTIALS_UNAVAILABLE");
+      return getAccessToken(env.GOOGLE_PLAY_CLIENT_EMAIL, env.GOOGLE_PLAY_PRIVATE_KEY, "https://www.googleapis.com/auth/androidpublisher");
+    }
+    function parseGooglePlaySubscription(data) {
+      if (!data || typeof data !== "object") return null;
+      const lineItems = Array.isArray(data.lineItems) ? data.lineItems : [];
+      const item = lineItems.find((line) => line && typeof line.productId === "string" && STORE_PRODUCT_ROLES[line.productId]);
+      if (!item) return null;
+      const expiryMs = Date.parse(item.expiryTime || "");
+      const accountIds = data.externalAccountIdentifiers && typeof data.externalAccountIdentifiers === "object" ? data.externalAccountIdentifiers : {};
+      return {
+        state: typeof data.subscriptionState === "string" ? data.subscriptionState : "",
+        productId: item.productId,
+        expiryMs: Number.isFinite(expiryMs) ? expiryMs : NaN,
+        accountId: typeof accountIds.obfuscatedExternalAccountId === "string" ? accountIds.obfuscatedExternalAccountId : "",
+        test: !!data.testPurchase,
+        acknowledged: data.acknowledgementState === "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED",
+        orderId: typeof data.latestOrderId === "string" ? data.latestOrderId.slice(0, 200) : "",
+        basePlanId: item.offerDetails && typeof item.offerDetails.basePlanId === "string" ? item.offerDetails.basePlanId : "",
+        offerId: item.offerDetails && typeof item.offerDetails.offerId === "string" ? item.offerDetails.offerId : ""
+      };
+    }
+    function googlePurchaseEntitled(purchase, nowMs = Date.now()) {
+      return !!purchase && GOOGLE_ENTITLED_STATES.includes(purchase.state) && Number.isFinite(purchase.expiryMs) && purchase.expiryMs > nowMs;
+    }
+    async function googlePlaySubscription(purchaseToken, env) {
+      if (!googlePurchaseTokenValid(purchaseToken)) throw new Error("GOOGLE_PURCHASE_INVALID");
+      const bearer = await googlePlayAccessToken(env);
+      const response = await fetch(GOOGLE_PLAY_API + "/purchases/subscriptionsv2/tokens/" + encodeURIComponent(purchaseToken), { headers: { Authorization: "Bearer " + bearer } });
+      if (response.status === 400 || response.status === 404 || response.status === 410) throw new Error("GOOGLE_PURCHASE_INVALID");
+      if (!response.ok) throw new Error("GOOGLE_STATUS_UNAVAILABLE");
+      const purchase = parseGooglePlaySubscription(await response.json());
+      if (!purchase) throw new Error("GOOGLE_PURCHASE_INVALID");
+      return { purchase, bearer };
+    }
+    async function googlePlayAcknowledge(productId, purchaseToken, bearer) {
+      // Unacknowledged purchases are refunded by Google after three days. The app
+      // also acknowledges through finishTransaction, so this is best effort.
+      try {
+        const response = await fetch(GOOGLE_PLAY_API + "/purchases/subscriptions/" + encodeURIComponent(productId) + "/tokens/" + encodeURIComponent(purchaseToken) + ":acknowledge", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + bearer, "Content-Type": "application/json" },
+          body: "{}"
+        });
+        if (!response.ok) console.error("[GooglePlay] acknowledge failed:", response.status);
+      } catch (error) {
+        console.error("[GooglePlay] acknowledge failed:", error && error.message ? error.message : error);
+      }
+    }
+    function googleSubscriptionFields(purchase, tokenHash, testAccount, now, user) {
+      const entitled = googlePurchaseEntitled(purchase, Date.parse(now));
+      const base = {
+        subscriptionStatus: entitled ? "active" : "expired",
+        subscriptionProductId: purchase.productId,
+        subscriptionPlatform: "google",
+        subscriptionEnvironment: purchase.test ? "Test" : "Production",
+        subscriptionPurchaseTokenHash: tokenHash,
+        subscriptionOrderId: purchase.orderId,
+        subscriptionTestAccount: testAccount,
+        subscriptionLastVerifiedAt: now
+      };
+      if (Number.isFinite(purchase.expiryMs)) base.subscriptionEndsAt = new Date(purchase.expiryMs).toISOString();
+      return { ...base, ...commercialAccessFields(evaluateSubscriptionEntitlement({ ...user, ...base })) };
+    }
+    async function phase4aReconcileGoogle(uid, user, env, accessToken) {
+      const tokenHash = String(user && user.subscriptionPurchaseTokenHash || "");
+      if (!/^[a-f0-9]{64}$/.test(tokenHash)) throw new Error("GOOGLE_PURCHASE_INVALID");
+      const claim = await getFirestoreDoc("google_purchase_claims", tokenHash, accessToken);
+      if (!claim || claim.uid !== uid) throw new Error("GOOGLE_PURCHASE_INVALID");
+      const { purchase } = await googlePlaySubscription(claim.purchaseToken, env);
+      const testAccount = purchase.test && (user.activatedByAdmin === true || storeTestUid(uid, env));
+      const bound = purchase.accountId === await googlePlayAccountId(uid) && STORE_PRODUCT_ROLES[purchase.productId] === user.role && (!purchase.test || testAccount);
+      const now = new Date().toISOString();
+      const fields = googleSubscriptionFields(bound ? purchase : { ...purchase, state: "SUBSCRIPTION_STATE_EXPIRED" }, tokenHash, testAccount, now, user);
+      const snap = await getFirestoreSnapshot("users", uid, accessToken);
+      if (!snap) throw new Error("PROFILE_NOT_FOUND");
+      if (!(await phase4aCommit([{ update: phase4aDoc("users", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }], accessToken))) throw new Error("STATE_CONFLICT");
+      return { ...user, ...fields };
+    }
+    async function handleGoogleSubscriptionSync(request, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid request"); }
+      if (!phase4aKeysOnly(body, ["productId", "purchaseToken"]) || typeof body.productId !== "string" || !googlePurchaseTokenValid(body.purchaseToken)) return phase4aError("INVALID_REQUEST", "Invalid Google Play purchase");
+      const expectedRole = STORE_PRODUCT_ROLES[body.productId] || "";
+      if (!expectedRole || auth.user.role !== expectedRole) return phase4aError("GOOGLE_PRODUCT_FORBIDDEN", "Product does not match account role", 403);
+      let lookup;
+      try { lookup = await googlePlaySubscription(body.purchaseToken, env); } catch (error) {
+        if (error && error.message === "GOOGLE_PURCHASE_INVALID") return phase4aError("GOOGLE_PURCHASE_INVALID", "Google Play purchase is invalid", 400);
+        throw error;
+      }
+      const { purchase, bearer } = lookup;
+      if (purchase.productId !== body.productId) return phase4aError("GOOGLE_PURCHASE_INVALID", "Google Play purchase is invalid", 400);
+      if (purchase.accountId !== await googlePlayAccountId(auth.uid)) return phase4aError("GOOGLE_ACCOUNT_MISMATCH", "Purchase belongs to another account", 403);
+      if (purchase.state === "SUBSCRIPTION_STATE_PENDING") return phase4aError("GOOGLE_PURCHASE_PENDING", "Payment is still pending", 409);
+      if (!googlePurchaseEntitled(purchase)) return phase4aError("GOOGLE_PURCHASE_INACTIVE", "Google Play subscription is not active", 400);
+      const testAccount = purchase.test && (auth.user.activatedByAdmin === true || storeTestUid(auth.uid, env));
+      if (purchase.test && !testAccount) return phase4aError("GOOGLE_TEST_PURCHASE_FORBIDDEN", "Test purchase not allowed", 403);
+      const tokenHash = await sha256Hex("google-purchase:" + body.purchaseToken);
+      const claimSnap = await getFirestoreSnapshot("google_purchase_claims", tokenHash, accessToken);
+      if (claimSnap && claimSnap.data.uid !== auth.uid) return phase4aError("GOOGLE_PURCHASE_CLAIMED", "Purchase belongs to another account", 409);
+      const userSnap = await getFirestoreSnapshot("users", auth.uid, accessToken);
+      if (!userSnap) return phase4aError("NOT_FOUND", "Profile not found", 404);
+      const now = new Date().toISOString();
+      const fields = { ...googleSubscriptionFields(purchase, tokenHash, testAccount, now, userSnap.data), subscriptionSyncedAt: now };
+      const writes = [{ update: phase4aDoc("users", auth.uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: userSnap.updateTime } }, auth.deletionFence];
+      if (!claimSnap) writes.push({ update: phase4aDoc("google_purchase_claims", tokenHash, { uid: auth.uid, purchaseToken: body.purchaseToken, productId: purchase.productId, createdAt: now }), currentDocument: { exists: false } });
+      else writes.push({ verify: "projects/tabbakheen-99883/databases/(default)/documents/google_purchase_claims/" + tokenHash, currentDocument: { updateTime: claimSnap.updateTime } });
+      if (!(await phase4aCommit(writes, accessToken))) return phase4aError("STATE_CONFLICT", "Subscription changed; retry", 409);
+      if (!purchase.acknowledged) await googlePlayAcknowledge(purchase.productId, body.purchaseToken, bearer);
+      await syncPublicProfile(auth.uid, { ...userSnap.data, ...fields }, accessToken);
+      const { subscriptionPurchaseTokenHash: _hash, ...visible } = fields;
+      return jsonResponse({ success: true, subscription: visible });
     }
     async function handlePhase4aOfferCreate(request, env, accessToken) {
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
@@ -5979,6 +6119,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         normalizeSaudiMobilePhone,
         handlePhase4cProfileRegistration,
         handleRequest,
+        evaluateSubscriptionEntitlement,
+        parseGooglePlaySubscription,
+        googlePlayAccountId,
+        handleGoogleSubscriptionSync,
+        phase4aReconcileGoogle,
         handlePhonePasswordLogin,
         handleProfilePhoneUpdate,
         phoneLoginRuntimeEnabled,
@@ -6227,6 +6372,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             await normalizeCommercialAccess(auth.uid, currentUser, entitlement, accessToken);
             return jsonResponse({ success: true, entitlement });
           }
+        } else if (currentUser.subscriptionPlatform === "google") {
+          try { currentUser = await phase4aReconcileGoogle(auth.uid, currentUser, env, accessToken); } catch (error) {
+            console.error("[GooglePlay] On-demand reconciliation failed:", error && error.message ? error.message : error);
+            const entitlement = { eligible: false, reason: "google_verification_unavailable", role: currentUser.role, source: "google", endsAt: null };
+            await normalizeCommercialAccess(auth.uid, currentUser, entitlement, accessToken);
+            return jsonResponse({ success: true, entitlement });
+          }
         }
         const entitlement = evaluateSubscriptionEntitlement(currentUser);
         if (url.searchParams.get("normalize") === "true") await normalizeCommercialAccess(auth.uid, currentUser, entitlement, accessToken);
@@ -6310,7 +6462,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const transaction = await phase4aAppleTransaction(body.transactionId, env);
           const expectedAccountToken = await phase4aAppleAccountToken(auth.uid);
           if (transaction.bundleId !== "com.tabbakheen.app" || String(transaction.transactionId) !== body.transactionId || transaction.productId !== body.productId || transaction.appAccountToken !== expectedAccountToken || transaction.inAppOwnershipType !== "PURCHASED" || transaction.revocationDate || !Number.isFinite(Number(transaction.expiresDate)) || Number(transaction.expiresDate) <= Date.now()) return phase4aError("APPLE_TRANSACTION_INVALID", "Apple transaction is invalid", 400);
-          if (transaction.environment !== "Production" && !(transaction.environment === "Sandbox" && auth.user.activatedByAdmin === true)) return phase4aError("APPLE_ENVIRONMENT_FORBIDDEN", "Sandbox transaction not allowed", 403);
+          const appleTestAccount = transaction.environment === "Sandbox" && (auth.user.activatedByAdmin === true || storeTestUid(auth.uid, env));
+          if (transaction.environment !== "Production" && !appleTestAccount) return phase4aError("APPLE_ENVIRONMENT_FORBIDDEN", "Sandbox transaction not allowed", 403);
           const expectedRole = { tabbakheen_providers_monthly: "provider", tabbakheen_drivers_monthly: "driver" }[body.productId] || "";
           if (!expectedRole || auth.user.role !== expectedRole) return phase4aError("APPLE_PRODUCT_FORBIDDEN", "Product does not match account role", 403);
           const originalTransactionId = String(transaction.originalTransactionId || transaction.transactionId);
@@ -6327,8 +6480,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           const subscriptionEndsAt = new Date(Number(transaction.expiresDate)).toISOString();
           const subscriptionLastVerifiedAt = new Date().toISOString();
-          const activeEntitlement = evaluateSubscriptionEntitlement({ ...userSnap.data, subscriptionStatus: "active", subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionLastVerifiedAt });
-          const fields = { subscriptionStatus: "active", subscriptionProductId: transaction.productId, subscriptionTransactionId: String(transaction.transactionId), subscriptionOriginalTransactionId: originalTransactionId, subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionEnvironment: transaction.environment || "Production", subscriptionLastVerifiedAt, subscriptionSyncedAt: subscriptionLastVerifiedAt, ...commercialAccessFields(activeEntitlement) };
+          const activeEntitlement = evaluateSubscriptionEntitlement({ ...userSnap.data, subscriptionStatus: "active", subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionEnvironment: transaction.environment || "Production", subscriptionTestAccount: appleTestAccount, subscriptionLastVerifiedAt });
+          const fields = { subscriptionStatus: "active", subscriptionProductId: transaction.productId, subscriptionTransactionId: String(transaction.transactionId), subscriptionOriginalTransactionId: originalTransactionId, subscriptionEndsAt, subscriptionPlatform: "apple", subscriptionEnvironment: transaction.environment || "Production", subscriptionLastVerifiedAt, subscriptionSyncedAt: subscriptionLastVerifiedAt, subscriptionTestAccount: appleTestAccount, ...commercialAccessFields(activeEntitlement) };
           const writes = [{ update: phase4aDoc("users", auth.uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: userSnap.updateTime } }, auth.deletionFence];
           if (!claim) writes.push({ update: phase4aDoc("apple_transaction_claims", originalTransactionId, { uid: auth.uid, createdAt: new Date().toISOString() }), updateMask: { fieldPaths: ["uid", "createdAt"] }, currentDocument: { exists: false } });
           else writes.push({ verify: "projects/tabbakheen-99883/databases/(default)/documents/apple_transaction_claims/" + originalTransactionId, currentDocument: { updateTime: claimSnap.updateTime } });
@@ -6348,6 +6501,33 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: true, entitlement: evaluateSubscriptionEntitlement(user), subscription: { subscriptionStatus: user.subscriptionStatus, subscriptionEndsAt: user.subscriptionEndsAt || null, subscriptionEnvironment: user.subscriptionEnvironment } });
         } catch (error) {
           return phase4aError("APPLE_RECONCILIATION_FAILED", "Apple subscription reconciliation failed", 502);
+        }
+      }
+      if (path === "/subscriptions/google/account-id" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        let body = {}; try { body = await request.json(); } catch {}
+        if (!phase4aKeysOnly(body, [])) return phase4aError("INVALID_REQUEST", "No body fields accepted");
+        return jsonResponse({ success: true, accountId: await googlePlayAccountId(auth.uid) });
+      }
+      if (path === "/subscriptions/google/sync" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleGoogleSubscriptionSync(request, env, accessToken);
+        } catch (error) {
+          console.error("[GooglePlay] sync failed:", error && error.message ? error.message : error);
+          return phase4aError("GOOGLE_SYNC_FAILED", "Google Play subscription sync failed", 502);
+        }
+      }
+      if (path === "/subscriptions/google/reconcile" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          if (auth.user.role !== "provider" && auth.user.role !== "driver") return phase4aError("GOOGLE_PRODUCT_FORBIDDEN", "Google Play subscription is not available for this role", 403);
+          const user = await phase4aReconcileGoogle(auth.uid, auth.user, env, accessToken);
+          return jsonResponse({ success: true, entitlement: evaluateSubscriptionEntitlement(user), subscription: { subscriptionStatus: user.subscriptionStatus, subscriptionEndsAt: user.subscriptionEndsAt || null, subscriptionEnvironment: user.subscriptionEnvironment } });
+        } catch (error) {
+          return phase4aError("GOOGLE_RECONCILIATION_FAILED", "Google Play subscription reconciliation failed", 502);
         }
       }
       if (path === "/ratings/submit" && request.method === "POST") {

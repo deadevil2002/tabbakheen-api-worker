@@ -97,7 +97,7 @@ has('path === "/subscriptions/apple/account-token"');
 has("phase4aAppleAccountToken");
 has('transaction.appAccountToken !== expectedAccountToken');
 has('transaction.inAppOwnershipType !== "PURCHASED"');
-has('transaction.environment === "Sandbox" && auth.user.activatedByAdmin === true');
+has('transaction.environment === "Sandbox" && (auth.user.activatedByAdmin === true || storeTestUid(auth.uid, env))');
 has('{ tabbakheen_providers_monthly: "provider", tabbakheen_drivers_monthly: "driver" }');
 has("currentExpiry >= Number(transaction.expiresDate)");
 has('phase4aDoc("users", targetUid, aggregateFields)');

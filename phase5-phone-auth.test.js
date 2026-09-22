@@ -150,12 +150,13 @@ function firebaseIdToken(uid, email) {
 }
 const authorizedReq = (path, body, uid = "register-uid") => new Request("https://worker.test" + path, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + firebaseIdToken(uid, "user@example.test") }, body: JSON.stringify(body) });
 const authorizedGet = (path, uid = "register-uid") => new Request("https://worker.test" + path, { headers: { Authorization: "Bearer " + firebaseIdToken(uid, "user@example.test") } });
-function assertThreeCalendarMonthTrial(profile) {
-  const start = new Date(profile.trialStartedAt);
-  const end = new Date(profile.trialEndsAt);
-  const expected = new Date(start.getTime());
-  expected.setUTCMonth(expected.getUTCMonth() + 3);
-  assert.equal(end.toISOString(), expected.toISOString());
+// The free period now comes from the store introductory offer, so a new
+// commercial profile carries no backend trial and cannot trade yet.
+function assertStoreSubscriptionRequired(profile) {
+  assert.equal(profile.subscriptionStatus, "inactive");
+  assert.equal(profile.trialStartedAt, undefined);
+  assert.equal(profile.trialEndsAt, undefined);
+  assert.equal(profile.commercialAccessAllowed, false);
 }
 
 (async () => {
@@ -194,12 +195,10 @@ function assertThreeCalendarMonthTrial(profile) {
   assert.equal(docs.get("users/optional-uid").data.phone, undefined);
   registration = await hooks.handlePhase4cProfileRegistration(authorizedReq("/profiles/register", { role: "provider", displayName: "Provider", phone: "0512345678" }, "provider-uid"), baseEnv(), "token");
   assert.equal((await registration.json()).success, true);
-  assert.equal(docs.get("users/provider-uid").data.subscriptionStatus, "trialing");
-  assertThreeCalendarMonthTrial(docs.get("users/provider-uid").data);
+  assertStoreSubscriptionRequired(docs.get("users/provider-uid").data);
   registration = await hooks.handlePhase4cProfileRegistration(authorizedReq("/profiles/register", { role: "driver", displayName: "Driver", phone: "0523456789" }, "driver-uid"), baseEnv(), "token");
   assert.equal((await registration.json()).success, true);
-  assert.equal(docs.get("users/driver-uid").data.subscriptionStatus, "trialing");
-  assertThreeCalendarMonthTrial(docs.get("users/driver-uid").data);
+  assertStoreSubscriptionRequired(docs.get("users/driver-uid").data);
 
   // A valid legacy alias blocks claims even when the other alias is malformed;
   // equal aliases classify once, while malformed/disagreeing profiles quarantine.
