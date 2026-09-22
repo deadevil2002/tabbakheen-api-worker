@@ -197,6 +197,13 @@ const TOKEN = "google-purchase-token-provider-1.AO-J1Ox";
   assert.equal(reconciled.subscriptionStatus, "expired");
   assert.equal(docs.get("users/provider-1").data.commercialAccessAllowed, false);
 
+  // The same account cannot carry a provider purchase into a driver role.
+  playPurchases.set(TOKEN, await playPurchase("provider-1"));
+  put("users/provider-1", { ...docs.get("users/provider-1").data, role: "driver" });
+  reconciled = await hooks.phase4aReconcileGoogle("provider-1", docs.get("users/provider-1").data, env(), "token");
+  assert.equal(reconciled.subscriptionStatus, "expired");
+  put("users/provider-1", { ...docs.get("users/provider-1").data, role: "provider" });
+
   // The entitlement endpoint reconciles Google users through the full router.
   playPurchases.set(TOKEN, await playPurchase("provider-1"));
   Object.assign(global, env());
