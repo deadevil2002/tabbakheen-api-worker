@@ -5439,7 +5439,7 @@ async function loadProviderReminderHistory(){
 function showProviderReminderHistoryDetails(index){
   var item=providerReminderHistoryCache[index];if(!item)return;
   var recipients=item.recipients||[];
-  var lines=recipients.map(function(r){return (r.displayName||r.email||r.uid)+(r.email&&r.displayName?" — "+r.email:"");}).join("\n");
+  var lines=recipients.map(function(r){return (r.displayName||r.email||r.uid)+(r.email&&r.displayName?" — "+r.email:"");}).join("\\n");
   showProviderDiscoveryModal({type:"info",title:lang==="ar"?"المستلمون المستهدفون":"Targeted recipients",message:lines|| (lang==="ar"?"لا توجد أسماء محفوظة لهذا السجل.":"No recipient names stored for this record.")});
 }
 
