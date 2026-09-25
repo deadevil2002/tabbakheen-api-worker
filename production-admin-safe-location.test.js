@@ -23,3 +23,5 @@ assert(source.includes("providerLocationReminderHistory"), "provider reminder hi
 assert(source.includes("recipients=targets.slice"), "future reminder audits must store target recipients");
 assert(source.includes("سجل تنبيهات الموقع"), "Admin reminder history UI missing");
 assert(source.includes("آخر تنبيه"), "provider drill-down last-reminder column missing");
+
+assert(source.includes('.join("\\\\n")'), "reminder recipient list newline must be escaped in generated Admin JavaScript");
