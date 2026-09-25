@@ -764,6 +764,8 @@
       let withoutPublicLocation = 0;
       let invalidPublicLocation = 0;
       let legacyPrivateLocationOnly = 0;
+      let eligibleWithoutPublicLocation = 0;
+      let ineligibleWithoutPublicLocation = 0;
       for (const user of users) {
         if (!user || user.role !== "provider") continue;
         totalProviders++;
@@ -773,6 +775,8 @@
         else {
           withoutPublicLocation++;
           if (user.publicLocationEnabled === true) invalidPublicLocation++;
+          if (isProviderAccountAllowed(user)) eligibleWithoutPublicLocation++;
+          else ineligibleWithoutPublicLocation++;
         }
         // Aggregate only. Never return private coordinates or account IDs.
         if (user.location && !hasValidPublicLocation) legacyPrivateLocationOnly++;
@@ -782,9 +786,28 @@
         publicLocationEnabled,
         withoutPublicLocation,
         invalidPublicLocation,
-        legacyPrivateLocationOnly
+        legacyPrivateLocationOnly,
+        eligibleWithoutPublicLocation,
+        ineligibleWithoutPublicLocation
       };
     }
+
+    async function providerDiscoveryReminderTargets(accessToken) {
+      const users = await listAllUsers(accessToken);
+      const targets = [];
+      for (const user of users) {
+        if (!user || user.role !== "provider" || !user._id) continue;
+        const projected = publicProfileFromPrivateUser(user._id, user);
+        const hasValidPublicLocation = !!projected && projected.publicLocationEnabled === true && !!projected.publicLocation;
+        if (hasValidPublicLocation || !isProviderAccountAllowed(user)) continue;
+        const deletion = await getFirestoreDoc("account_deletion_requests", user._id, accessToken);
+        if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.status)) continue;
+        targets.push(user);
+      }
+      return targets;
+    }
+    __name(providerDiscoveryReminderTargets, "providerDiscoveryReminderTargets");
+    __name2(providerDiscoveryReminderTargets, "providerDiscoveryReminderTargets");
     __name(providerDiscoveryStats, "providerDiscoveryStats");
     __name2(providerDiscoveryStats, "providerDiscoveryStats");
     function canRequestOrderContact(order, uid, target, purpose) {
@@ -5057,7 +5080,8 @@ async function renderSettings(c){
     '<div class="settings-section"><h3>'+(lang==="ar"?"مواقع مقدمي الخدمة والخريطة":"Provider discovery & map")+'</h3>'+
     '<p style="font-size:13px;color:var(--text2);margin-bottom:14px">'+(lang==="ar"?"إحصاءات مجمعة فقط. لا تعرض هذه الصفحة إحداثيات خاصة أو عناوين المنازل. يظهر مقدم الخدمة على الخريطة فقط بعد تفعيل موقع الاكتشاف العام.":"Aggregate statistics only. No private coordinates or home addresses are shown. A provider appears on the map only after enabling a public discovery location.")+'</p>'+
     '<div id="provider-discovery-stats" class="grid-2" style="margin-bottom:12px"><div style="padding:12px;border:1px solid var(--border);border-radius:10px">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div>'+
-    '<button type="button" class="btn btn-sm" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn btn-sm" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button><button type="button" class="btn btn-sm btn-primary" id="provider-location-reminder-btn" onclick="sendProviderLocationReminder()">'+(lang==="ar"?"إرسال تنبيه للناقصين المؤهلين":"Notify eligible providers missing location")+'</button></div>'+
+    '<div id="provider-location-reminder-result" style="font-size:12px;color:var(--text2);margin-top:8px"></div>'+
     '<div class="form-group" style="margin-top:14px"><label>'+(lang==="ar"?"نطاق «القريب منك» المحفوظ":"Saved nearby discovery radius")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div>'+
     '<p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"هذا الإعداد محفوظ وجاهز للنسخة القادمة، لكنه لا يغيّر سلوك التطبيق المنشور حالياً. الخريطة الحالية تبقى غير محدودة وتعرض كل مقدم خدمة نشر موقع اكتشاف عام عند عمل Zoom Out.":"This setting is stored for a future client release and does not change the currently published app. The current map remains unrestricted and shows every provider who published a public discovery location when zooming out.")+'</p>'+
     '</div>'+
@@ -5152,7 +5176,32 @@ async function loadProviderDiscoveryStats(){
     stat(lang==="ar"?"إجمالي مقدمي الخدمة":"Total providers",data.totalProviders)+
     stat(lang==="ar"?"موقع عام مفعّل":"Public location enabled",data.publicLocationEnabled)+
     stat(lang==="ar"?"بدون موقع عام":"Without public location",data.withoutPublicLocation)+
-    stat(lang==="ar"?"موقع عام غير صالح":"Invalid public location",data.invalidPublicLocation);
+    stat(lang==="ar"?"موقع عام غير صالح":"Invalid public location",data.invalidPublicLocation)+
+    stat(lang==="ar"?"مؤهلون ويمكنهم النشر":"Eligible and can publish",data.eligibleWithoutPublicLocation)+
+    stat(lang==="ar"?"غير مؤهلين حالياً":"Currently ineligible",data.ineligibleWithoutPublicLocation);
+}
+
+async function sendProviderLocationReminder(){
+  var btn=document.getElementById("provider-location-reminder-btn");
+  var result=document.getElementById("provider-location-reminder-result");
+  if(!btn)return;
+  var ok=confirm(lang==="ar"?"سيتم إرسال التنبيه فقط لمقدمي الخدمة المؤهلين الذين لم ينشروا موقع اكتشاف عام. متابعة؟":"Send only to eligible providers who have not published a public discovery location?");
+  if(!ok)return;
+  btn.disabled=true;
+  if(result)result.textContent=lang==="ar"?"جاري الإرسال...":"Sending...";
+  try{
+    var data=await api("/provider-discovery/remind-missing-location",{method:"POST",body:JSON.stringify({confirm:true})});
+    if(!data||!data.success)throw new Error(data&&data.error||"Failed");
+    var msg=(lang==="ar"
+      ?"تمت معالجة "+Number(data.targeted||0)+" حساب. أُرسل إلى "+Number(data.sentCount||0)+" جهاز، وتعذر الإرسال إلى "+Number(data.failedCount||0)+"."
+      :"Processed "+Number(data.targeted||0)+" accounts. Sent to "+Number(data.sentCount||0)+" devices; "+Number(data.failedCount||0)+" failed.");
+    if(result)result.textContent=msg;
+    toast(lang==="ar"?"تم إرسال تنبيه الموقع":"Location reminder sent");
+    await loadProviderDiscoveryStats();
+  }catch(e){
+    if(result)result.textContent=lang==="ar"?"تعذر إرسال التنبيه.":"Unable to send reminder.";
+    toast(lang==="ar"?"تعذر إرسال التنبيه":"Reminder failed","error");
+  }finally{btn.disabled=false;}
 }
 
 function updatePhoneSignupRequirementHint(){
@@ -6937,6 +6986,24 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             // Aggregate-only operational visibility for Admin. Never emit
             // provider IDs, private coordinates, home addresses, or phones.
             return jsonResponse({ success: true, ...(await providerDiscoveryStats(accessToken)) });
+          }
+          if (path === "/admin/api/provider-discovery/remind-missing-location" && request.method === "POST") {
+            const body = await request.json().catch(() => ({}));
+            if (body?.confirm !== true) return jsonResponse({ error: "Confirmation required" }, 400);
+            const targets = await providerDiscoveryReminderTargets(accessToken);
+            const title = "فعّل ظهورك على خريطة طباخين";
+            const message = "حدّد موقع الاكتشاف العام من الإعدادات حتى يظهر حسابك للعملاء وتظهر المسافة.";
+            const result = await sendAdminBroadcast(targets, title, message, accessToken);
+            const auditId = "provider-location-reminder-" + crypto.randomUUID();
+            await updateFirestoreDocument("admin_audit_logs", auditId, {
+              action: "provider_discovery_location_reminder",
+              targeted: targets.length,
+              sentCount: result.sentCount,
+              failedCount: result.failedCount,
+              createdAt: new Date().toISOString(),
+              changedBy: "admin_token"
+            }, accessToken);
+            return jsonResponse({ success: true, targeted: targets.length, ...result });
           }
           if (path === "/admin/api/phone-index/backfill" && request.method === "POST") {
             return await executePhoneIndexBackfill(request, env, accessToken);
