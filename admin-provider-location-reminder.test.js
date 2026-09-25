@@ -13,3 +13,8 @@ assert(source.includes('id="provider-location-reminder-btn"'), "Admin reminder b
 assert(source.includes("eligibleWithoutPublicLocation"), "diagnostic eligibility count missing");
 assert(source.includes("ineligibleWithoutPublicLocation"), "diagnostic ineligible count missing");
 console.log("admin provider location reminder source checks: PASS");
+
+assert(source.includes("provider-discovery-grid"), "responsive provider discovery grid missing");
+assert(source.includes("provider-radius-box"), "radius settings panel missing");
+assert(source.includes("provider-reminder-result"), "reminder result state UI missing");
+assert(source.includes("Visible on map"), "clear map visibility label missing");
