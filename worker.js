@@ -508,6 +508,30 @@
     }
     __name(listAllInvoices, "listAllInvoices");
     __name2(listAllInvoices, "listAllInvoices");
+    async function listAllAdminAuditLogs(accessToken) {
+      const logs = [];
+      let pageToken = null;
+      do {
+        let url = `${FIRESTORE_BASE}/admin_audit_logs?pageSize=300`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const response = await fetch(url, { headers: { "Authorization": `Bearer ${accessToken}` } });
+        if (!response.ok) {
+          if (response.status === 404) return [];
+          const text = await response.text();
+          throw new Error(`Failed to list admin audit logs: ${response.status} ${text}`);
+        }
+        const data = await response.json();
+        for (const doc of data.documents || []) {
+          const parsed = parseFirestoreDoc(doc);
+          if (parsed) logs.push(parsed);
+        }
+        pageToken = data.nextPageToken || null;
+      } while (pageToken);
+      return logs;
+    }
+    __name(listAllAdminAuditLogs, "listAllAdminAuditLogs");
+    __name2(listAllAdminAuditLogs, "listAllAdminAuditLogs");
+
     async function updateFirestoreDocument(collectionPath, docId, fields, accessToken) {
       const fieldPaths = Object.keys(fields);
       const maskParams = fieldPaths.map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join("&");
@@ -786,8 +810,37 @@
     __name(providerDiscoveryStats, "providerDiscoveryStats");
     __name2(providerDiscoveryStats, "providerDiscoveryStats");
 
+    async function providerLocationReminderHistory(accessToken, limit = 50) {
+      const logs = await listAllAdminAuditLogs(accessToken);
+      return logs
+        .filter((item) => item && item.action === "provider_discovery_location_reminder")
+        .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+        .slice(0, Math.max(1, Math.min(100, limit)))
+        .map((item) => ({
+          id: item._id || "",
+          createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
+          scope: item.scope === "single" ? "single" : "all_missing",
+          targeted: Number.isInteger(item.targeted) ? item.targeted : 0,
+          sentCount: Number.isInteger(item.sentCount) ? item.sentCount : 0,
+          failedCount: Number.isInteger(item.failedCount) ? item.failedCount : 0,
+          recipients: Array.isArray(item.recipients) ? item.recipients.slice(0, 200).map((r) => ({
+            uid: typeof r?.uid === "string" ? r.uid : "",
+            displayName: typeof r?.displayName === "string" ? r.displayName : "",
+            email: typeof r?.email === "string" ? r.email : ""
+          })).filter((r) => r.uid) : []
+        }));
+    }
+    __name(providerLocationReminderHistory, "providerLocationReminderHistory");
+    __name2(providerLocationReminderHistory, "providerLocationReminderHistory");
+
     async function providerDiscoveryAdminList(accessToken, filter) {
-      const users = await listAllUsers(accessToken);
+      const [users, reminderHistory] = await Promise.all([listAllUsers(accessToken), providerLocationReminderHistory(accessToken, 100)]);
+      const lastReminderByUid = new Map();
+      for (const event of reminderHistory) {
+        for (const recipient of event.recipients || []) {
+          if (recipient.uid && !lastReminderByUid.has(recipient.uid)) lastReminderByUid.set(recipient.uid, event.createdAt || "");
+        }
+      }
       const allowed = new Set(["all", "visible", "missing", "invalid", "private_only"]);
       const selected = allowed.has(filter) ? filter : "missing";
       const rows = [];
@@ -810,7 +863,8 @@
           publicLocationEnabled: state.validPublic,
           publicCity: state.validPublic && typeof user.publicLocation?.city === "string" ? user.publicLocation.city : "",
           hasPrivateLocation: !!user.location,
-          canPublishLocation: canProviderManagePublicLocation(user)
+          canPublishLocation: canProviderManagePublicLocation(user),
+          lastReminderAt: lastReminderByUid.get(user._id) || ""
         });
       }
       rows.sort((a,b)=>String(a.displayName||a.email).localeCompare(String(b.displayName||b.email),"ar"));
@@ -5281,6 +5335,7 @@ async function renderSettings(c){
     '<div class="provider-discovery-actions"><button type="button" class="btn btn-secondary" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button><button type="button" class="btn btn-primary" id="provider-location-reminder-btn" onclick="sendProviderLocationReminder()" disabled>'+(lang==="ar"?"إرسال تنبيه لمن لم يحدد الموقع":"Notify providers missing location")+'</button></div>'+
     '<div id="provider-location-reminder-result" class="provider-reminder-result" aria-live="polite"></div><div id="provider-discovery-updated" class="provider-discovery-updated"></div>'+
     '<div id="provider-discovery-list" class="provider-list" style="display:none"><div class="provider-list-head"><strong id="provider-discovery-list-title"></strong><button type="button" class="btn btn-sm btn-secondary" onclick="closeProviderDiscoveryList()">'+(lang==="ar"?"إغلاق":"Close")+'</button></div><div id="provider-discovery-list-body" class="provider-list-body"></div></div>'+
+    '<div class="provider-list" style="margin-top:18px"><div class="provider-list-head"><strong>'+(lang==="ar"?"سجل تنبيهات الموقع":"Location reminder history")+'</strong><button type="button" class="btn btn-sm btn-secondary" onclick="loadProviderReminderHistory()">'+(lang==="ar"?"تحديث السجل":"Refresh history")+'</button></div><div id="provider-reminder-history-body" class="provider-list-body"><div class="loading">'+(lang==="ar"?"جاري تحميل السجل...":"Loading history...")+'</div></div></div>'+
     '<div id="provider-discovery-modal" class="provider-discovery-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="provider-discovery-modal-title"><div class="provider-discovery-modal-card"><div class="provider-discovery-modal-head"><h3 id="provider-discovery-modal-title" class="provider-discovery-modal-title"></h3><button type="button" class="provider-discovery-modal-close" onclick="closeProviderDiscoveryModal()" aria-label="'+(lang==="ar"?"إغلاق":"Close")+'">×</button></div><p id="provider-discovery-modal-message" class="provider-discovery-modal-message"></p><div class="provider-discovery-modal-actions"><button type="button" id="provider-discovery-modal-cancel" class="btn btn-secondary" onclick="closeProviderDiscoveryModal()">'+(lang==="ar"?"إلغاء":"Cancel")+'</button><button type="button" id="provider-discovery-modal-confirm" class="btn btn-primary">'+(lang==="ar"?"حسنًا":"OK")+'</button></div></div></div>'+
     '<div class="provider-radius-box"><div class="form-group"><label>'+(lang==="ar"?"نطاق «القريب منك» للنسخة القادمة":"Nearby radius for next app release")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div><div class="provider-radius-note">'+(lang==="ar"?"الإعداد الحالي «مفتوح» يعني بدون حد مسافة. التطبيق المنشور حالياً لا يستخدم هذا الخيار بعد، والخريطة تعرض كل من نشر موقع اكتشاف عام عند عمل Zoom Out.":"Unlimited means no distance cap. The currently published app does not consume this setting yet; zooming out shows every provider who published a public discovery location.")+'</div></div></div>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"بوابة تحديث التطبيق":"App update gate")+'</h3>'+
@@ -5329,7 +5384,7 @@ async function renderSettings(c){
     '<button class="btn btn-sm btn-warning" onclick="changePassword()">'+t("changePasswordBtn")+'</button>'+
     '</div>'+
     '<button class="btn btn-primary" onclick="saveSettings()">'+t("saveSettings")+'</button>';
-  setTimeout(function(){updatePricingPreview();loadProviderDiscoveryStats();},50);
+  setTimeout(function(){updatePricingPreview();loadProviderDiscoveryStats();loadProviderReminderHistory();},50);
 }
 
 var providerDiscoveryCurrentFilter="",providerDiscoveryModalAction=null;
@@ -5365,6 +5420,29 @@ async function loadProviderDiscoveryStats(){
   if(btn){var n=Number(data.publishableWithoutLocation||0);btn.disabled=n<1;btn.textContent=n>0?(lang==="ar"?"إرسال تنبيه إلى "+n+" مقدم خدمة":"Notify "+n+" providers"):(lang==="ar"?"لا يوجد حساب يحتاج تنبيه":"No provider needs a reminder");}
   if(updated){var now=new Date();updated.textContent=(lang==="ar"?"آخر تحديث: ":"Last updated: ")+now.toLocaleTimeString(lang==="ar"?"ar-SA":"en-US",{hour:"2-digit",minute:"2-digit"});}
 }
+function providerReminderDate(value){
+  if(!value)return lang==="ar"?"لم يرسل سابقاً":"Never sent";
+  var d=new Date(value);
+  return isNaN(d.getTime())?esc(String(value)):esc(d.toLocaleString(lang==="ar"?"ar-SA":"en-US"));
+}
+var providerReminderHistoryCache=[];
+async function loadProviderReminderHistory(){
+  var body=document.getElementById("provider-reminder-history-body");
+  if(!body)return;
+  body.innerHTML='<div class="loading">'+(lang==="ar"?"جاري تحميل السجل...":"Loading history...")+'</div>';
+  var data=await api("/provider-discovery/reminder-history?limit=50");
+  if(!data||!data.success){body.innerHTML='<div class="empty">'+(lang==="ar"?"تعذر تحميل سجل التنبيهات":"Unable to load reminder history")+'</div>';return;}
+  providerReminderHistoryCache=data.history||[];
+  if(!providerReminderHistoryCache.length){body.innerHTML='<div class="empty">'+(lang==="ar"?"لا توجد تنبيهات مسجلة حتى الآن":"No reminder history yet")+'</div>';return;}
+  body.innerHTML='<div class="table-wrap" style="box-shadow:none;border-radius:0"><table><thead><tr><th>'+(lang==="ar"?"التاريخ":"Date")+'</th><th>'+(lang==="ar"?"النوع":"Type")+'</th><th>'+(lang==="ar"?"المستهدفون":"Targeted")+'</th><th>'+(lang==="ar"?"مقبول للإرسال":"Accepted")+'</th><th>'+(lang==="ar"?"فشل":"Failed")+'</th><th>'+(lang==="ar"?"التفاصيل":"Details")+'</th></tr></thead><tbody>'+providerReminderHistoryCache.map(function(item,index){var hasRecipients=item.recipients&&item.recipients.length;return '<tr><td>'+providerReminderDate(item.createdAt)+'</td><td>'+(item.scope==="single"?(lang==="ar"?"فردي":"Single"):(lang==="ar"?"جماعي":"Bulk"))+'</td><td>'+Number(item.targeted||0)+'</td><td>'+Number(item.sentCount||0)+'</td><td>'+Number(item.failedCount||0)+'</td><td>'+(hasRecipients?'<button class="btn btn-sm btn-secondary" data-index="'+index+'" onclick="showProviderReminderHistoryDetails(Number(this.dataset.index))">'+(lang==="ar"?"عرض الأسماء":"View recipients")+'</button>':'<span style="font-size:11px;color:var(--text3)">'+(lang==="ar"?"سجل قديم — الأسماء غير محفوظة":"Legacy record — recipients not stored")+'</span>')+'</td></tr>';}).join("")+'</tbody></table></div>';
+}
+function showProviderReminderHistoryDetails(index){
+  var item=providerReminderHistoryCache[index];if(!item)return;
+  var recipients=item.recipients||[];
+  var lines=recipients.map(function(r){return (r.displayName||r.email||r.uid)+(r.email&&r.displayName?" — "+r.email:"");}).join("\n");
+  showProviderDiscoveryModal({type:"info",title:lang==="ar"?"المستلمون المستهدفون":"Targeted recipients",message:lines|| (lang==="ar"?"لا توجد أسماء محفوظة لهذا السجل.":"No recipient names stored for this record.")});
+}
+
 async function openProviderDiscoveryList(filter){
   providerDiscoveryCurrentFilter=filter||"missing";
   var wrap=document.getElementById("provider-discovery-list"),body=document.getElementById("provider-discovery-list-body"),title=document.getElementById("provider-discovery-list-title");
@@ -5375,7 +5453,7 @@ async function openProviderDiscoveryList(filter){
   var data=await api("/provider-discovery/list?filter="+encodeURIComponent(providerDiscoveryCurrentFilter));
   if(!data||!data.success){body.innerHTML='<div class="empty">'+(lang==="ar"?"تعذر تحميل القائمة":"Unable to load list")+'</div>';return;}
   if(!data.providers||!data.providers.length){body.innerHTML='<div class="empty">'+t("noData")+'</div>';return;}
-  body.innerHTML='<div class="table-wrap" style="box-shadow:none;border-radius:0"><table><thead><tr><th>'+(lang==="ar"?"الاسم":"Name")+'</th><th>'+(lang==="ar"?"التواصل":"Contact")+'</th><th>'+(lang==="ar"?"الحساب":"Account")+'</th><th>'+(lang==="ar"?"الموقع":"Location")+'</th><th>'+(lang==="ar"?"إجراء":"Action")+'</th></tr></thead><tbody>'+data.providers.map(function(p){var status=p.publicLocationEnabled?(lang==="ar"?"ظاهر":"Visible"):(p.canPublishLocation?(lang==="ar"?"يستطيع التفعيل":"Can publish"):(lang==="ar"?"الحساب موقوف":"Account blocked"));return '<tr><td><strong>'+esc(p.displayName||"-")+'</strong><div style="font-size:11px;color:var(--text3)">'+esc(p.email||"")+'</div></td><td>'+esc(p.phone||"-")+'</td><td><span class="badge '+(p.canPublishLocation?"badge-green":"badge-gray")+'">'+esc(p.accountStatus||"active")+'</span><div style="font-size:11px;color:var(--text3);margin-top:4px">'+esc(p.subscriptionStatus||"")+'</div></td><td>'+esc(p.publicCity||status)+(p.hasPrivateLocation&&!p.publicLocationEnabled?'<div style="font-size:11px;color:var(--info)">'+(lang==="ar"?"يوجد موقع خاص محفوظ":"Private location exists")+'</div>':"")+'</td><td>'+(!p.publicLocationEnabled&&p.canPublishLocation?'<button class="btn btn-sm btn-primary" data-uid="'+esc(p.uid)+'" onclick="sendProviderLocationReminder(this.dataset.uid)">'+(lang==="ar"?"تنبيه":"Notify")+'</button>':"-")+'</td></tr>';}).join("")+'</tbody></table></div>';
+  body.innerHTML='<div class="table-wrap" style="box-shadow:none;border-radius:0"><table><thead><tr><th>'+(lang==="ar"?"الاسم":"Name")+'</th><th>'+(lang==="ar"?"التواصل":"Contact")+'</th><th>'+(lang==="ar"?"الحساب":"Account")+'</th><th>'+(lang==="ar"?"الموقع":"Location")+'</th><th>'+(lang==="ar"?"آخر تنبيه":"Last reminder")+'</th><th>'+(lang==="ar"?"إجراء":"Action")+'</th></tr></thead><tbody>'+data.providers.map(function(p){var status=p.publicLocationEnabled?(lang==="ar"?"ظاهر":"Visible"):(p.canPublishLocation?(lang==="ar"?"يستطيع التفعيل":"Can publish"):(lang==="ar"?"الحساب موقوف":"Account blocked"));return '<tr><td><strong>'+esc(p.displayName||"-")+'</strong><div style="font-size:11px;color:var(--text3)">'+esc(p.email||"")+'</div></td><td>'+esc(p.phone||"-")+'</td><td><span class="badge '+(p.canPublishLocation?"badge-green":"badge-gray")+'">'+esc(p.accountStatus||"active")+'</span><div style="font-size:11px;color:var(--text3);margin-top:4px">'+esc(p.subscriptionStatus||"")+'</div></td><td>'+esc(p.publicCity||status)+(p.hasPrivateLocation&&!p.publicLocationEnabled?'<div style="font-size:11px;color:var(--info)">'+(lang==="ar"?"يوجد موقع خاص محفوظ":"Private location exists")+'</div>':"")+'</td><td>'+providerReminderDate(p.lastReminderAt)+'</td><td>'+(!p.publicLocationEnabled&&p.canPublishLocation?'<button class="btn btn-sm btn-primary" data-uid="'+esc(p.uid)+'" onclick="sendProviderLocationReminder(this.dataset.uid)">'+(lang==="ar"?"تنبيه":"Notify")+'</button>':"-")+'</td></tr>';}).join("")+'</tbody></table></div>';
 }
 function closeProviderDiscoveryList(){var wrap=document.getElementById("provider-discovery-list");if(wrap)wrap.style.display="none";providerDiscoveryCurrentFilter="";document.querySelectorAll(".provider-stat").forEach(function(x){x.classList.remove("selected");});}
 async function sendProviderLocationReminder(uid){
@@ -5388,7 +5466,7 @@ async function performProviderLocationReminder(uid){
   if(result){result.className="provider-reminder-result show loading";result.textContent=lang==="ar"?"جاري إرسال التنبيه...":"Sending reminder...";}
   try{var payload={confirm:true};if(uid)payload.uid=uid;var data=await api("/provider-discovery/remind-missing-location",{method:"POST",body:JSON.stringify(payload)});if(!data||!data.success)throw new Error(data&&data.error||"Failed");var sent=Number(data.sentCount||0),targeted=Number(data.targeted||0),failed=Number(data.failedCount||0);if(result){result.className="provider-reminder-result show "+(failed>0&&sent===0?"error":"success");result.textContent=(lang==="ar"?"المستهدفون: "+targeted+" — تم الإرسال: "+sent+(failed?" — تعذر: "+failed:""):"Targeted: "+targeted+" — Sent: "+sent+(failed?" — Failed: "+failed:""));}showProviderDiscoveryModal({type:failed>0&&sent===0?"error":"success",title:failed>0&&sent===0?(lang==="ar"?"تعذر الإرسال":"Unable to send"):(lang==="ar"?"تم الإرسال":"Sent"),message:failed>0&&sent===0?(lang==="ar"?"تعذر إرسال التنبيه. حاول مرة أخرى.":"Unable to send the reminder. Please try again."):(lang==="ar"?"تم إرسال التنبيه بنجاح.":"The reminder was sent successfully.")});}
   catch(e){if(result){result.className="provider-reminder-result show error";result.textContent=lang==="ar"?"تعذر إرسال التنبيه.":"Unable to send reminder.";}showProviderDiscoveryModal({type:"error",title:lang==="ar"?"تعذر الإرسال":"Unable to send",message:lang==="ar"?"تعذر إرسال التنبيه. حاول مرة أخرى.":"Unable to send the reminder. Please try again."});}
-  finally{await loadProviderDiscoveryStats();if(providerDiscoveryCurrentFilter)await openProviderDiscoveryList(providerDiscoveryCurrentFilter);}
+  finally{await loadProviderDiscoveryStats();await loadProviderReminderHistory();if(providerDiscoveryCurrentFilter)await openProviderDiscoveryList(providerDiscoveryCurrentFilter);}
 }
 
 function updatePhoneSignupRequirementHint(){
@@ -7189,6 +7267,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const filter = url.searchParams.get("filter") || "missing";
             return jsonResponse({ success:true, ...(await providerDiscoveryAdminList(accessToken,filter)) });
           }
+          if (path === "/admin/api/provider-discovery/reminder-history" && request.method === "GET") {
+            const rawLimit = Number(url.searchParams.get("limit") || 50);
+            const limit = Number.isInteger(rawLimit) ? Math.max(1, Math.min(100, rawLimit)) : 50;
+            return jsonResponse({ success:true, history:await providerLocationReminderHistory(accessToken,limit) });
+          }
           if (path === "/admin/api/provider-discovery/remind-missing-location" && request.method === "POST") {
             const body=await request.json().catch(()=>({}));
             if(body?.confirm!==true)return jsonResponse({ error:"Confirmation required" },400);
@@ -7199,7 +7282,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const message="حدّد موقع الاكتشاف العام من الإعدادات حتى يظهر حسابك للعملاء وتظهر المسافة.";
             const result=await sendAdminBroadcast(targets,title,message,accessToken);
             const auditId="provider-location-reminder-"+crypto.randomUUID();
-            await updateFirestoreDocument("admin_audit_logs",auditId,{action:"provider_discovery_location_reminder",targeted:targets.length,sentCount:result.sentCount,failedCount:result.failedCount,scope:uid?"single":"all_missing",createdAt:new Date().toISOString(),changedBy:"admin_token"},accessToken);
+            const recipients=targets.slice(0,200).map((user)=>({
+              uid:user._id,
+              displayName:typeof user.displayName==="string"?user.displayName:"",
+              email:typeof user.email==="string"?user.email:""
+            }));
+            await updateFirestoreDocument("admin_audit_logs",auditId,{action:"provider_discovery_location_reminder",targeted:targets.length,sentCount:result.sentCount,failedCount:result.failedCount,scope:uid?"single":"all_missing",recipients,createdAt:new Date().toISOString(),changedBy:"admin_token"},accessToken);
             return jsonResponse({ success:true,targeted:targets.length,...result });
           }
           if (path === "/admin/api/phone-index/backfill" && request.method === "POST") {
