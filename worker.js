@@ -4284,6 +4284,27 @@ tr:hover td{background:#f8fafc}
 .toggle input{width:18px;height:18px;accent-color:var(--primary)}
 .settings-section{background:var(--card);border-radius:var(--radius);padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
 .settings-section h3{font-size:16px;font-weight:600;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.provider-discovery-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+.provider-discovery-copy{max-width:760px}
+.provider-discovery-copy p{font-size:13px;color:var(--text2);line-height:1.75;margin-top:6px}
+.provider-discovery-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:#ecfdf5;color:#047857;font-size:12px;font-weight:700;white-space:nowrap}
+.provider-discovery-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.provider-stat{padding:15px;border:1px solid var(--border);border-radius:12px;background:#fff;min-width:0}
+.provider-stat .provider-stat-label{font-size:12px;color:var(--text2);line-height:1.45}
+.provider-stat .provider-stat-value{font-size:28px;font-weight:800;margin-top:6px;line-height:1}
+.provider-stat.success{background:#f0fdf4;border-color:#bbf7d0}.provider-stat.success .provider-stat-value{color:#15803d}
+.provider-stat.warning{background:#fffbeb;border-color:#fde68a}.provider-stat.warning .provider-stat-value{color:#b45309}
+.provider-stat.info{background:#eff6ff;border-color:#bfdbfe}.provider-stat.info .provider-stat-value{color:#1d4ed8}
+.provider-stat.danger{background:#fef2f2;border-color:#fecaca}.provider-stat.danger .provider-stat-value{color:#b91c1c}
+.provider-stat.muted{background:#f8fafc}
+.provider-discovery-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0 10px}
+.provider-discovery-actions .btn{min-height:38px}
+.provider-reminder-result{display:none;padding:10px 12px;border-radius:8px;font-size:12px;margin-top:8px}
+.provider-reminder-result.show{display:block}.provider-reminder-result.success{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}.provider-reminder-result.error{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}.provider-reminder-result.loading{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.provider-radius-box{margin-top:18px;padding:16px;border:1px solid var(--border);border-radius:12px;background:#f8fafc}
+.provider-radius-box .form-group{margin-bottom:8px}
+.provider-radius-note{font-size:12px;color:#9a6700;line-height:1.65;margin-top:8px}
+.provider-discovery-updated{font-size:11px;color:var(--text3);margin-top:8px}
 .banner-preview{width:100%;max-width:400px;aspect-ratio:16/7;object-fit:cover;border-radius:8px;border:1px solid var(--border);margin-bottom:12px;background:#f1f5f9}
 .upload-row{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
 .file-input{font-size:13px}
@@ -4337,6 +4358,8 @@ html[dir="rtl"] .drill-close{float:left}
   .stats-grid{grid-template-columns:repeat(2,1fr);gap:10px}
   .filters{flex-direction:column;gap:8px}.filters select,.filters input{width:100%}
   .grid-2{grid-template-columns:1fr}
+  .provider-discovery-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .provider-discovery-actions .btn{flex:1;min-width:180px}
   .detail-grid{grid-template-columns:1fr;gap:10px}
   .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}
   .table-wrap table{min-width:640px}
@@ -4353,6 +4376,9 @@ html[dir="rtl"] .drill-close{float:left}
 }
 @media(max-width:480px){
   .stats-grid{grid-template-columns:1fr;gap:8px}
+  .provider-discovery-grid{grid-template-columns:1fr}
+  .provider-discovery-actions{flex-direction:column;align-items:stretch}
+  .provider-discovery-actions .btn{width:100%;min-width:0}
   .main{padding:10px;padding-top:66px}
   .stat-card .value{font-size:20px}
   .stat-card{padding:14px}
@@ -5077,13 +5103,12 @@ async function renderSettings(c){
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup" onchange="updatePhoneSignupRequirementHint()"'+(requirePhoneAtSignup?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+' <span id="s-requirePhoneAtSignup-status">'+(requirePhoneAtSignup?"ON":"OFF")+'</span></label><p id="s-requirePhoneAtSignup-hint" style="font-size:12px;color:var(--text2);margin-top:8px">'+(requirePhoneAtSignup?(lang==="ar"?"عند التفعيل، يجب على المستخدم الجديد إدخال رقم الجوال عند إنشاء الحساب.":"When enabled, new users must enter a phone number when creating an account."):(lang==="ar"?"يمكن للمستخدم الجديد إنشاء حساب بدون رقم جوال.":"When disabled, new users may create an account without a phone number."))+'</p></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" disabled> '+(lang==="ar"?"تسجيل الدخول برقم الجوال":"Phone number login")+' <span>OFF</span></label><p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"غير مفعل حالياً":"Currently disabled")+'</p></div>'+
     '</div>'+
-    '<div class="settings-section"><h3>'+(lang==="ar"?"مواقع مقدمي الخدمة والخريطة":"Provider discovery & map")+'</h3>'+
-    '<p style="font-size:13px;color:var(--text2);margin-bottom:14px">'+(lang==="ar"?"إحصاءات مجمعة فقط. لا تعرض هذه الصفحة إحداثيات خاصة أو عناوين المنازل. يظهر مقدم الخدمة على الخريطة فقط بعد تفعيل موقع الاكتشاف العام.":"Aggregate statistics only. No private coordinates or home addresses are shown. A provider appears on the map only after enabling a public discovery location.")+'</p>'+
-    '<div id="provider-discovery-stats" class="grid-2" style="margin-bottom:12px"><div style="padding:12px;border:1px solid var(--border);border-radius:10px">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div>'+
-    '<div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn btn-sm" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button><button type="button" class="btn btn-sm btn-primary" id="provider-location-reminder-btn" onclick="sendProviderLocationReminder()">'+(lang==="ar"?"إرسال تنبيه للناقصين المؤهلين":"Notify eligible providers missing location")+'</button></div>'+
-    '<div id="provider-location-reminder-result" style="font-size:12px;color:var(--text2);margin-top:8px"></div>'+
-    '<div class="form-group" style="margin-top:14px"><label>'+(lang==="ar"?"نطاق «القريب منك» المحفوظ":"Saved nearby discovery radius")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div>'+
-    '<p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"هذا الإعداد محفوظ وجاهز للنسخة القادمة، لكنه لا يغيّر سلوك التطبيق المنشور حالياً. الخريطة الحالية تبقى غير محدودة وتعرض كل مقدم خدمة نشر موقع اكتشاف عام عند عمل Zoom Out.":"This setting is stored for a future client release and does not change the currently published app. The current map remains unrestricted and shows every provider who published a public discovery location when zooming out.")+'</p>'+
+    '<div class="settings-section"><div class="provider-discovery-head"><div class="provider-discovery-copy"><h3 style="margin-bottom:0">'+(lang==="ar"?"مواقع مقدمي الخدمة والخريطة":"Provider discovery & map")+'</h3><p>'+(lang==="ar"?"تابع جاهزية ظهور مقدمي الخدمة على الخريطة وأرسل تنبيهًا فقط للحسابات المؤهلة التي لم تنشر موقع اكتشاف عام. لا تعرض هذه الصفحة أي إحداثيات خاصة أو عناوين منازل.":"Track provider map visibility and notify only eligible providers who have not published a public discovery location. No private coordinates or home addresses are shown.")+'</p></div><span class="provider-discovery-badge">'+(lang==="ar"?"خصوصية محمية":"Privacy protected")+'</span></div>'+
+    '<div id="provider-discovery-stats" class="provider-discovery-grid"><div class="provider-stat muted"><div class="provider-stat-label">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div></div>'+
+    '<div class="provider-discovery-actions"><button type="button" class="btn btn-secondary" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button><button type="button" class="btn btn-primary" id="provider-location-reminder-btn" onclick="sendProviderLocationReminder()" disabled>'+(lang==="ar"?"إرسال تنبيه للمؤهلين بدون موقع":"Notify eligible providers without location")+'</button></div>'+
+    '<div id="provider-location-reminder-result" class="provider-reminder-result" aria-live="polite"></div>'+
+    '<div id="provider-discovery-updated" class="provider-discovery-updated"></div>'+
+    '<div class="provider-radius-box"><div class="form-group"><label>'+(lang==="ar"?"نطاق «القريب منك» للنسخة القادمة":"Nearby radius for next app release")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div><div class="provider-radius-note">'+(lang==="ar"?"مهم: تغيير هذا الخيار يُحفظ في الباك إند لكنه لا يغيّر التطبيق المنشور حالياً. الخريطة الحالية تبقى بدون حد مسافة، وعند Zoom Out تظهر كل الحسابات التي نشرت موقع اكتشاف عام.":"Important: this setting is stored in the backend but does not change the currently published app. The current map has no distance limit; zooming out shows every provider who published a public discovery location.")+'</div></div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"بوابة تحديث التطبيق":"App update gate")+'</h3>'+
     '<p style="font-size:12px;color:var(--warning);margin-bottom:16px">'+(lang==="ar"?"اتركها متوقفة حتى يصبح الإصدار الجديد متاحاً في المتجر. عند التفعيل لا يمكن للتطبيقات الأقدم تجاوز شاشة التحديث.":"Leave this disabled until the new release is available in the store. Once enabled, older clients cannot bypass the update screen.")+'</p>'+
@@ -5164,44 +5189,61 @@ async function renderSettings(c){
 
 async function loadProviderDiscoveryStats(){
   var el=document.getElementById("provider-discovery-stats");
+  var btn=document.getElementById("provider-location-reminder-btn");
+  var updated=document.getElementById("provider-discovery-updated");
   if(!el)return;
-  el.innerHTML='<div style="padding:12px;border:1px solid var(--border);border-radius:10px">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div>';
+  if(btn)btn.disabled=true;
+  el.innerHTML='<div class="provider-stat muted"><div class="provider-stat-label">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div>';
   var data=await api("/provider-discovery/stats");
   if(!data||!data.success){
-    el.innerHTML='<div style="padding:12px;border:1px solid var(--border);border-radius:10px;color:var(--danger)">'+(lang==="ar"?"تعذر تحميل إحصاءات المواقع":"Unable to load location statistics")+'</div>';
+    el.innerHTML='<div class="provider-stat danger"><div class="provider-stat-label">'+(lang==="ar"?"تعذر تحميل إحصاءات المواقع":"Unable to load location statistics")+'</div></div>';
+    if(updated)updated.textContent="";
     return;
   }
-  function stat(label,value){return '<div style="padding:12px;border:1px solid var(--border);border-radius:10px"><div style="font-size:12px;color:var(--text2)">'+label+'</div><div style="font-size:24px;font-weight:700;margin-top:4px">'+Number(value||0)+'</div></div>';}
+  function stat(label,value,kind){return '<div class="provider-stat '+kind+'"><div class="provider-stat-label">'+label+'</div><div class="provider-stat-value">'+Number(value||0)+'</div></div>';}
   el.innerHTML=
-    stat(lang==="ar"?"إجمالي مقدمي الخدمة":"Total providers",data.totalProviders)+
-    stat(lang==="ar"?"موقع عام مفعّل":"Public location enabled",data.publicLocationEnabled)+
-    stat(lang==="ar"?"بدون موقع عام":"Without public location",data.withoutPublicLocation)+
-    stat(lang==="ar"?"موقع عام غير صالح":"Invalid public location",data.invalidPublicLocation)+
-    stat(lang==="ar"?"مؤهلون ويمكنهم النشر":"Eligible and can publish",data.eligibleWithoutPublicLocation)+
-    stat(lang==="ar"?"غير مؤهلين حالياً":"Currently ineligible",data.ineligibleWithoutPublicLocation);
+    stat(lang==="ar"?"إجمالي مقدمي الخدمة":"Total providers",data.totalProviders,"muted")+
+    stat(lang==="ar"?"ظاهرون على الخريطة":"Visible on map",data.publicLocationEnabled,"success")+
+    stat(lang==="ar"?"بدون موقع عام":"Without public location",data.withoutPublicLocation,"warning")+
+    stat(lang==="ar"?"موقع عام غير صالح":"Invalid public location",data.invalidPublicLocation,"danger")+
+    stat(lang==="ar"?"مؤهلون ويمكنهم النشر":"Eligible and can publish",data.eligibleWithoutPublicLocation,"info")+
+    stat(lang==="ar"?"غير مؤهلين حالياً":"Currently ineligible",data.ineligibleWithoutPublicLocation,"muted");
+  var targetCount=Number(data.eligibleWithoutPublicLocation||0);
+  if(btn){
+    btn.disabled=targetCount<1;
+    btn.textContent=targetCount>0
+      ?(lang==="ar"?"إرسال تنبيه إلى "+targetCount+" مقدم خدمة":"Notify "+targetCount+" eligible providers")
+      :(lang==="ar"?"لا يوجد مؤهلون بحاجة لتنبيه":"No eligible providers need a reminder");
+  }
+  if(updated){
+    var now=new Date();
+    updated.textContent=(lang==="ar"?"آخر تحديث: ":"Last updated: ")+now.toLocaleTimeString(lang==="ar"?"ar-SA":"en-US",{hour:"2-digit",minute:"2-digit"});
+  }
 }
 
 async function sendProviderLocationReminder(){
   var btn=document.getElementById("provider-location-reminder-btn");
   var result=document.getElementById("provider-location-reminder-result");
-  if(!btn)return;
-  var ok=confirm(lang==="ar"?"سيتم إرسال التنبيه فقط لمقدمي الخدمة المؤهلين الذين لم ينشروا موقع اكتشاف عام. متابعة؟":"Send only to eligible providers who have not published a public discovery location?");
+  if(!btn||btn.disabled)return;
+  var ok=confirm(lang==="ar"?"سيتم إرسال التنبيه فقط لمقدمي الخدمة المؤهلين الذين لم ينشروا موقع اكتشاف عام. لن يتم إرسال شيء للحسابات غير المؤهلة أو التي فعّلت الموقع مسبقاً. متابعة؟":"Only eligible providers without a public discovery location will be notified. Ineligible or already-visible providers will be skipped. Continue?");
   if(!ok)return;
   btn.disabled=true;
-  if(result)result.textContent=lang==="ar"?"جاري الإرسال...":"Sending...";
+  if(result){result.className="provider-reminder-result show loading";result.textContent=lang==="ar"?"جاري إرسال التنبيه...":"Sending reminder...";}
   try{
     var data=await api("/provider-discovery/remind-missing-location",{method:"POST",body:JSON.stringify({confirm:true})});
     if(!data||!data.success)throw new Error(data&&data.error||"Failed");
+    var targeted=Number(data.targeted||0),sent=Number(data.sentCount||0),failed=Number(data.failedCount||0);
     var msg=(lang==="ar"
-      ?"تمت معالجة "+Number(data.targeted||0)+" حساب. أُرسل إلى "+Number(data.sentCount||0)+" جهاز، وتعذر الإرسال إلى "+Number(data.failedCount||0)+"."
-      :"Processed "+Number(data.targeted||0)+" accounts. Sent to "+Number(data.sentCount||0)+" devices; "+Number(data.failedCount||0)+" failed.");
-    if(result)result.textContent=msg;
-    toast(lang==="ar"?"تم إرسال تنبيه الموقع":"Location reminder sent");
-    await loadProviderDiscoveryStats();
+      ?"المستهدفون: "+targeted+" — تم الإرسال: "+sent+(failed?" — تعذر: "+failed:"")
+      :"Targeted: "+targeted+" — Sent: "+sent+(failed?" — Failed: "+failed:""));
+    if(result){result.className="provider-reminder-result show "+(failed>0&&sent===0?"error":"success");result.textContent=msg;}
+    toast(lang==="ar"?"تمت معالجة تنبيه الموقع":"Location reminder processed");
   }catch(e){
-    if(result)result.textContent=lang==="ar"?"تعذر إرسال التنبيه.":"Unable to send reminder.";
+    if(result){result.className="provider-reminder-result show error";result.textContent=lang==="ar"?"تعذر إرسال التنبيه. حاول مرة أخرى.":"Unable to send the reminder. Please try again.";}
     toast(lang==="ar"?"تعذر إرسال التنبيه":"Reminder failed","error");
-  }finally{btn.disabled=false;}
+  }finally{
+    await loadProviderDiscoveryStats();
+  }
 }
 
 function updatePhoneSignupRequirementHint(){
