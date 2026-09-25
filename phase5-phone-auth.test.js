@@ -487,23 +487,35 @@ function assertStoreSubscriptionRequired(profile) {
   assert.equal(docs.get("public_profiles/provider-public").data.publicLocation, undefined);
   assert.equal(docs.get("public_profiles/provider-public").data.publicLocationEnabled, undefined);
 
-  // A provider can always withdraw public-location consent, even when their
-  // commercial entitlement is expired or their account is suspended. The
-  // inverse operation remains entitlement-gated.
-  for (const [uid, accountState] of [
-    ["provider-expired", { subscriptionStatus: "expired" }],
-    ["provider-suspended", { subscriptionStatus: "trialing", trialEndsAt: "2099-01-01T00:00:00.000Z", accountStatus: "suspended" }],
-  ]) {
-    put(`users/${uid}`, {
-      role: "provider", displayName: uid, createdAt: "2026-01-01T00:00:00.000Z",
-      publicLocationEnabled: true, publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" },
-      ...accountState,
-    });
-    put(`public_profiles/${uid}`, hooks.publicProfileFromPrivateUser(uid, docs.get(`users/${uid}`).data));
-    privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
-      publicLocationEnabled: true, publicLocation: { lat: 24.9, lng: 46.8, city: "Riyadh" },
-    }, uid));
-    assert.equal(privateResponse.status, 403);
+  // Public-location setup is not a paid entitlement. An otherwise-active
+  // provider may publish or replace a public discovery location even after a
+  // store subscription/trial expires. Account suspension still blocks
+  // publication. Withdrawal remains allowed in both cases.
+  put("users/provider-expired", {
+    role: "provider", displayName: "provider-expired", createdAt: "2026-01-01T00:00:00.000Z",
+    subscriptionStatus: "expired", publicLocationEnabled: true,
+    publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" },
+  });
+  put("public_profiles/provider-expired", hooks.publicProfileFromPrivateUser("provider-expired", docs.get("users/provider-expired").data));
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
+    publicLocationEnabled: true, publicLocation: { lat: 24.9, lng: 46.8, city: "Riyadh" },
+  }, "provider-expired"));
+  assert.equal(privateResponse.status, 200);
+  assert.deepEqual(await privateResponse.json(), { success: true, publicLocationEnabled: true });
+  assert.deepEqual(docs.get("users/provider-expired").data.publicLocation, { lat: 24.9, lng: 46.8, city: "Riyadh" });
+
+  put("users/provider-suspended", {
+    role: "provider", displayName: "provider-suspended", createdAt: "2026-01-01T00:00:00.000Z",
+    subscriptionStatus: "trialing", trialEndsAt: "2099-01-01T00:00:00.000Z", accountStatus: "suspended",
+    publicLocationEnabled: true, publicLocation: { lat: 24.8, lng: 46.7, city: "Riyadh" },
+  });
+  put("public_profiles/provider-suspended", hooks.publicProfileFromPrivateUser("provider-suspended", docs.get("users/provider-suspended").data));
+  privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", {
+    publicLocationEnabled: true, publicLocation: { lat: 24.9, lng: 46.8, city: "Riyadh" },
+  }, "provider-suspended"));
+  assert.equal(privateResponse.status, 403);
+
+  for (const uid of ["provider-expired", "provider-suspended"]) {
     privateResponse = await hooks.handleRequest(authorizedReq("/profile/public-discovery", { publicLocationEnabled: false }, uid));
     assert.equal(privateResponse.status, 200);
     assert.equal(docs.get(`users/${uid}`).data.publicLocation, null);
