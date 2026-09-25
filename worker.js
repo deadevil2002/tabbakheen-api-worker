@@ -288,7 +288,8 @@
       supportWhatsapp: "",
       deliveryPricing: { currency: "SAR", baseFee: 5, perKmInsideCity: 2, perKmOutsideCity: 2, maxFee: 50 },
       defaultLanguage: "ar",
-      subscriptionWarningDays: 7
+      subscriptionWarningDays: 7,
+      providerDiscoveryRadiusKm: null
     };
     function validPublicHttpsUrl(value, maximumLength = 2048) {
       if (typeof value !== "string" || !value || value.length > maximumLength) return false;
@@ -327,7 +328,8 @@
           maxFee: finiteAmount(pricing.maxFee, PUBLIC_APP_SETTINGS_DEFAULT.deliveryPricing.maxFee, 1e5)
         },
         defaultLanguage: source.defaultLanguage === "en" ? "en" : "ar",
-        subscriptionWarningDays: Number.isInteger(source.subscriptionWarningDays) && source.subscriptionWarningDays >= 0 && source.subscriptionWarningDays <= 90 ? source.subscriptionWarningDays : PUBLIC_APP_SETTINGS_DEFAULT.subscriptionWarningDays
+        subscriptionWarningDays: Number.isInteger(source.subscriptionWarningDays) && source.subscriptionWarningDays >= 0 && source.subscriptionWarningDays <= 90 ? source.subscriptionWarningDays : PUBLIC_APP_SETTINGS_DEFAULT.subscriptionWarningDays,
+        providerDiscoveryRadiusKm: [10, 25, 50, 100].includes(source.providerDiscoveryRadiusKm) ? source.providerDiscoveryRadiusKm : null
       };
     }
     function publicOfferDto(offer) {
@@ -656,10 +658,10 @@
       ]);
       if (!sourceSnapshot || sourceSnapshot.data.role !== "provider") return { ok: false, code: "forbidden" };
       if (publicProfileDeletionActive(deletionSnapshot)) return { ok: false, code: "account_deletion_blocked" };
-      // Withdrawal is always available to the authenticated provider. An
-      // expired/suspended account must never be trapped with previously
-      // published coordinates. Enabling/replacing is the only gated action.
-      if (enabled && !isProviderAccountAllowed(sourceSnapshot.data)) return { ok: false, code: "forbidden" };
+      // Public-location preference is not a billing entitlement. Providers may
+      // prepare/publish their discovery location regardless of trial or store
+      // subscription state. Suspended/disabled accounts still cannot publish.
+      if (enabled && !canProviderManagePublicLocation(sourceSnapshot.data)) return { ok: false, code: "forbidden" };
       const fields = enabled ? { publicLocationEnabled: true, publicLocation: location } : { publicLocationEnabled: false, publicLocation: null };
       const nextUser = { ...sourceSnapshot.data, ...fields };
       const profile = publicProfileFromPrivateUser(uid, nextUser);
@@ -753,6 +755,85 @@
     }
     __name(classifyPublicProfileProjection, "classifyPublicProfileProjection");
     __name2(classifyPublicProfileProjection, "classifyPublicProfileProjection");
+    function providerDiscoveryClassification(user) {
+      if (!user || user.role !== "provider") return null;
+      const projected = publicProfileFromPrivateUser(user._id, user);
+      const validPublic = !!projected && projected.publicLocationEnabled === true && !!projected.publicLocation;
+      const invalidPublic = user.publicLocationEnabled === true && !validPublic;
+      const privateOnly = !!user.location && !validPublic;
+      return { validPublic, invalidPublic, privateOnly };
+    }
+    __name(providerDiscoveryClassification, "providerDiscoveryClassification");
+    __name2(providerDiscoveryClassification, "providerDiscoveryClassification");
+
+    async function providerDiscoveryStats(accessToken) {
+      const users = await listAllUsers(accessToken);
+      let totalProviders = 0, publicLocationEnabled = 0, withoutPublicLocation = 0, invalidPublicLocation = 0, privateLocationOnly = 0, publishableWithoutLocation = 0;
+      for (const user of users) {
+        const state = providerDiscoveryClassification(user);
+        if (!state) continue;
+        totalProviders++;
+        if (state.validPublic) publicLocationEnabled++;
+        else {
+          withoutPublicLocation++;
+          if (state.invalidPublic) invalidPublicLocation++;
+          if (state.privateOnly) privateLocationOnly++;
+          if (canProviderManagePublicLocation(user)) publishableWithoutLocation++;
+        }
+      }
+      return { totalProviders, publicLocationEnabled, withoutPublicLocation, invalidPublicLocation, privateLocationOnly, publishableWithoutLocation };
+    }
+    __name(providerDiscoveryStats, "providerDiscoveryStats");
+    __name2(providerDiscoveryStats, "providerDiscoveryStats");
+
+    async function providerDiscoveryAdminList(accessToken, filter) {
+      const users = await listAllUsers(accessToken);
+      const allowed = new Set(["all", "visible", "missing", "invalid", "private_only"]);
+      const selected = allowed.has(filter) ? filter : "missing";
+      const rows = [];
+      for (const user of users) {
+        const state = providerDiscoveryClassification(user);
+        if (!state) continue;
+        const matches = selected === "all"
+          || selected === "visible" && state.validPublic
+          || selected === "missing" && !state.validPublic
+          || selected === "invalid" && state.invalidPublic
+          || selected === "private_only" && state.privateOnly;
+        if (!matches) continue;
+        rows.push({
+          uid: user._id,
+          displayName: typeof user.displayName === "string" ? user.displayName : "",
+          email: typeof user.email === "string" ? user.email : "",
+          phone: typeof user.phone === "string" ? user.phone : "",
+          accountStatus: typeof user.accountStatus === "string" ? user.accountStatus : "active",
+          subscriptionStatus: typeof user.subscriptionStatus === "string" ? user.subscriptionStatus : "",
+          publicLocationEnabled: state.validPublic,
+          publicCity: state.validPublic && typeof user.publicLocation?.city === "string" ? user.publicLocation.city : "",
+          hasPrivateLocation: !!user.location,
+          canPublishLocation: canProviderManagePublicLocation(user)
+        });
+      }
+      rows.sort((a,b)=>String(a.displayName||a.email).localeCompare(String(b.displayName||b.email),"ar"));
+      return { filter: selected, count: rows.length, providers: rows.slice(0, 200) };
+    }
+    __name(providerDiscoveryAdminList, "providerDiscoveryAdminList");
+    __name2(providerDiscoveryAdminList, "providerDiscoveryAdminList");
+
+    async function providerDiscoveryReminderTargets(accessToken, onlyUid) {
+      const users = await listAllUsers(accessToken);
+      const targets = [];
+      for (const user of users) {
+        const state = providerDiscoveryClassification(user);
+        if (!state || state.validPublic || !canProviderManagePublicLocation(user)) continue;
+        if (onlyUid && user._id !== onlyUid) continue;
+        const deletion = await getFirestoreDoc("account_deletion_requests", user._id, accessToken);
+        if (deletion && ["requested","in_progress","auth_deleted","cleanup_pending","completed"].includes(deletion.status)) continue;
+        targets.push(user);
+      }
+      return targets;
+    }
+    __name(providerDiscoveryReminderTargets, "providerDiscoveryReminderTargets");
+    __name2(providerDiscoveryReminderTargets, "providerDiscoveryReminderTargets");
     function canRequestOrderContact(order, uid, target, purpose) {
       if (!order || purpose !== "contact" || !["provider", "driver"].includes(target)) return false;
       // Contact is operational data, not a durable participant directory. It
@@ -918,6 +999,11 @@
     }
     __name(isProviderAccountAllowed, "isProviderAccountAllowed");
     __name2(isProviderAccountAllowed, "isProviderAccountAllowed");
+    function canProviderManagePublicLocation(user) {
+      return !!user && user.role === "provider" && user.accountStatus !== "suspended" && user.accountStatus !== "disabled";
+    }
+    __name(canProviderManagePublicLocation, "canProviderManagePublicLocation");
+    __name2(canProviderManagePublicLocation, "canProviderManagePublicLocation");
     function isDeliveryNotificationEvent(event) {
       return ["self_pickup_selected", "self_pickup_completed", "driver_delivery_requested", "driver_assigned", "driver_rejected", "picked_up", "arrived", "delivery_pending_confirmation", "delivered", "driver_assigned_by_provider"].includes(event);
     }
@@ -4367,6 +4453,26 @@ tr:hover td{background:#f8fafc}
 .toggle input{width:18px;height:18px;accent-color:var(--primary)}
 .settings-section{background:var(--card);border-radius:var(--radius);padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
 .settings-section h3{font-size:16px;font-weight:600;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.provider-discovery-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+.provider-discovery-copy{max-width:820px}.provider-discovery-copy p{font-size:13px;color:var(--text2);line-height:1.75;margin-top:6px}
+.provider-discovery-badge{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;background:#ecfdf5;color:#047857;font-size:12px;font-weight:700;white-space:nowrap}
+.provider-discovery-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.provider-stat{padding:15px;border:1px solid var(--border);border-radius:12px;background:#fff;cursor:pointer;transition:.15s;text-align:start}
+.provider-stat:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(15,23,42,.06)}
+.provider-stat.selected{outline:2px solid var(--primary);outline-offset:-2px}
+.provider-stat .provider-stat-label{font-size:12px;color:var(--text2);line-height:1.45}
+.provider-stat .provider-stat-value{font-size:28px;font-weight:800;margin-top:6px;line-height:1}
+.provider-stat.success{background:#f0fdf4;border-color:#bbf7d0}.provider-stat.success .provider-stat-value{color:#15803d}
+.provider-stat.warning{background:#fffbeb;border-color:#fde68a}.provider-stat.warning .provider-stat-value{color:#b45309}
+.provider-stat.info{background:#eff6ff;border-color:#bfdbfe}.provider-stat.info .provider-stat-value{color:#1d4ed8}
+.provider-stat.danger{background:#fef2f2;border-color:#fecaca}.provider-stat.danger .provider-stat-value{color:#b91c1c}
+.provider-stat.muted{background:#f8fafc}
+.provider-discovery-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0 10px}
+.provider-reminder-result{display:none;padding:10px 12px;border-radius:8px;font-size:12px;margin-top:8px}
+.provider-reminder-result.show{display:block}.provider-reminder-result.success{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}.provider-reminder-result.error{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}.provider-reminder-result.loading{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.provider-radius-box{margin-top:18px;padding:16px;border:1px solid var(--border);border-radius:12px;background:#f8fafc}
+.provider-radius-note{font-size:12px;color:#9a6700;line-height:1.65;margin-top:8px}.provider-discovery-updated{font-size:11px;color:var(--text3);margin-top:8px}
+.provider-list{margin-top:18px;border:1px solid var(--border);border-radius:12px;overflow:hidden}.provider-list-head{padding:12px 14px;background:#f8fafc;display:flex;justify-content:space-between;gap:10px;align-items:center}.provider-list-body{overflow:auto}
 .banner-preview{width:100%;max-width:400px;aspect-ratio:16/7;object-fit:cover;border-radius:8px;border:1px solid var(--border);margin-bottom:12px;background:#f1f5f9}
 .upload-row{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
 .file-input{font-size:13px}
@@ -4420,6 +4526,8 @@ html[dir="rtl"] .drill-close{float:left}
   .stats-grid{grid-template-columns:repeat(2,1fr);gap:10px}
   .filters{flex-direction:column;gap:8px}.filters select,.filters input{width:100%}
   .grid-2{grid-template-columns:1fr}
+  .provider-discovery-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .provider-discovery-actions .btn{flex:1;min-width:180px}
   .detail-grid{grid-template-columns:1fr;gap:10px}
   .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}
   .table-wrap table{min-width:640px}
@@ -4436,6 +4544,9 @@ html[dir="rtl"] .drill-close{float:left}
 }
 @media(max-width:480px){
   .stats-grid{grid-template-columns:1fr;gap:8px}
+  .provider-discovery-grid{grid-template-columns:1fr}
+  .provider-discovery-actions{flex-direction:column;align-items:stretch}
+  .provider-discovery-actions .btn{width:100%;min-width:0}
   .main{padding:10px;padding-top:66px}
   .stat-card .value{font-size:20px}
   .stat-card{padding:14px}
@@ -5151,6 +5262,7 @@ async function renderSettings(c){
   var bannerUrl=appSettings.bannerImageUrl||"";
   var bannerEnabled=appSettings.bannerEnabled!==false;
   var requirePhoneAtSignup=appSettings.requirePhoneAtSignup!==false;
+  var providerDiscoveryRadiusKm=[10,25,50,100].indexOf(appSettings.providerDiscoveryRadiusKm)>=0?appSettings.providerDiscoveryRadiusKm:"";
   var clientVersionGate=appSettings.clientVersionGate||{enabled:false,ios:{minimumVersion:"",minimumBuild:"",storeUrl:""},android:{minimumVersion:"",minimumBuild:"",storeUrl:""}};
   var iosGate=clientVersionGate.ios||{minimumVersion:"",minimumBuild:"",storeUrl:""};
   var androidGate=clientVersionGate.android||{minimumVersion:"",minimumBuild:"",storeUrl:""};
@@ -5159,6 +5271,12 @@ async function renderSettings(c){
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup" onchange="updatePhoneSignupRequirementHint()"'+(requirePhoneAtSignup?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+' <span id="s-requirePhoneAtSignup-status">'+(requirePhoneAtSignup?"ON":"OFF")+'</span></label><p id="s-requirePhoneAtSignup-hint" style="font-size:12px;color:var(--text2);margin-top:8px">'+(requirePhoneAtSignup?(lang==="ar"?"عند التفعيل، يجب على المستخدم الجديد إدخال رقم الجوال عند إنشاء الحساب.":"When enabled, new users must enter a phone number when creating an account."):(lang==="ar"?"يمكن للمستخدم الجديد إنشاء حساب بدون رقم جوال.":"When disabled, new users may create an account without a phone number."))+'</p></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" disabled> '+(lang==="ar"?"تسجيل الدخول برقم الجوال":"Phone number login")+' <span>OFF</span></label><p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"غير مفعل حالياً":"Currently disabled")+'</p></div>'+
     '</div>'+
+    '<div class="settings-section"><div class="provider-discovery-head"><div class="provider-discovery-copy"><h3 style="margin-bottom:0">'+(lang==="ar"?"مواقع مقدمي الخدمة والخريطة":"Provider discovery & map")+'</h3><p>'+(lang==="ar"?"اضغط على أي بطاقة لعرض الحسابات التابعة لها. يمكن لكل مقدم خدمة نشط تحديد موقع الاكتشاف العام بدون اشتراط اشتراك أو تجربة سارية. لا تعرض هذه الصفحة إحداثيات خاصة أو عناوين المنازل.":"Click any card to view matching accounts. Any active provider can set a public discovery location without requiring an active trial or store subscription. No private coordinates or home addresses are shown.")+'</p></div><span class="provider-discovery-badge">'+(lang==="ar"?"خصوصية محمية":"Privacy protected")+'</span></div>'+
+    '<div id="provider-discovery-stats" class="provider-discovery-grid"><div class="provider-stat muted"><div class="provider-stat-label">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div></div>'+
+    '<div class="provider-discovery-actions"><button type="button" class="btn btn-secondary" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button><button type="button" class="btn btn-primary" id="provider-location-reminder-btn" onclick="sendProviderLocationReminder()" disabled>'+(lang==="ar"?"إرسال تنبيه لمن لم يحدد الموقع":"Notify providers missing location")+'</button></div>'+
+    '<div id="provider-location-reminder-result" class="provider-reminder-result" aria-live="polite"></div><div id="provider-discovery-updated" class="provider-discovery-updated"></div>'+
+    '<div id="provider-discovery-list" class="provider-list" style="display:none"><div class="provider-list-head"><strong id="provider-discovery-list-title"></strong><button type="button" class="btn btn-sm btn-secondary" onclick="closeProviderDiscoveryList()">'+(lang==="ar"?"إغلاق":"Close")+'</button></div><div id="provider-discovery-list-body" class="provider-list-body"></div></div>'+
+    '<div class="provider-radius-box"><div class="form-group"><label>'+(lang==="ar"?"نطاق «القريب منك» للنسخة القادمة":"Nearby radius for next app release")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div><div class="provider-radius-note">'+(lang==="ar"?"الإعداد الحالي «مفتوح» يعني بدون حد مسافة. التطبيق المنشور حالياً لا يستخدم هذا الخيار بعد، والخريطة تعرض كل من نشر موقع اكتشاف عام عند عمل Zoom Out.":"Unlimited means no distance cap. The currently published app does not consume this setting yet; zooming out shows every provider who published a public discovery location.")+'</div></div></div>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"بوابة تحديث التطبيق":"App update gate")+'</h3>'+
     '<p style="font-size:12px;color:var(--warning);margin-bottom:16px">'+(lang==="ar"?"اتركها متوقفة حتى يصبح الإصدار الجديد متاحاً في المتجر. عند التفعيل لا يمكن للتطبيقات الأقدم تجاوز شاشة التحديث.":"Leave this disabled until the new release is available in the store. Once enabled, older clients cannot bypass the update screen.")+'</p>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-cvg-enabled"'+(clientVersionGate.enabled?" checked":"")+'> '+(lang==="ar"?"فرض التحديث الأدنى":"Enforce minimum app version")+'</label></div>'+
@@ -5191,41 +5309,13 @@ async function renderSettings(c){
     '<div id="pricing-validation" style="margin-top:8px"></div>'+
     '<div id="pricing-preview" style="margin-top:12px;padding:16px;background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:10px"></div>'+
     '</div>'+
-    '<div class="settings-section"><h3>'+t("subWarning")+'</h3>'+
-    '<div class="form-group"><label>'+t("warningDays")+'</label><input type="number" id="s-warningDays" value="'+(appSettings.subscriptionWarningDays!=null?appSettings.subscriptionWarningDays:7)+'"></div>'+
-    '</div>'+
     '<div class="settings-section"><h3>'+t("adminNotifications")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewUser"'+(appSettings.notifyOnNewUser?" checked":"")+'> '+t("notifyNewUser")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewProvider"'+(appSettings.notifyOnNewProvider?" checked":"")+'> '+t("notifyNewProvider")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewDriver"'+(appSettings.notifyOnNewDriver?" checked":"")+'> '+t("notifyNewDriver")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyCrVerification"'+(appSettings.notifyOnCrVerification?" checked":"")+'> '+t("notifyCrVerification")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyFreelanceRequest"'+(appSettings.notifyOnFreelanceRequest?" checked":"")+'> '+t("notifyFreelanceRequest")+'</label></div>'+
-    '</div>'+
-    '<div class="settings-section"><h3>'+t("providerSubSettings")+'</h3>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ps-active"'+(appSettings.providerSubscription&&appSettings.providerSubscription.active?" checked":"")+'> '+t("subActive")+'</label></div>'+
-    '<div class="form-group"><label>'+t("subPrice")+'</label><input type="number" min="0" step="0.5" id="s-ps-price" value="'+(appSettings.providerSubscription&&appSettings.providerSubscription.price!=null?appSettings.providerSubscription.price:15)+'"></div>'+
-    '<div class="form-group"><label>'+t("subPeriod")+'</label><select id="s-ps-period"><option value="weekly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="weekly"?" selected":"")+'>'+t("periodWeekly")+'</option><option value="monthly"'+((appSettings.providerSubscription&&appSettings.providerSubscription.period==="monthly")||(!appSettings.providerSubscription||!appSettings.providerSubscription.period)?" selected":"")+'>'+t("periodMonthly")+'</option><option value="quarterly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="quarterly"?" selected":"")+'>'+t("periodQuarterly")+'</option><option value="yearly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="yearly"?" selected":"")+'>'+t("periodYearly")+'</option></select></div>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ps-freeTrialEnabled"'+(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialEnabled?" checked":"")+'> '+t("freeTrialEnabledLabel")+'</label></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextArLabel")+'</label><input id="s-ps-freeTrialTextAr" value="'+esc(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialTextAr||"")+'"></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextEnLabel")+'</label><input id="s-ps-freeTrialTextEn" value="'+esc(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialTextEn||"")+'"></div>'+
-    '</div>'+
-    '<div class="settings-section"><h3>'+t("driverSubSettings")+'</h3>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ds-active"'+(appSettings.driverSubscription&&appSettings.driverSubscription.active?" checked":"")+'> '+t("subActive")+'</label></div>'+
-    '<div class="form-group"><label>'+t("subPrice")+'</label><input type="number" min="0" step="0.5" id="s-ds-price" value="'+(appSettings.driverSubscription&&appSettings.driverSubscription.price!=null?appSettings.driverSubscription.price:15)+'"></div>'+
-    '<div class="form-group"><label>'+t("subPeriod")+'</label><select id="s-ds-period"><option value="weekly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="weekly"?" selected":"")+'>'+t("periodWeekly")+'</option><option value="monthly"'+((appSettings.driverSubscription&&appSettings.driverSubscription.period==="monthly")||(!appSettings.driverSubscription||!appSettings.driverSubscription.period)?" selected":"")+'>'+t("periodMonthly")+'</option><option value="quarterly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="quarterly"?" selected":"")+'>'+t("periodQuarterly")+'</option><option value="yearly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="yearly"?" selected":"")+'>'+t("periodYearly")+'</option></select></div>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ds-freeTrialEnabled"'+(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialEnabled?" checked":"")+'> '+t("freeTrialEnabledLabel")+'</label></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextArLabel")+'</label><input id="s-ds-freeTrialTextAr" value="'+esc(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialTextAr||"")+'"></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextEnLabel")+'</label><input id="s-ds-freeTrialTextEn" value="'+esc(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialTextEn||"")+'"></div>'+
-    '</div>'+
-    '<div class="settings-section"><h3>'+(lang==="ar"?"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A Apple":"Apple Subscriptions")+'</h3>'+
-    '<p style="font-size:13px;color:var(--text2);margin-bottom:16px">'+(lang==="ar"?"\u0627\u0644\u0645\u0639\u0644\u0648\u0645\u0627\u062A \u0623\u062F\u0646\u0627\u0647 \u0645\u0646 \u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642. \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064A \u0648\u0645\u062F\u0629 \u0627\u0644\u0641\u0648\u062A\u0631\u0629 \u0648\u0634\u0631\u0648\u0637 \u0627\u0644\u062A\u062C\u062F\u064A\u062F \u0641\u064A iOS \u062A\u062A\u062D\u0643\u0645 \u0628\u0647\u0627 Apple App Store Connect.":"The information below is from App Configuration. Final iOS price, billing duration, renewal, cancellation, and entitlement terms are controlled by Apple App Store Connect.")+'</p>'+
-    '<div class="grid-2">'+
-    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px"><strong>'+(lang==="ar"?"\u0645\u0642\u062F\u0645 \u0627\u0644\u062E\u062F\u0645\u0629":"Provider")+'</strong><div style="font-size:12px;color:var(--text2);margin-top:8px">App Configuration</div><div style="margin-top:4px"><code>tabbakheen_provider_monthly</code></div><div style="margin-top:6px">'+(lang==="ar"?"\u0627\u0644\u062F\u0648\u0631: \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629":"Role: Provider")+'</div><div>'+(lang==="ar"?"\u0645\u0641\u0639\u0651\u0644: ":"Configured: ")+(appSettings.providerSubscription&&appSettings.providerSubscription.active?(lang==="ar"?"\u0646\u0639\u0645":"Yes"):(lang==="ar"?"\u0644\u0627":"No"))+'</div></div>'+
-    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px"><strong>'+(lang==="ar"?"\u0627\u0644\u0633\u0627\u0626\u0642":"Driver")+'</strong><div style="font-size:12px;color:var(--text2);margin-top:8px">App Configuration</div><div style="margin-top:4px"><code>tabbakheen_driver_monthly</code></div><div style="margin-top:6px">'+(lang==="ar"?"\u0627\u0644\u062F\u0648\u0631: \u0633\u0627\u0626\u0642":"Role: Driver")+'</div><div>'+(lang==="ar"?"\u0645\u0641\u0639\u0651\u0644: ":"Configured: ")+(appSettings.driverSubscription&&appSettings.driverSubscription.active?(lang==="ar"?"\u0646\u0639\u0645":"Yes"):(lang==="ar"?"\u0644\u0627":"No"))+'</div></div>'+
-    '</div>'+
-    '<div style="margin-top:14px;padding:12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412">'+(lang==="ar"?"Apple / StoreKit: \u0644\u0627 \u062A\u062A\u0648\u0641\u0631 \u0628\u064A\u0627\u0646\u0627\u062A \u0645\u0628\u0627\u0634\u0631\u0629 \u0648\u0645\u0648\u062B\u0648\u0642\u0629 \u0645\u0646 App Store Connect \u062F\u0627\u062E\u0644 \u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u062D\u0627\u0644\u064A\u0627\u064B. \u0644\u0627 \u062A\u064F\u0639\u062F \u0627\u0644\u0623\u0633\u0639\u0627\u0631 \u0627\u0644\u0645\u062F\u062E\u0644\u0629 \u0641\u064A \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u0623\u0633\u0639\u0627\u0631 Apple.":"Apple / StoreKit: Direct authoritative App Store Connect data is not currently available in Admin. Admin-entered prices are not Apple prices.")+'</div>'+
-    '</div>'+
-    '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
+    '</div>'+    '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
     '<div id="pw-msg" class="success-msg"></div>'+
     '<div class="form-group"><label>'+t("currentPassword")+'</label><input type="password" id="s-curPw"></div>'+
     '<div class="form-group"><label>'+t("newPassword")+'</label><input type="password" id="s-newPw"></div>'+
@@ -5233,7 +5323,50 @@ async function renderSettings(c){
     '<button class="btn btn-sm btn-warning" onclick="changePassword()">'+t("changePasswordBtn")+'</button>'+
     '</div>'+
     '<button class="btn btn-primary" onclick="saveSettings()">'+t("saveSettings")+'</button>';
-  setTimeout(updatePricingPreview,50);
+  setTimeout(function(){updatePricingPreview();loadProviderDiscoveryStats();},50);
+}
+
+var providerDiscoveryCurrentFilter="";
+async function loadProviderDiscoveryStats(){
+  var el=document.getElementById("provider-discovery-stats"),btn=document.getElementById("provider-location-reminder-btn"),updated=document.getElementById("provider-discovery-updated");
+  if(!el)return;
+  if(btn)btn.disabled=true;
+  el.innerHTML='<div class="provider-stat muted"><div class="provider-stat-label">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div>';
+  var data=await api("/provider-discovery/stats");
+  if(!data||!data.success){el.innerHTML='<div class="provider-stat danger"><div class="provider-stat-label">'+(lang==="ar"?"تعذر تحميل إحصاءات المواقع":"Unable to load location statistics")+'</div></div>';return;}
+  function stat(label,value,kind,filter){return '<button type="button" class="provider-stat '+kind+'" data-filter="'+filter+'" onclick="openProviderDiscoveryList(this.dataset.filter)"><div class="provider-stat-label">'+label+'</div><div class="provider-stat-value">'+Number(value||0)+'</div></button>';}
+  el.innerHTML=
+    stat(lang==="ar"?"إجمالي مقدمي الخدمة":"Total providers",data.totalProviders,"muted","all")+
+    stat(lang==="ar"?"ظاهرون على الخريطة":"Visible on map",data.publicLocationEnabled,"success","visible")+
+    stat(lang==="ar"?"بدون موقع عام":"Without public location",data.withoutPublicLocation,"warning","missing")+
+    stat(lang==="ar"?"موقع عام غير صالح":"Invalid public location",data.invalidPublicLocation,"danger","invalid")+
+    stat(lang==="ar"?"عندهم موقع خاص فقط":"Private location only",data.privateLocationOnly,"info","private_only")+
+    stat(lang==="ar"?"يمكنهم تحديد الموقع الآن":"Can set location now",data.publishableWithoutLocation,"muted","missing");
+  if(btn){var n=Number(data.publishableWithoutLocation||0);btn.disabled=n<1;btn.textContent=n>0?(lang==="ar"?"إرسال تنبيه إلى "+n+" مقدم خدمة":"Notify "+n+" providers"):(lang==="ar"?"لا يوجد حساب يحتاج تنبيه":"No provider needs a reminder");}
+  if(updated){var now=new Date();updated.textContent=(lang==="ar"?"آخر تحديث: ":"Last updated: ")+now.toLocaleTimeString(lang==="ar"?"ar-SA":"en-US",{hour:"2-digit",minute:"2-digit"});}
+}
+async function openProviderDiscoveryList(filter){
+  providerDiscoveryCurrentFilter=filter||"missing";
+  var wrap=document.getElementById("provider-discovery-list"),body=document.getElementById("provider-discovery-list-body"),title=document.getElementById("provider-discovery-list-title");
+  if(!wrap||!body)return;wrap.style.display="block";body.innerHTML='<div class="loading">'+t("loading")+'</div>';
+  document.querySelectorAll(".provider-stat").forEach(function(x){x.classList.toggle("selected",x.dataset.filter===providerDiscoveryCurrentFilter);});
+  var labels={all:lang==="ar"?"كل مقدمي الخدمة":"All providers",visible:lang==="ar"?"الظاهرون على الخريطة":"Visible on map",missing:lang==="ar"?"لم يحددوا موقعاً عاماً":"Missing public location",invalid:lang==="ar"?"موقع عام غير صالح":"Invalid public location",private_only:lang==="ar"?"لديهم موقع خاص فقط":"Private location only"};
+  if(title)title.textContent=labels[providerDiscoveryCurrentFilter]||labels.missing;
+  var data=await api("/provider-discovery/list?filter="+encodeURIComponent(providerDiscoveryCurrentFilter));
+  if(!data||!data.success){body.innerHTML='<div class="empty">'+(lang==="ar"?"تعذر تحميل القائمة":"Unable to load list")+'</div>';return;}
+  if(!data.providers||!data.providers.length){body.innerHTML='<div class="empty">'+t("noData")+'</div>';return;}
+  body.innerHTML='<div class="table-wrap" style="box-shadow:none;border-radius:0"><table><thead><tr><th>'+(lang==="ar"?"الاسم":"Name")+'</th><th>'+(lang==="ar"?"التواصل":"Contact")+'</th><th>'+(lang==="ar"?"الحساب":"Account")+'</th><th>'+(lang==="ar"?"الموقع":"Location")+'</th><th>'+(lang==="ar"?"إجراء":"Action")+'</th></tr></thead><tbody>'+data.providers.map(function(p){var status=p.publicLocationEnabled?(lang==="ar"?"ظاهر":"Visible"):(p.canPublishLocation?(lang==="ar"?"يستطيع التفعيل":"Can publish"):(lang==="ar"?"الحساب موقوف":"Account blocked"));return '<tr><td><strong>'+esc(p.displayName||"-")+'</strong><div style="font-size:11px;color:var(--text3)">'+esc(p.email||"")+'</div></td><td>'+esc(p.phone||"-")+'</td><td><span class="badge '+(p.canPublishLocation?"badge-green":"badge-gray")+'">'+esc(p.accountStatus||"active")+'</span><div style="font-size:11px;color:var(--text3);margin-top:4px">'+esc(p.subscriptionStatus||"")+'</div></td><td>'+esc(p.publicCity||status)+(p.hasPrivateLocation&&!p.publicLocationEnabled?'<div style="font-size:11px;color:var(--info)">'+(lang==="ar"?"يوجد موقع خاص محفوظ":"Private location exists")+'</div>':"")+'</td><td>'+(!p.publicLocationEnabled&&p.canPublishLocation?'<button class="btn btn-sm btn-primary" data-uid="'+esc(p.uid)+'" onclick="sendProviderLocationReminder(this.dataset.uid)">'+(lang==="ar"?"تنبيه":"Notify")+'</button>':"-")+'</td></tr>';}).join("")+'</tbody></table></div>';
+}
+function closeProviderDiscoveryList(){var wrap=document.getElementById("provider-discovery-list");if(wrap)wrap.style.display="none";providerDiscoveryCurrentFilter="";document.querySelectorAll(".provider-stat").forEach(function(x){x.classList.remove("selected");});}
+async function sendProviderLocationReminder(uid){
+  var btn=document.getElementById("provider-location-reminder-btn"),result=document.getElementById("provider-location-reminder-result");
+  if(!uid&&btn&&btn.disabled)return;
+  var ok=confirm(uid?(lang==="ar"?"إرسال تنبيه لهذا مقدم الخدمة لتحديد موقع ظهوره؟":"Notify this provider to set a public discovery location?"):(lang==="ar"?"سيتم إرسال التنبيه لكل مقدم خدمة نشط لم يحدد موقعاً عاماً. متابعة؟":"Notify all active providers who have not set a public discovery location?"));
+  if(!ok)return;if(btn&&!uid)btn.disabled=true;
+  if(result){result.className="provider-reminder-result show loading";result.textContent=lang==="ar"?"جاري إرسال التنبيه...":"Sending reminder...";}
+  try{var payload={confirm:true};if(uid)payload.uid=uid;var data=await api("/provider-discovery/remind-missing-location",{method:"POST",body:JSON.stringify(payload)});if(!data||!data.success)throw new Error(data&&data.error||"Failed");var sent=Number(data.sentCount||0),targeted=Number(data.targeted||0),failed=Number(data.failedCount||0);if(result){result.className="provider-reminder-result show "+(failed>0&&sent===0?"error":"success");result.textContent=(lang==="ar"?"المستهدفون: "+targeted+" — تم الإرسال: "+sent+(failed?" — تعذر: "+failed:""):"Targeted: "+targeted+" — Sent: "+sent+(failed?" — Failed: "+failed:""));}toast(lang==="ar"?"تمت معالجة التنبيه":"Reminder processed");}
+  catch(e){if(result){result.className="provider-reminder-result show error";result.textContent=lang==="ar"?"تعذر إرسال التنبيه.":"Unable to send reminder.";}toast(lang==="ar"?"تعذر إرسال التنبيه":"Reminder failed","error");}
+  finally{await loadProviderDiscoveryStats();if(providerDiscoveryCurrentFilter)await openProviderDiscoveryList(providerDiscoveryCurrentFilter);}
 }
 
 function updatePhoneSignupRequirementHint(){
@@ -5316,30 +5449,14 @@ async function saveSettings(){
       maxFee:Math.max(0,numberValue("s-maxFee",50))
     },
     defaultLanguage:lang,
-    subscriptionWarningDays:Math.max(0,integerValue("s-warningDays",7)),
+    providerDiscoveryRadiusKm:(function(){var el=document.getElementById("s-providerDiscoveryRadiusKm");if(!el||!el.value)return null;var n=parseInt(el.value,10);return [10,25,50,100].indexOf(n)>=0?n:null;})(),
     requirePhoneAtSignup:document.getElementById("s-requirePhoneAtSignup")?document.getElementById("s-requirePhoneAtSignup").checked:true,
     notifyOnNewUser:document.getElementById("s-notifyNewUser")?document.getElementById("s-notifyNewUser").checked:false,
     notifyOnNewProvider:document.getElementById("s-notifyNewProvider")?document.getElementById("s-notifyNewProvider").checked:false,
     notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
     notifyOnCrVerification:document.getElementById("s-notifyCrVerification")?document.getElementById("s-notifyCrVerification").checked:false,
     notifyOnFreelanceRequest:document.getElementById("s-notifyFreelanceRequest")?document.getElementById("s-notifyFreelanceRequest").checked:false,
-    clientVersionGate:clientVersionGate,
-    providerSubscription:{
-      active:document.getElementById("s-ps-active")?document.getElementById("s-ps-active").checked:false,
-      price:Math.max(0,numberValue("s-ps-price",15)),
-      period:document.getElementById("s-ps-period")?document.getElementById("s-ps-period").value:"monthly",
-      freeTrialEnabled:document.getElementById("s-ps-freeTrialEnabled")?document.getElementById("s-ps-freeTrialEnabled").checked:false,
-      freeTrialTextAr:document.getElementById("s-ps-freeTrialTextAr")?document.getElementById("s-ps-freeTrialTextAr").value:"",
-      freeTrialTextEn:document.getElementById("s-ps-freeTrialTextEn")?document.getElementById("s-ps-freeTrialTextEn").value:""
-    },
-    driverSubscription:{
-      active:document.getElementById("s-ds-active")?document.getElementById("s-ds-active").checked:false,
-      price:Math.max(0,numberValue("s-ds-price",15)),
-      period:document.getElementById("s-ds-period")?document.getElementById("s-ds-period").value:"monthly",
-      freeTrialEnabled:document.getElementById("s-ds-freeTrialEnabled")?document.getElementById("s-ds-freeTrialEnabled").checked:false,
-      freeTrialTextAr:document.getElementById("s-ds-freeTrialTextAr")?document.getElementById("s-ds-freeTrialTextAr").value:"",
-      freeTrialTextEn:document.getElementById("s-ds-freeTrialTextEn")?document.getElementById("s-ds-freeTrialTextEn").value:""
-    }
+    clientVersionGate:clientVersionGate
   };
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
@@ -6972,6 +7089,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const body = await request.json();
             if (!body || typeof body !== "object" || Array.isArray(body)) return jsonResponse({ error: "Settings must be an object" }, 400);
             if ("requirePhoneAtSignup" in body && typeof body.requirePhoneAtSignup !== "boolean") return jsonResponse({ error: "requirePhoneAtSignup must be boolean" }, 400);
+            if ("providerDiscoveryRadiusKm" in body && body.providerDiscoveryRadiusKm !== null && ![10,25,50,100].includes(body.providerDiscoveryRadiusKm)) return jsonResponse({ error: "providerDiscoveryRadiusKm must be null, 10, 25, 50, or 100" }, 400);
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
             if ("clientVersionGate" in body) {
               const gate = validateClientVersionGate(body.clientVersionGate);
@@ -7000,14 +7118,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "supportWhatsapp",
               "deliveryPricing",
               "defaultLanguage",
-              "subscriptionWarningDays",
+              "providerDiscoveryRadiusKm",
               "notifyOnNewUser",
               "notifyOnNewProvider",
               "notifyOnNewDriver",
               "notifyOnCrVerification",
               "notifyOnFreelanceRequest",
-              "providerSubscription",
-              "driverSubscription",
               "requirePhoneAtSignup",
               "clientVersionGate"
             ];
@@ -7019,19 +7135,21 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               return jsonResponse({ error: "No valid settings fields" }, 400);
             }
             const before = await getFirestoreDoc("app_settings", "main", accessToken) || {};
-            const oldValue = before.requirePhoneAtSignup !== false;
-            if ("requirePhoneAtSignup" in fields && oldValue !== fields.requirePhoneAtSignup) {
-              const changedAt = new Date().toISOString();
-              const auditId = "settings-" + crypto.randomUUID();
-              const committed = await phase4aCommit([
-                { update: phase4aDoc("app_settings", "main", fields), updateMask: { fieldPaths: Object.keys(fields) } },
-                { update: phase4aDoc("admin_audit_logs", auditId, { action: "app_settings_changed", setting: "requirePhoneAtSignup", oldValue, newValue: fields.requirePhoneAtSignup, changedAt, changedBy: "admin_token" }), updateMask: { fieldPaths: ["action", "setting", "oldValue", "newValue", "changedAt", "changedBy"] }, currentDocument: { exists: false } }
-              ], accessToken);
-              if (!committed) return jsonResponse({ error: "Settings changed concurrently; retry" }, 409);
-            } else {
-              await updateFirestoreDocument("app_settings", "main", fields, accessToken);
+            const audits = [], changedAt = new Date().toISOString();
+            const oldPhone = before.requirePhoneAtSignup !== false;
+            if ("requirePhoneAtSignup" in fields && oldPhone !== fields.requirePhoneAtSignup) {
+              audits.push({ setting:"requirePhoneAtSignup", oldValue:oldPhone, newValue:fields.requirePhoneAtSignup });
             }
-            return jsonResponse({ success: true, updated: Object.keys(fields) });
+            const oldRadius = [10,25,50,100].includes(before.providerDiscoveryRadiusKm) ? before.providerDiscoveryRadiusKm : null;
+            if ("providerDiscoveryRadiusKm" in fields && oldRadius !== fields.providerDiscoveryRadiusKm) {
+              audits.push({ setting:"providerDiscoveryRadiusKm", oldValue:oldRadius, newValue:fields.providerDiscoveryRadiusKm });
+            }
+            if (audits.length) {
+              const writes=[{ update: phase4aDoc("app_settings","main",fields), updateMask:{ fieldPaths:Object.keys(fields) } }];
+              for(const item of audits){const auditId="settings-"+crypto.randomUUID();writes.push({ update: phase4aDoc("admin_audit_logs",auditId,{ action:"app_settings_changed",setting:item.setting,oldValue:item.oldValue,newValue:item.newValue,changedAt,changedBy:"admin_token" }), updateMask:{ fieldPaths:["action","setting","oldValue","newValue","changedAt","changedBy"] }, currentDocument:{ exists:false } });}
+              const committed=await phase4aCommit(writes,accessToken);if(!committed)return jsonResponse({ error:"Settings changed concurrently; retry" },409);
+            } else await updateFirestoreDocument("app_settings","main",fields,accessToken);
+            return jsonResponse({ success:true, updated:Object.keys(fields) });
           }
           if (path === "/admin/api/phone-index/dry-run" && request.method === "GET") {
             const classification = await classifyPhoneIndexBackfill(accessToken, env);
@@ -7041,6 +7159,26 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             // Read-only aggregate report; it never emits user IDs, phones,
             // addresses, or coordinates and it never writes a projection.
             return jsonResponse({ success: true, ...(await classifyPublicProfileProjection(accessToken)) });
+          }
+          if (path === "/admin/api/provider-discovery/stats" && request.method === "GET") {
+            return jsonResponse({ success:true, ...(await providerDiscoveryStats(accessToken)) });
+          }
+          if (path === "/admin/api/provider-discovery/list" && request.method === "GET") {
+            const filter = url.searchParams.get("filter") || "missing";
+            return jsonResponse({ success:true, ...(await providerDiscoveryAdminList(accessToken,filter)) });
+          }
+          if (path === "/admin/api/provider-discovery/remind-missing-location" && request.method === "POST") {
+            const body=await request.json().catch(()=>({}));
+            if(body?.confirm!==true)return jsonResponse({ error:"Confirmation required" },400);
+            const uid=typeof body.uid==="string"&&phase4aSafeSegment(body.uid)?body.uid:"";
+            if(body.uid&& !uid)return jsonResponse({ error:"Invalid provider" },400);
+            const targets=await providerDiscoveryReminderTargets(accessToken,uid);
+            const title="فعّل ظهورك على خريطة طباخين";
+            const message="حدّد موقع الاكتشاف العام من الإعدادات حتى يظهر حسابك للعملاء وتظهر المسافة.";
+            const result=await sendAdminBroadcast(targets,title,message,accessToken);
+            const auditId="provider-location-reminder-"+crypto.randomUUID();
+            await updateFirestoreDocument("admin_audit_logs",auditId,{action:"provider_discovery_location_reminder",targeted:targets.length,sentCount:result.sentCount,failedCount:result.failedCount,scope:uid?"single":"all_missing",createdAt:new Date().toISOString(),changedBy:"admin_token"},accessToken);
+            return jsonResponse({ success:true,targeted:targets.length,...result });
           }
           if (path === "/admin/api/phone-index/backfill" && request.method === "POST") {
             return await executePhoneIndexBackfill(request, env, accessToken);
@@ -7485,8 +7623,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           let location;
           if (body?.publicLocationEnabled === true) {
-            if (!isProviderAccountAllowed(user)) {
-              return jsonResponse({ success: false, code: "forbidden", error: "An eligible provider account is required to publish a location" }, 403);
+            if (!canProviderManagePublicLocation(user)) {
+              return jsonResponse({ success: false, code: "forbidden", error: "An active provider account is required to publish a location" }, 403);
             }
             const loc = body.publicLocation;
             if (!loc || !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng) || loc.lat < 12 || loc.lat > 34 || loc.lng < 34 || loc.lng > 61 || loc.lat === 0 && loc.lng === 0 || typeof loc.city !== "string" || !loc.city.trim() || loc.city.trim().length > 120) {
