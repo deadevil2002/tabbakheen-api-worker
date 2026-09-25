@@ -310,6 +310,7 @@ const payload = () => ({
       deliveryPricing: { currency: "SAR", baseFee: 5, perKmInsideCity: 2, perKmOutsideCity: 2, maxFee: 50 },
       defaultLanguage: "ar",
       subscriptionWarningDays: 7,
+      providerDiscoveryRadiusKm: null,
     },
   });
   put("app_settings/main", {
@@ -336,6 +337,7 @@ const payload = () => ({
     deliveryPricing: { currency: "SAR", baseFee: 10, perKmInsideCity: 1, perKmOutsideCity: 3, maxFee: 40 },
     defaultLanguage: "en",
     subscriptionWarningDays: 14,
+    providerDiscoveryRadiusKm: null,
   });
   assert.equal("providerSubscription" in publicSettings.settings, false, "subscription internals are not a mobile-consumed public settings field");
   assert.equal("notifyOnNewUser" in publicSettings.settings, false, "admin notification internals are not exposed");
