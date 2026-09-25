@@ -4470,6 +4470,11 @@ tr:hover td{background:#f8fafc}
 .provider-discovery-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0 10px}
 .provider-reminder-result{display:none;padding:10px 12px;border-radius:8px;font-size:12px;margin-top:8px}
 .provider-reminder-result.show{display:block}.provider-reminder-result.success{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}.provider-reminder-result.error{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}.provider-reminder-result.loading{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.provider-discovery-modal{position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(15,23,42,.58);backdrop-filter:blur(4px)}
+.provider-discovery-modal-card{width:min(460px,100%);background:var(--card);border:1px solid rgba(255,255,255,.24);border-radius:20px;padding:24px;box-shadow:0 24px 64px rgba(15,23,42,.3);animation:providerModalIn .18s ease-out}
+.provider-discovery-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.provider-discovery-modal-title{margin:0;font-size:19px;font-weight:800;color:var(--text)}.provider-discovery-modal-close{width:32px;height:32px;border:0;border-radius:10px;background:#f1f5f9;color:var(--text2);font-size:22px;line-height:1;cursor:pointer}.provider-discovery-modal-close:hover{background:#e2e8f0;color:var(--text)}
+.provider-discovery-modal-message{margin:14px 0 0;color:var(--text2);font-size:14px;line-height:1.8}.provider-discovery-modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}.provider-discovery-modal.confirm .provider-discovery-modal-card{border-top:4px solid var(--primary)}.provider-discovery-modal.success .provider-discovery-modal-card{border-top:4px solid var(--success)}.provider-discovery-modal.error .provider-discovery-modal-card{border-top:4px solid var(--error)}
+@keyframes providerModalIn{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
 .provider-radius-box{margin-top:18px;padding:16px;border:1px solid var(--border);border-radius:12px;background:#f8fafc}
 .provider-radius-note{font-size:12px;color:#9a6700;line-height:1.65;margin-top:8px}.provider-discovery-updated{font-size:11px;color:var(--text3);margin-top:8px}
 .provider-list{margin-top:18px;border:1px solid var(--border);border-radius:12px;overflow:hidden}.provider-list-head{padding:12px 14px;background:#f8fafc;display:flex;justify-content:space-between;gap:10px;align-items:center}.provider-list-body{overflow:auto}
@@ -5276,6 +5281,7 @@ async function renderSettings(c){
     '<div class="provider-discovery-actions"><button type="button" class="btn btn-secondary" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button><button type="button" class="btn btn-primary" id="provider-location-reminder-btn" onclick="sendProviderLocationReminder()" disabled>'+(lang==="ar"?"إرسال تنبيه لمن لم يحدد الموقع":"Notify providers missing location")+'</button></div>'+
     '<div id="provider-location-reminder-result" class="provider-reminder-result" aria-live="polite"></div><div id="provider-discovery-updated" class="provider-discovery-updated"></div>'+
     '<div id="provider-discovery-list" class="provider-list" style="display:none"><div class="provider-list-head"><strong id="provider-discovery-list-title"></strong><button type="button" class="btn btn-sm btn-secondary" onclick="closeProviderDiscoveryList()">'+(lang==="ar"?"إغلاق":"Close")+'</button></div><div id="provider-discovery-list-body" class="provider-list-body"></div></div>'+
+    '<div id="provider-discovery-modal" class="provider-discovery-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="provider-discovery-modal-title"><div class="provider-discovery-modal-card"><div class="provider-discovery-modal-head"><h3 id="provider-discovery-modal-title" class="provider-discovery-modal-title"></h3><button type="button" class="provider-discovery-modal-close" onclick="closeProviderDiscoveryModal()" aria-label="'+(lang==="ar"?"إغلاق":"Close")+'">×</button></div><p id="provider-discovery-modal-message" class="provider-discovery-modal-message"></p><div class="provider-discovery-modal-actions"><button type="button" id="provider-discovery-modal-cancel" class="btn btn-secondary" onclick="closeProviderDiscoveryModal()">'+(lang==="ar"?"إلغاء":"Cancel")+'</button><button type="button" id="provider-discovery-modal-confirm" class="btn btn-primary">'+(lang==="ar"?"حسنًا":"OK")+'</button></div></div></div>'+
     '<div class="provider-radius-box"><div class="form-group"><label>'+(lang==="ar"?"نطاق «القريب منك» للنسخة القادمة":"Nearby radius for next app release")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div><div class="provider-radius-note">'+(lang==="ar"?"الإعداد الحالي «مفتوح» يعني بدون حد مسافة. التطبيق المنشور حالياً لا يستخدم هذا الخيار بعد، والخريطة تعرض كل من نشر موقع اكتشاف عام عند عمل Zoom Out.":"Unlimited means no distance cap. The currently published app does not consume this setting yet; zooming out shows every provider who published a public discovery location.")+'</div></div></div>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"بوابة تحديث التطبيق":"App update gate")+'</h3>'+
     '<p style="font-size:12px;color:var(--warning);margin-bottom:16px">'+(lang==="ar"?"اتركها متوقفة حتى يصبح الإصدار الجديد متاحاً في المتجر. عند التفعيل لا يمكن للتطبيقات الأقدم تجاوز شاشة التحديث.":"Leave this disabled until the new release is available in the store. Once enabled, older clients cannot bypass the update screen.")+'</p>'+
@@ -5326,7 +5332,21 @@ async function renderSettings(c){
   setTimeout(function(){updatePricingPreview();loadProviderDiscoveryStats();},50);
 }
 
-var providerDiscoveryCurrentFilter="";
+var providerDiscoveryCurrentFilter="",providerDiscoveryModalAction=null;
+function closeProviderDiscoveryModal(){var modal=document.getElementById("provider-discovery-modal");if(modal)modal.style.display="none";providerDiscoveryModalAction=null;}
+function showProviderDiscoveryModal(options){
+  var modal=document.getElementById("provider-discovery-modal"),title=document.getElementById("provider-discovery-modal-title"),message=document.getElementById("provider-discovery-modal-message"),cancel=document.getElementById("provider-discovery-modal-cancel"),confirmButton=document.getElementById("provider-discovery-modal-confirm");
+  if(!modal||!title||!message||!cancel||!confirmButton)return;
+  var confirmMode=options&&options.mode==="confirm";
+  modal.className="provider-discovery-modal "+(confirmMode?"confirm":(options&&options.type)||"info");
+  title.textContent=options.title||"";message.textContent=options.message||"";
+  cancel.style.display=confirmMode?"inline-flex":"none";cancel.textContent=options.cancelText||(lang==="ar"?"إلغاء":"Cancel");
+  confirmButton.textContent=options.confirmText||(lang==="ar"?"حسنًا":"OK");
+  confirmButton.className="btn "+((options&&options.type)==="error"?"btn-warning":"btn-primary");
+  providerDiscoveryModalAction=confirmMode&&typeof options.onConfirm==="function"?options.onConfirm:null;
+  confirmButton.onclick=function(){var action=providerDiscoveryModalAction;closeProviderDiscoveryModal();if(action)action();};
+  modal.style.display="flex";confirmButton.focus();
+}
 async function loadProviderDiscoveryStats(){
   var el=document.getElementById("provider-discovery-stats"),btn=document.getElementById("provider-location-reminder-btn"),updated=document.getElementById("provider-discovery-updated");
   if(!el)return;
@@ -5359,13 +5379,15 @@ async function openProviderDiscoveryList(filter){
 }
 function closeProviderDiscoveryList(){var wrap=document.getElementById("provider-discovery-list");if(wrap)wrap.style.display="none";providerDiscoveryCurrentFilter="";document.querySelectorAll(".provider-stat").forEach(function(x){x.classList.remove("selected");});}
 async function sendProviderLocationReminder(uid){
+  showProviderDiscoveryModal({mode:"confirm",title:lang==="ar"?"تأكيد الإرسال":"Confirm send",message:uid?(lang==="ar"?"سيتم إرسال تنبيه إلى مقدم الخدمة لتحديد موقع الاكتشاف العام. هل تريد المتابعة؟":"A reminder will be sent to this provider to set a public discovery location. Continue?"):(lang==="ar"?"سيتم إرسال تنبيه إلى مقدمي الخدمة الذين لم يحددوا موقع الاكتشاف العام. هل تريد المتابعة؟":"A reminder will be sent to providers who have not set a public discovery location. Continue?"),confirmText:lang==="ar"?"إرسال":"Send",cancelText:lang==="ar"?"إلغاء":"Cancel",onConfirm:function(){performProviderLocationReminder(uid);}});
+}
+async function performProviderLocationReminder(uid){
   var btn=document.getElementById("provider-location-reminder-btn"),result=document.getElementById("provider-location-reminder-result");
   if(!uid&&btn&&btn.disabled)return;
-  var ok=confirm(uid?(lang==="ar"?"إرسال تنبيه لهذا مقدم الخدمة لتحديد موقع ظهوره؟":"Notify this provider to set a public discovery location?"):(lang==="ar"?"سيتم إرسال التنبيه لكل مقدم خدمة نشط لم يحدد موقعاً عاماً. متابعة؟":"Notify all active providers who have not set a public discovery location?"));
-  if(!ok)return;if(btn&&!uid)btn.disabled=true;
+  if(btn&&!uid)btn.disabled=true;
   if(result){result.className="provider-reminder-result show loading";result.textContent=lang==="ar"?"جاري إرسال التنبيه...":"Sending reminder...";}
-  try{var payload={confirm:true};if(uid)payload.uid=uid;var data=await api("/provider-discovery/remind-missing-location",{method:"POST",body:JSON.stringify(payload)});if(!data||!data.success)throw new Error(data&&data.error||"Failed");var sent=Number(data.sentCount||0),targeted=Number(data.targeted||0),failed=Number(data.failedCount||0);if(result){result.className="provider-reminder-result show "+(failed>0&&sent===0?"error":"success");result.textContent=(lang==="ar"?"المستهدفون: "+targeted+" — تم الإرسال: "+sent+(failed?" — تعذر: "+failed:""):"Targeted: "+targeted+" — Sent: "+sent+(failed?" — Failed: "+failed:""));}toast(lang==="ar"?"تمت معالجة التنبيه":"Reminder processed");}
-  catch(e){if(result){result.className="provider-reminder-result show error";result.textContent=lang==="ar"?"تعذر إرسال التنبيه.":"Unable to send reminder.";}toast(lang==="ar"?"تعذر إرسال التنبيه":"Reminder failed","error");}
+  try{var payload={confirm:true};if(uid)payload.uid=uid;var data=await api("/provider-discovery/remind-missing-location",{method:"POST",body:JSON.stringify(payload)});if(!data||!data.success)throw new Error(data&&data.error||"Failed");var sent=Number(data.sentCount||0),targeted=Number(data.targeted||0),failed=Number(data.failedCount||0);if(result){result.className="provider-reminder-result show "+(failed>0&&sent===0?"error":"success");result.textContent=(lang==="ar"?"المستهدفون: "+targeted+" — تم الإرسال: "+sent+(failed?" — تعذر: "+failed:""):"Targeted: "+targeted+" — Sent: "+sent+(failed?" — Failed: "+failed:""));}showProviderDiscoveryModal({type:failed>0&&sent===0?"error":"success",title:failed>0&&sent===0?(lang==="ar"?"تعذر الإرسال":"Unable to send"):(lang==="ar"?"تم الإرسال":"Sent"),message:failed>0&&sent===0?(lang==="ar"?"تعذر إرسال التنبيه. حاول مرة أخرى.":"Unable to send the reminder. Please try again."):(lang==="ar"?"تم إرسال التنبيه بنجاح.":"The reminder was sent successfully.")});}
+  catch(e){if(result){result.className="provider-reminder-result show error";result.textContent=lang==="ar"?"تعذر إرسال التنبيه.":"Unable to send reminder.";}showProviderDiscoveryModal({type:"error",title:lang==="ar"?"تعذر الإرسال":"Unable to send",message:lang==="ar"?"تعذر إرسال التنبيه. حاول مرة أخرى.":"Unable to send the reminder. Please try again."});}
   finally{await loadProviderDiscoveryStats();if(providerDiscoveryCurrentFilter)await openProviderDiscoveryList(providerDiscoveryCurrentFilter);}
 }
 
