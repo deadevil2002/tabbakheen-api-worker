@@ -5152,29 +5152,12 @@ async function renderSettings(c){
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyCrVerification"'+(appSettings.notifyOnCrVerification?" checked":"")+'> '+t("notifyCrVerification")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyFreelanceRequest"'+(appSettings.notifyOnFreelanceRequest?" checked":"")+'> '+t("notifyFreelanceRequest")+'</label></div>'+
     '</div>'+
-    '<div class="settings-section"><h3>'+t("providerSubSettings")+'</h3>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ps-active"'+(appSettings.providerSubscription&&appSettings.providerSubscription.active?" checked":"")+'> '+t("subActive")+'</label></div>'+
-    '<div class="form-group"><label>'+t("subPrice")+'</label><input type="number" min="0" step="0.5" id="s-ps-price" value="'+(appSettings.providerSubscription&&appSettings.providerSubscription.price!=null?appSettings.providerSubscription.price:15)+'"></div>'+
-    '<div class="form-group"><label>'+t("subPeriod")+'</label><select id="s-ps-period"><option value="weekly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="weekly"?" selected":"")+'>'+t("periodWeekly")+'</option><option value="monthly"'+((appSettings.providerSubscription&&appSettings.providerSubscription.period==="monthly")||(!appSettings.providerSubscription||!appSettings.providerSubscription.period)?" selected":"")+'>'+t("periodMonthly")+'</option><option value="quarterly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="quarterly"?" selected":"")+'>'+t("periodQuarterly")+'</option><option value="yearly"'+(appSettings.providerSubscription&&appSettings.providerSubscription.period==="yearly"?" selected":"")+'>'+t("periodYearly")+'</option></select></div>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ps-freeTrialEnabled"'+(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialEnabled?" checked":"")+'> '+t("freeTrialEnabledLabel")+'</label></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextArLabel")+'</label><input id="s-ps-freeTrialTextAr" value="'+esc(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialTextAr||"")+'"></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextEnLabel")+'</label><input id="s-ps-freeTrialTextEn" value="'+esc(appSettings.providerSubscription&&appSettings.providerSubscription.freeTrialTextEn||"")+'"></div>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"إدارة الاشتراكات":"Subscription management")+'</h3>'+
+    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px;background:#f8fafc;font-size:13px;color:var(--text2);line-height:1.7">'+
+      (lang==="ar"
+        ?"تتم إدارة شراء وتجديد وإلغاء اشتراكات مقدمي الخدمة والسائقين من خلال App Store وGoogle Play فقط. لوحة الإدارة لا تغيّر الأسعار أو خطط الاشتراك أو فترات التجربة."
+        :"Provider and driver purchases, renewals, and cancellations are managed only by App Store and Google Play. Admin does not edit prices, subscription plans, or store trial configuration.")+
     '</div>'+
-    '<div class="settings-section"><h3>'+t("driverSubSettings")+'</h3>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ds-active"'+(appSettings.driverSubscription&&appSettings.driverSubscription.active?" checked":"")+'> '+t("subActive")+'</label></div>'+
-    '<div class="form-group"><label>'+t("subPrice")+'</label><input type="number" min="0" step="0.5" id="s-ds-price" value="'+(appSettings.driverSubscription&&appSettings.driverSubscription.price!=null?appSettings.driverSubscription.price:15)+'"></div>'+
-    '<div class="form-group"><label>'+t("subPeriod")+'</label><select id="s-ds-period"><option value="weekly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="weekly"?" selected":"")+'>'+t("periodWeekly")+'</option><option value="monthly"'+((appSettings.driverSubscription&&appSettings.driverSubscription.period==="monthly")||(!appSettings.driverSubscription||!appSettings.driverSubscription.period)?" selected":"")+'>'+t("periodMonthly")+'</option><option value="quarterly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="quarterly"?" selected":"")+'>'+t("periodQuarterly")+'</option><option value="yearly"'+(appSettings.driverSubscription&&appSettings.driverSubscription.period==="yearly"?" selected":"")+'>'+t("periodYearly")+'</option></select></div>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-ds-freeTrialEnabled"'+(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialEnabled?" checked":"")+'> '+t("freeTrialEnabledLabel")+'</label></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextArLabel")+'</label><input id="s-ds-freeTrialTextAr" value="'+esc(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialTextAr||"")+'"></div>'+
-    '<div class="form-group"><label>'+t("freeTrialTextEnLabel")+'</label><input id="s-ds-freeTrialTextEn" value="'+esc(appSettings.driverSubscription&&appSettings.driverSubscription.freeTrialTextEn||"")+'"></div>'+
-    '</div>'+
-    '<div class="settings-section"><h3>'+(lang==="ar"?"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A Apple":"Apple Subscriptions")+'</h3>'+
-    '<p style="font-size:13px;color:var(--text2);margin-bottom:16px">'+(lang==="ar"?"\u0627\u0644\u0645\u0639\u0644\u0648\u0645\u0627\u062A \u0623\u062F\u0646\u0627\u0647 \u0645\u0646 \u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642. \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0646\u0647\u0627\u0626\u064A \u0648\u0645\u062F\u0629 \u0627\u0644\u0641\u0648\u062A\u0631\u0629 \u0648\u0634\u0631\u0648\u0637 \u0627\u0644\u062A\u062C\u062F\u064A\u062F \u0641\u064A iOS \u062A\u062A\u062D\u0643\u0645 \u0628\u0647\u0627 Apple App Store Connect.":"The information below is from App Configuration. Final iOS price, billing duration, renewal, cancellation, and entitlement terms are controlled by Apple App Store Connect.")+'</p>'+
-    '<div class="grid-2">'+
-    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px"><strong>'+(lang==="ar"?"\u0645\u0642\u062F\u0645 \u0627\u0644\u062E\u062F\u0645\u0629":"Provider")+'</strong><div style="font-size:12px;color:var(--text2);margin-top:8px">App Configuration</div><div style="margin-top:4px"><code>tabbakheen_provider_monthly</code></div><div style="margin-top:6px">'+(lang==="ar"?"\u0627\u0644\u062F\u0648\u0631: \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629":"Role: Provider")+'</div><div>'+(lang==="ar"?"\u0645\u0641\u0639\u0651\u0644: ":"Configured: ")+(appSettings.providerSubscription&&appSettings.providerSubscription.active?(lang==="ar"?"\u0646\u0639\u0645":"Yes"):(lang==="ar"?"\u0644\u0627":"No"))+'</div></div>'+
-    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px"><strong>'+(lang==="ar"?"\u0627\u0644\u0633\u0627\u0626\u0642":"Driver")+'</strong><div style="font-size:12px;color:var(--text2);margin-top:8px">App Configuration</div><div style="margin-top:4px"><code>tabbakheen_driver_monthly</code></div><div style="margin-top:6px">'+(lang==="ar"?"\u0627\u0644\u062F\u0648\u0631: \u0633\u0627\u0626\u0642":"Role: Driver")+'</div><div>'+(lang==="ar"?"\u0645\u0641\u0639\u0651\u0644: ":"Configured: ")+(appSettings.driverSubscription&&appSettings.driverSubscription.active?(lang==="ar"?"\u0646\u0639\u0645":"Yes"):(lang==="ar"?"\u0644\u0627":"No"))+'</div></div>'+
-    '</div>'+
-    '<div style="margin-top:14px;padding:12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412">'+(lang==="ar"?"Apple / StoreKit: \u0644\u0627 \u062A\u062A\u0648\u0641\u0631 \u0628\u064A\u0627\u0646\u0627\u062A \u0645\u0628\u0627\u0634\u0631\u0629 \u0648\u0645\u0648\u062B\u0648\u0642\u0629 \u0645\u0646 App Store Connect \u062F\u0627\u062E\u0644 \u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u062D\u0627\u0644\u064A\u0627\u064B. \u0644\u0627 \u062A\u064F\u0639\u062F \u0627\u0644\u0623\u0633\u0639\u0627\u0631 \u0627\u0644\u0645\u062F\u062E\u0644\u0629 \u0641\u064A \u0627\u0644\u0625\u062F\u0627\u0631\u0629 \u0623\u0633\u0639\u0627\u0631 Apple.":"Apple / StoreKit: Direct authoritative App Store Connect data is not currently available in Admin. Admin-entered prices are not Apple prices.")+'</div>'+
     '</div>'+
     '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
     '<div id="pw-msg" class="success-msg"></div>'+
@@ -5334,23 +5317,7 @@ async function saveSettings(){
     notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
     notifyOnCrVerification:document.getElementById("s-notifyCrVerification")?document.getElementById("s-notifyCrVerification").checked:false,
     notifyOnFreelanceRequest:document.getElementById("s-notifyFreelanceRequest")?document.getElementById("s-notifyFreelanceRequest").checked:false,
-    clientVersionGate:clientVersionGate,
-    providerSubscription:{
-      active:document.getElementById("s-ps-active")?document.getElementById("s-ps-active").checked:false,
-      price:Math.max(0,numberValue("s-ps-price",15)),
-      period:document.getElementById("s-ps-period")?document.getElementById("s-ps-period").value:"monthly",
-      freeTrialEnabled:document.getElementById("s-ps-freeTrialEnabled")?document.getElementById("s-ps-freeTrialEnabled").checked:false,
-      freeTrialTextAr:document.getElementById("s-ps-freeTrialTextAr")?document.getElementById("s-ps-freeTrialTextAr").value:"",
-      freeTrialTextEn:document.getElementById("s-ps-freeTrialTextEn")?document.getElementById("s-ps-freeTrialTextEn").value:""
-    },
-    driverSubscription:{
-      active:document.getElementById("s-ds-active")?document.getElementById("s-ds-active").checked:false,
-      price:Math.max(0,numberValue("s-ds-price",15)),
-      period:document.getElementById("s-ds-period")?document.getElementById("s-ds-period").value:"monthly",
-      freeTrialEnabled:document.getElementById("s-ds-freeTrialEnabled")?document.getElementById("s-ds-freeTrialEnabled").checked:false,
-      freeTrialTextAr:document.getElementById("s-ds-freeTrialTextAr")?document.getElementById("s-ds-freeTrialTextAr").value:"",
-      freeTrialTextEn:document.getElementById("s-ds-freeTrialTextEn")?document.getElementById("s-ds-freeTrialTextEn").value:""
-    }
+    clientVersionGate:clientVersionGate
   };
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
@@ -6979,8 +6946,6 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "notifyOnNewDriver",
               "notifyOnCrVerification",
               "notifyOnFreelanceRequest",
-              "providerSubscription",
-              "driverSubscription",
               "requirePhoneAtSignup",
               "clientVersionGate"
             ];
