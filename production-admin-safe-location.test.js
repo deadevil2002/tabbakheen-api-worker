@@ -17,3 +17,9 @@ assert(source.includes('providerDiscoveryRadiusKm'), "future radius setting miss
 assert(source.includes('openProviderDiscoveryList'), "Admin drilldown UI missing");
 assert(source.includes('sendProviderLocationReminder'), "Admin reminder UI missing");
 console.log("production admin safe location checks: PASS");
+
+assert(source.includes('path === "/admin/api/provider-discovery/reminder-history"'), "provider reminder history route missing");
+assert(source.includes("providerLocationReminderHistory"), "provider reminder history helper missing");
+assert(source.includes("recipients=targets.slice"), "future reminder audits must store target recipients");
+assert(source.includes("سجل تنبيهات الموقع"), "Admin reminder history UI missing");
+assert(source.includes("آخر تنبيه"), "provider drill-down last-reminder column missing");
