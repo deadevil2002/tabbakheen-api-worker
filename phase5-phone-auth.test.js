@@ -408,6 +408,11 @@ function assertStoreSubscriptionRequired(profile) {
     ratingAverage: 5, ratingCount: 0, verificationStatus: "unverified",
     updatedAt: docs.get("public_profiles/projection-uid").data.updatedAt
   });
+  // An identical projection is not rewritten: a fresh `updatedAt` alone would
+  // fire every public_profiles listener on every device.
+  const projected = docs.get("public_profiles/projection-uid");
+  assert.equal(await hooks.syncPublicProfile("projection-uid", null, "token"), true);
+  assert.equal(docs.get("public_profiles/projection-uid"), projected, "identical projection is not rewritten");
   global.__createDeletionBeforeNextCommit = "projection-uid";
   assert.equal(await hooks.syncPublicProfile("projection-uid", null, "token"), false);
   assert.equal(docs.has("public_profiles/projection-uid"), true);

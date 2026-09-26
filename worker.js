@@ -631,6 +631,14 @@
     }
     __name(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
     __name2(publicProfileFromPrivateUser, "publicProfileFromPrivateUser");
+    // Deep equality that ignores map key order (Firestore returns map fields
+    // in its own order, not the order the projection built them in).
+    function sameFirestoreValue(a, b) {
+      if (a === b) return true;
+      if (!a || !b || typeof a !== "object" || typeof b !== "object" || Array.isArray(a) !== Array.isArray(b)) return false;
+      const aKeys = Object.keys(a), bKeys = Object.keys(b);
+      return aKeys.length === bKeys.length && aKeys.every((key) => sameFirestoreValue(a[key], b[key]));
+    }
     function publicProfileDeletionActive(snapshot) {
       return !!snapshot && PUBLIC_PROFILE_DELETION_STATUSES.includes(snapshot.data?.status);
     }
@@ -642,7 +650,16 @@
       // identity after deletion, role change, or source deletion.
       writes.push(sourceSnapshot ? { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid, currentDocument: { updateTime: sourceSnapshot.updateTime } } : { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid, currentDocument: { exists: false } });
       writes.push(phase4aDeletionFence(uid, deletionSnapshot));
-      if (profile) {
+      // `updatedAt` is new on every projection, so an identical profile would
+      // still fire every public_profiles listener. Skip the write in that case.
+      const sameProjection = profile && publicSnapshot && publicSnapshot.data
+        && Object.keys(profile).every((key) => key === "updatedAt" || sameFirestoreValue(profile[key], publicSnapshot.data[key]))
+        && Object.keys(publicSnapshot.data).every((key) => key === "_id" || key in profile);
+      if (sameProjection) {
+        // Commit only the source/deletion preconditions: no document write,
+        // but a deletion that raced this sync still fails it.
+        return phase4aCommit(writes, accessToken);
+      } else if (profile) {
         writes.push({ update: phase4aDoc("public_profiles", uid, profile), currentDocument: publicSnapshot ? { updateTime: publicSnapshot.updateTime } : { exists: false } });
       } else if (publicSnapshot) {
         writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/public_profiles/" + uid, currentDocument: { updateTime: publicSnapshot.updateTime } });
@@ -1032,6 +1049,10 @@
       if (!uid || !user || user.role === "customer") return;
       const fields = commercialAccessFields(entitlement);
       if (user.role === "driver" && !entitlement.eligible) fields.isAvailable = false;
+      // commercialAccessUpdatedAt is new on every call; compare the rest and
+      // skip both the profile PATCH and the public projection when unchanged.
+      const unchanged = Object.keys(fields).every((key) => key === "commercialAccessUpdatedAt" || sameFirestoreValue(user[key] ?? null, fields[key] ?? null));
+      if (unchanged) return;
       try {
         await updateFirestoreDocument("users", uid, fields, accessToken);
         await syncPublicProfile(uid, { ...user, ...fields }, accessToken);
@@ -2111,6 +2132,24 @@
       if (!response.ok) throw new Error("Firestore bounded query failed: " + response.status);
       return (await response.json()).filter((entry) => entry.document).map((entry) => parseFirestoreDoc(entry.document));
     }
+    // Equality-only AND query; Firestore serves it by merging single-field
+    // indexes, so no composite index is needed.
+    async function queryFirestoreAllEqual(collectionId, equals, limit, accessToken) {
+      const filters = Object.entries(equals).map(([fieldPath, value]) => ({
+        fieldFilter: {
+          field: { fieldPath },
+          op: "EQUAL",
+          value: typeof value === "string" ? { stringValue: value } : typeof value === "boolean" ? { booleanValue: value } : { integerValue: String(value) }
+        }
+      }));
+      const response = await fetch(FIRESTORE_BASE + ":runQuery", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ structuredQuery: { from: [{ collectionId }], where: { compositeFilter: { op: "AND", filters } }, limit } })
+      });
+      if (!response.ok) throw new Error("Firestore equality query failed: " + response.status);
+      return (await response.json()).filter((entry) => entry.document).map((entry) => parseFirestoreDoc(entry.document));
+    }
     function driverAvailableDeliveryDto(order) {
       const dto = {
         id: order && (order._id || order.id),
@@ -2518,6 +2557,7 @@
         ...commercialAccessFields(evaluateSubscriptionEntitlement({ ...candidate, subscriptionEnvironment: status.environment, subscriptionTestAccount: appleTestAccount, subscriptionLastVerifiedAt: now }))
       };
       if (candidate.subscriptionEndsAt) fields.subscriptionEndsAt = candidate.subscriptionEndsAt;
+      if (storeReconcileUnchanged(user, fields)) return { ...candidate, ...fields };
       const snap = await getFirestoreSnapshot("users", uid, accessToken);
       if (!snap) throw new Error("PROFILE_NOT_FOUND");
       if (!(await phase4aCommit([{ update: phase4aDoc("users", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }], accessToken))) throw new Error("STATE_CONFLICT");
@@ -2600,6 +2640,17 @@
         console.error("[GooglePlay] acknowledge failed:", error && error.message ? error.message : error);
       }
     }
+    // Every store reconciliation stamps fresh timestamps, so writing it
+    // unconditionally changes the profile on each entitlement read — and
+    // older app builds re-read the entitlement on every profile change,
+    // which looped once per second. Skip the write when only the timestamps
+    // differ and the stored verification is under an hour old (well inside
+    // the 24h staleness window of evaluateSubscriptionEntitlement).
+    function storeReconcileUnchanged(user, fields) {
+      const verifiedAt = entitlementTime(user && user.subscriptionLastVerifiedAt);
+      if (!Number.isFinite(verifiedAt) || Date.now() - verifiedAt > 60 * 60 * 1e3) return false;
+      return Object.keys(fields).every((key) => key === "subscriptionLastVerifiedAt" || key === "commercialAccessUpdatedAt" || sameFirestoreValue(user[key] ?? null, fields[key] ?? null));
+    }
     function googleSubscriptionFields(purchase, tokenHash, testAccount, now, user) {
       const entitled = googlePurchaseEntitled(purchase, Date.parse(now));
       const base = {
@@ -2625,6 +2676,7 @@
       const bound = purchase.accountId === await googlePlayAccountId(uid) && STORE_PRODUCT_ROLES[purchase.productId] === user.role && (!purchase.test || testAccount);
       const now = new Date().toISOString();
       const fields = googleSubscriptionFields(bound ? purchase : { ...purchase, state: "SUBSCRIPTION_STATE_EXPIRED" }, tokenHash, testAccount, now, user);
+      if (storeReconcileUnchanged(user, fields)) return { ...user, ...fields };
       const snap = await getFirestoreSnapshot("users", uid, accessToken);
       if (!snap) throw new Error("PROFILE_NOT_FOUND");
       if (!(await phase4aCommit([{ update: phase4aDoc("users", uid, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }], accessToken))) throw new Error("STATE_CONFLICT");
@@ -6297,7 +6349,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         queryFirestore("order_transition_events", "status", "EQUAL", "pending", accessToken),
         queryFirestore("order_transition_events", "status", "EQUAL", "failed", accessToken),
         queryFirestore("order_transition_events", "status", "EQUAL", "sent", accessToken),
-        queryFirestore("orders", "status", "EQUAL", "pending", accessToken)
+        // Only pending orders that still need the v1 -> v2 notification
+        // repair. The old status == "pending" scan re-read every stale
+        // pending order every minute (~26k reads/day on its own).
+        queryFirestoreAllEqual("orders", { status: "pending", transactionalNotificationVersion: 1 }, 25, accessToken)
       ]);
       for (const eventDoc of [...pending, ...failed].slice(0, 25)) {
         if (eventDoc.leaseUntil && new Date(eventDoc.leaseUntil).getTime() > Date.now()) continue;
@@ -6305,7 +6360,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       for (const eventDoc of sent.slice(0, 25)) await pollOutboxReceipts(eventDoc, accessToken);
-      for (const order of pendingOrders.filter((item) => item.transactionalNotificationVersion === 1).slice(0, 25)) {
+      for (const order of pendingOrders.filter((item) => item.status === "pending" && item.transactionalNotificationVersion === 1).slice(0, 25)) {
         const version = notificationStateVersion(order, "order_created");
         await sendTransitionNotification("order_created", order._id, accessToken, version);
         const eventDoc = await getFirestoreDoc("order_transition_events", notificationEventId(order._id, "order_created", version), accessToken);
@@ -6582,7 +6637,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
         const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
         let currentUser = auth.user;
-        if (currentUser.subscriptionPlatform === "apple") {
+        // A store-verified, still-eligible subscriber is re-verified at most
+        // once per 15 minutes. Anyone not currently eligible is always
+        // re-checked, so a renewal or re-purchase opens access immediately.
+        const lastVerifiedMs = entitlementTime(currentUser.subscriptionLastVerifiedAt);
+        const recentlyVerified = Number.isFinite(lastVerifiedMs) && Date.now() - lastVerifiedMs < 15 * 60 * 1e3;
+        if (recentlyVerified && evaluateSubscriptionEntitlement(currentUser).eligible) {
+          // Use the stored verification; fall through to the evaluator below.
+        } else if (currentUser.subscriptionPlatform === "apple") {
           try { currentUser = await phase4aReconcileApple(auth.uid, currentUser, env, accessToken); } catch (error) {
             console.error("[Apple] On-demand reconciliation failed:", error && error.message ? error.message : error);
             const entitlement = { eligible: false, reason: "apple_verification_unavailable", role: currentUser.role, source: "apple", endsAt: null };

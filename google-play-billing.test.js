@@ -43,12 +43,14 @@ const target = (write) => (write.update?.name || write.delete || write.verify).s
 // token -> subscriptionsv2 response; acknowledgements are recorded.
 const playPurchases = new Map();
 const acknowledged = [];
+let playLookups = 0;
 
 global.fetch = async (url, init = {}) => {
   url = String(url);
   if (url === "https://oauth2.googleapis.com/token") return json({ access_token: "oauth-token" });
   if (url.includes("securetoken@system.gserviceaccount.com")) return new Response(JSON.stringify({ keys: [JWK] }), { headers: { "Content-Type": "application/json", "cache-control": "max-age=3600" } });
   if (url.startsWith(PLAY + "subscriptionsv2/tokens/")) {
+    playLookups++;
     const token = decodeURIComponent(url.slice((PLAY + "subscriptionsv2/tokens/").length));
     return playPurchases.has(token) ? json(playPurchases.get(token)) : json({ error: { code: 404 } }, 404);
   }
@@ -211,6 +213,30 @@ const TOKEN = "google-purchase-token-provider-1.AO-J1Ox";
   body = await res.json();
   assert.equal(body.entitlement.eligible, true, JSON.stringify(body));
   assert.equal(body.entitlement.reason, "active_paid");
+
+  // Repeat reads neither re-query Google nor rewrite the profile. Older app
+  // builds re-read the entitlement on every profile change, so a write here
+  // turned into a once-per-second loop that exhausted the Firestore quota.
+  const verifiedProfile = docs.get("users/provider-1");
+  const lookupsBefore = playLookups;
+  res = await hooks.handleRequest(get("/subscriptions/entitlement", "provider-1"));
+  assert.equal((await res.json()).entitlement.eligible, true);
+  assert.equal(playLookups, lookupsBefore, "a recently verified subscriber skips the store");
+  assert.equal(docs.get("users/provider-1").updateTime, verifiedProfile.updateTime, "a repeat read does not write the profile");
+  // A reconcile whose store answer is unchanged does not write either.
+  reconciled = await hooks.phase4aReconcileGoogle("provider-1", docs.get("users/provider-1").data, env(), "token");
+  assert.equal(reconciled.subscriptionStatus, "active");
+  assert.equal(docs.get("users/provider-1").updateTime, verifiedProfile.updateTime, "an unchanged reconcile does not write");
+  // A changed store answer is still written straight away.
+  playPurchases.set(TOKEN, await playPurchase("provider-1", { subscriptionState: "SUBSCRIPTION_STATE_EXPIRED", lineItems: [{ productId: "tabbakheen_providers_monthly", expiryTime: past }] }));
+  reconciled = await hooks.phase4aReconcileGoogle("provider-1", docs.get("users/provider-1").data, env(), "token");
+  assert.equal(docs.get("users/provider-1").data.subscriptionStatus, "expired");
+  // A subscriber who is not eligible is always re-checked, so a renewal opens
+  // access on the next read rather than after the 15-minute window.
+  playPurchases.set(TOKEN, await playPurchase("provider-1"));
+  res = await hooks.handleRequest(get("/subscriptions/entitlement", "provider-1"));
+  assert.equal((await res.json()).entitlement.eligible, true);
+
   res = await hooks.handleRequest(post("/subscriptions/google/account-id", {}, "provider-1"));
   assert.equal((await res.json()).accountId, await hooks.googlePlayAccountId("provider-1"));
 
