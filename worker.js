@@ -5428,7 +5428,15 @@ async function renderSettings(c){
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewDriver"'+(appSettings.notifyOnNewDriver?" checked":"")+'> '+t("notifyNewDriver")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyCrVerification"'+(appSettings.notifyOnCrVerification?" checked":"")+'> '+t("notifyCrVerification")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyFreelanceRequest"'+(appSettings.notifyOnFreelanceRequest?" checked":"")+'> '+t("notifyFreelanceRequest")+'</label></div>'+
-    '</div>'+    '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
+    '</div>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"إدارة الاشتراكات":"Subscription management")+'</h3>'+
+    '<div style="padding:14px;border:1px solid var(--border);border-radius:10px;background:#f8fafc;font-size:13px;color:var(--text2);line-height:1.7">'+
+      (lang==="ar"
+        ?"تتم إدارة شراء وتجديد وإلغاء اشتراكات مقدمي الخدمة والسائقين من خلال App Store وGoogle Play فقط. لوحة الإدارة لا تغيّر الأسعار أو خطط الاشتراك أو فترات التجربة."
+        :"Provider and driver purchases, renewals, and cancellations are managed only by App Store and Google Play. Admin does not edit prices, subscription plans, or store trial configuration.")+
+    '</div>'+
+    '</div>'+
+    '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
     '<div id="pw-msg" class="success-msg"></div>'+
     '<div class="form-group"><label>'+t("currentPassword")+'</label><input type="password" id="s-curPw"></div>'+
     '<div class="form-group"><label>'+t("newPassword")+'</label><input type="password" id="s-newPw"></div>'+
