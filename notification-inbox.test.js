@@ -92,6 +92,8 @@ const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, event
   const first = await hooks.persistUserNotification(input("account-a", "event-1"), token);
   const duplicate = await hooks.persistUserNotification(input("account-a", "event-1"), token);
   assert.equal(first.id, duplicate.id, "stable event ID must deduplicate retries");
+  assert.equal(first.summary.totalUnread, 1, "persistence returns the authoritative post-commit badge");
+  assert.equal(duplicate.summary.totalUnread, 1, "deduplicated retry returns the current authoritative badge");
   assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 1, "duplicate cannot increment unread");
 
   await hooks.persistUserNotification(input("account-b", "event-1"), token);
@@ -108,6 +110,11 @@ const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, event
   assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 24, "mark one read decrements summary");
   await hooks.markAllNotificationsRead("account-a", token);
   assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 0, "mark all read clears summary");
+
+  for (let index = 2; index <= 61; index++) await hooks.persistUserNotification(input("account-b", `bulk-${index}`), token);
+  assert.equal(documents.get("notification_summaries/account-b").data.totalUnread, 61, "large inbox summary starts exact");
+  assert.equal(await hooks.markAllNotificationsRead("account-b", token), 61, "mark all processes more than one bounded page");
+  assert.equal(documents.get("notification_summaries/account-b").data.totalUnread, 0, "batched mark all leaves an exact zero summary");
 
   const broadcastUsers = [{ _id: "account-a", role: "customer" }, { _id: "account-b", role: "customer" }];
   await hooks.persistNotificationBatch(broadcastUsers, (user) => ({ ...input(user._id, "broadcast-1", "admin"), type: "admin_broadcast", target: "notifications" }), token);
@@ -135,6 +142,41 @@ const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, event
   assert.equal(complaintCreated.id, complaintRepeated.id, "identical complaint update cannot spam duplicate notifications");
   assert.equal(complaintCreated.notification.category, "complaint");
 
+  await hooks.persistUserNotification({ ...input("account-a", "order-context-a"), orderId: "order-context" }, token);
+  await hooks.persistUserNotification({ ...input("account-a", "message-context-a", "message"), type: "order_chat_message", orderId: "order-context" }, token);
+  const otherOrder = await hooks.persistUserNotification({ ...input("account-a", "other-order-a"), orderId: "other-order" }, token);
+  const accountBContext = await hooks.persistUserNotification({ ...input("account-b", "order-context-b"), orderId: "order-context" }, token);
+  assert.equal(await hooks.markNotificationContextRead("account-a", { kind: "order", orderId: "order-context" }, token), 1, "order navigation clears only order/delivery notifications");
+  assert.equal(await hooks.markNotificationContextRead("account-a", { kind: "message", orderId: "order-context" }, token), 1, "chat read clears only related message notifications");
+  assert(documents.has("notification_unread/account-a/items/" + otherOrder.id), "unrelated order stays unread");
+  assert(documents.has("notification_unread/account-b/items/" + accountBContext.id), "other account stays unread");
+
+  const reminder = {
+    recipientUid: "account-a",
+    eventKey: "subscription_reminder:2026-10-05T00:00:00.000Z:days_6",
+    type: "subscription_reminder",
+    category: "subscription",
+    title: "تنبيه انتهاء الاشتراك",
+    body: "اشتراكك ينتهي قريباً",
+    role: "provider"
+  };
+  const reminderFirst = await hooks.persistUserNotification(reminder, token);
+  const reminderRetry = await hooks.persistUserNotification(reminder, token);
+  assert.equal(reminderFirst.id, reminderRetry.id, "subscription reminder retries remain idempotent");
+  assert.equal(reminderFirst.notification.category, "subscription", "subscription reminder is durable before push");
+
+  for (let index = 0; index < 73; index++) {
+    const id = `cleanup-${String(index).padStart(3, "0")}`;
+    documents.set(`user_notifications/delete-me/items/${id}`, snapshot(`user_notifications/delete-me/items/${id}`, { recipientUid: "delete-me", createdAt: `2026-09-29T01:${String(index).padStart(2, "0")}:00.000Z` }));
+    documents.set(`notification_unread/delete-me/items/${id}`, snapshot(`notification_unread/delete-me/items/${id}`, { notificationId: id, category: "order", createdAt: `2026-09-29T01:${String(index).padStart(2, "0")}:00.000Z` }));
+  }
+  const cleanupItemsFirst = await hooks.deleteNotificationSubcollectionBatch("delete-me", "user_notifications", token);
+  assert.deepEqual(cleanupItemsFirst, { deletedCount: 50, complete: false }, "account cleanup is bounded and resumable");
+  assert.equal((await hooks.deleteNotificationSubcollectionBatch("delete-me", "user_notifications", token)).complete, true, "item cleanup completes on retry");
+  assert.equal((await hooks.deleteNotificationSubcollectionBatch("delete-me", "user_notifications", token)).deletedCount, 0, "completed item cleanup is idempotent");
+  assert.equal((await hooks.deleteNotificationSubcollectionBatch("delete-me", "notification_unread", token)).complete, false, "unread markers are explicitly cleaned in bounded pages");
+  assert.equal((await hooks.deleteNotificationSubcollectionBatch("delete-me", "notification_unread", token)).complete, true, "unread marker cleanup resumes to completion");
+
   assert.equal(hooks.notificationSummaryField("message"), "messagesUnread");
   assert.equal(hooks.notificationSummaryField("complaint"), "accountUnread");
   const source = fs.readFileSync(__dirname + "/worker.js", "utf8");
@@ -142,7 +184,11 @@ const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, event
   assert(source.includes('eventKey: "complaint_update:" + complaintId + ":" + digest'), "complaint updates use stable content idempotency");
   assert(source.includes("const meaningful = Object.entries(requested).some"), "identical complaint saves must not notify");
   assert(source.includes("await persistNotificationBatch(allMatchedUsers"), "admin audience must receive durable records");
-  console.log("notification inbox tests: PASS (ownership, pagination, summary, read, read-all, dismiss, idempotency, broadcast durability)");
+  assert(source.includes('badge: notificationOutcome.summary.totalUnread'), "subscription push uses the durable authoritative badge");
+  assert(source.indexOf('eventKey: "subscription_reminder:"') < source.indexOf('data: { type: "subscription_reminder" }'), "subscription record must be durable before push");
+  assert(source.includes('path === "/notifications/context/read"'), "normal navigation has a narrow authenticated context-read endpoint");
+  assert(source.includes('await markNotificationContextRead(auth.uid, { kind: "message", orderId: body.orderId }, accessToken)'), "chat read clears its durable message notifications");
+  console.log("notification inbox tests: PASS (badges, ownership, pagination, batched/context reads, cleanup, idempotency, broadcast/reminder durability)");
 })().catch((error) => {
   console.error(error.stack || error);
   process.exitCode = 1;

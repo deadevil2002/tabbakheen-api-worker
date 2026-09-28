@@ -1685,6 +1685,10 @@
         const existing = new Date(snapshot.data[field] || 0).getTime();
         const existingSequence = Number(snapshot.data[sequenceField] || 0);
         const visibleSequence = Number(visible.sequence || 0);
+        if (Number.isInteger(existingSequence) && existingSequence >= visibleSequence) {
+          await markNotificationContextRead(auth.uid, { kind: "message", orderId: body.orderId }, accessToken);
+          return jsonResponse({ success: true, idempotent: true, lastReadAt: snapshot.data[field] || visible.createdAt, lastReadSequence: existingSequence });
+        }
         // An acknowledgement can move only across one contiguous 30-message
         // fetched page. This prevents a newest-page poll from globally marking a
         // hidden older gap as read; the client must page that gap first.
@@ -1692,7 +1696,10 @@
         const readSequence = visibleSequence;
         const readAt = new Date(Math.max(existing || 0, new Date(visible.createdAt).getTime())).toISOString();
         const committed = await compareAndSetFirestoreDocument("orders", body.orderId, { [field]: readAt, [sequenceField]: readSequence }, snapshot.updateTime, accessToken);
-        if (committed.ok) return jsonResponse({ success: true, lastReadAt: readAt, lastReadSequence: readSequence });
+        if (committed.ok) {
+          await markNotificationContextRead(auth.uid, { kind: "message", orderId: body.orderId }, accessToken);
+          return jsonResponse({ success: true, lastReadAt: readAt, lastReadSequence: readSequence });
+        }
       }
       return phase4aError("state_conflict", "Order chat changed; refresh and try again", 409);
     }
@@ -2005,13 +2012,14 @@
       if (!phase4aSafeSegment(recipientUid) || typeof input?.eventKey !== "string" || !input.eventKey || typeof input?.title !== "string" || !input.title.trim() || typeof input?.body !== "string" || !input.body.trim()) throw new Error("Invalid notification input");
       const id = await notificationDocumentId(recipientUid, input.eventKey);
       const collection = "user_notifications/" + recipientUid + "/items";
-      const existing = await getFirestoreSnapshot(collection, id, accessToken);
-      if (existing) return { existing: true, id, notification: { ...existing.data, id } };
-      const [summarySnapshot, deletionSnapshot] = await Promise.all([
+      const [existing, summarySnapshot, deletionSnapshot] = await Promise.all([
+        getFirestoreSnapshot(collection, id, accessToken),
         getFirestoreSnapshot("notification_summaries", recipientUid, accessToken),
         getFirestoreSnapshot("account_deletion_requests", recipientUid, accessToken)
       ]);
-      if (publicProfileDeletionActive(deletionSnapshot)) return { skipped: true, id };
+      const prior = normalizedNotificationSummary(summarySnapshot?.data);
+      if (existing) return { existing: true, id, notification: { ...existing.data, id }, summary: prior };
+      if (publicProfileDeletionActive(deletionSnapshot)) return { skipped: true, id, summary: prior };
       const now = typeof input.createdAt === "string" ? input.createdAt : new Date().toISOString();
       const category = ["order", "delivery", "message", "complaint", "subscription", "account", "admin"].includes(input.category) ? input.category : "account";
       const record = {
@@ -2030,17 +2038,16 @@
         target: typeof input.target === "string" ? input.target.slice(0, 40) : null,
         role: ["customer", "provider", "driver"].includes(input.role) ? input.role : null
       };
-      const prior = normalizedNotificationSummary(summarySnapshot?.data);
       const categoryField = notificationSummaryField(category);
       const next = { ...prior, totalUnread: prior.totalUnread + 1, [categoryField]: prior[categoryField] + 1, updatedAt: now };
-      const marker = { notificationId: id, category, createdAt: now };
+      const marker = { notificationId: id, category, type: record.type, orderId: record.orderId, complaintId: record.complaintId, createdAt: now };
       const writes = [
         { update: phase4aDoc(collection, id, record), updateMask: { fieldPaths: Object.keys(record) }, currentDocument: { exists: false } },
         { update: phase4aDoc("notification_unread/" + recipientUid + "/items", id, marker), updateMask: { fieldPaths: Object.keys(marker) }, currentDocument: { exists: false } },
         { update: phase4aDoc("notification_summaries", recipientUid, next), updateMask: { fieldPaths: Object.keys(next) }, currentDocument: summarySnapshot ? { updateTime: summarySnapshot.updateTime } : { exists: false } },
         phase4aDeletionFence(recipientUid, deletionSnapshot)
       ];
-      return { existing: false, id, notification: { ...record, id }, writes };
+      return { existing: false, id, notification: { ...record, id }, summary: next, writes };
     }
     async function persistUserNotification(input, accessToken) {
       for (let attempt = 0; attempt < 4; attempt++) {
@@ -2052,9 +2059,13 @@
     }
     async function persistNotificationBatch(users, makeInput, accessToken) {
       const unique = [...new Map((Array.isArray(users) ? users : []).filter((user) => user && phase4aSafeSegment(user._id || user.uid)).map((user) => [user._id || user.uid, user])).values()];
+      const results = /* @__PURE__ */ new Map();
       for (let offset = 0; offset < unique.length; offset += 20) {
-        await Promise.all(unique.slice(offset, offset + 20).map((user) => persistUserNotification(makeInput(user), accessToken)));
+        const chunk = unique.slice(offset, offset + 20);
+        const outcomes = await Promise.all(chunk.map((user) => persistUserNotification(makeInput(user), accessToken)));
+        chunk.forEach((user, index) => results.set(user._id || user.uid, outcomes[index]));
       }
+      return results;
     }
     async function listFirestorePage(collectionPath, pageSize, pageToken, accessToken) {
       const bounded = Math.max(1, Math.min(50, Number(pageSize) || 20));
@@ -2093,17 +2104,74 @@
       }
       throw new Error("Notification state changed; retry");
     }
+    async function markUnreadNotificationBatch(recipientUid, notificationIds, accessToken) {
+      const ids = [...new Set((Array.isArray(notificationIds) ? notificationIds : []).filter(phase4aSafeSegment))].slice(0, 50);
+      if (!ids.length) return 0;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const [summarySnapshot, deletionSnapshot, markerSnapshots, itemSnapshots] = await Promise.all([
+          getFirestoreSnapshot("notification_summaries", recipientUid, accessToken),
+          getFirestoreSnapshot("account_deletion_requests", recipientUid, accessToken),
+          Promise.all(ids.map((id) => getFirestoreSnapshot("notification_unread/" + recipientUid + "/items", id, accessToken))),
+          Promise.all(ids.map((id) => getFirestoreSnapshot("user_notifications/" + recipientUid + "/items", id, accessToken)))
+        ]);
+        if (publicProfileDeletionActive(deletionSnapshot)) return 0;
+        const active = ids.map((id, index) => ({ id, marker: markerSnapshots[index], item: itemSnapshots[index] })).filter((entry) => entry.marker);
+        if (!active.length) return 0;
+        const now = new Date().toISOString();
+        const prior = normalizedNotificationSummary(summarySnapshot?.data);
+        const next = { ...prior, updatedAt: now };
+        const writes = [];
+        for (const entry of active) {
+          if (entry.item && entry.item.data.recipientUid === recipientUid && !entry.item.data.readAt) {
+            writes.push({ update: phase4aDoc("user_notifications/" + recipientUid + "/items", entry.id, { readAt: now }), updateMask: { fieldPaths: ["readAt"] }, currentDocument: { updateTime: entry.item.updateTime } });
+          }
+          writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/notification_unread/" + recipientUid + "/items/" + entry.id, currentDocument: { updateTime: entry.marker.updateTime } });
+          const field = notificationSummaryField(entry.marker.data.category || entry.item?.data?.category);
+          next.totalUnread = Math.max(0, next.totalUnread - 1);
+          next[field] = Math.max(0, next[field] - 1);
+        }
+        writes.push({ update: phase4aDoc("notification_summaries", recipientUid, next), updateMask: { fieldPaths: Object.keys(next) }, currentDocument: summarySnapshot ? { updateTime: summarySnapshot.updateTime } : { exists: false } });
+        writes.push(phase4aDeletionFence(recipientUid, deletionSnapshot));
+        if (await phase4aCommit(writes, accessToken)) return active.length;
+      }
+      throw new Error("Notification batch changed; retry");
+    }
+    function notificationMatchesContext(item, marker, context) {
+      const category = marker?.category || item?.category;
+      const orderId = marker?.orderId || item?.orderId;
+      const complaintId = marker?.complaintId || item?.complaintId;
+      if (context.kind === "message") return category === "message" && orderId === context.orderId;
+      if (context.kind === "order") return ["order", "delivery"].includes(category) && orderId === context.orderId;
+      if (context.kind === "complaint") return category === "complaint" && (!context.complaintId || complaintId === context.complaintId);
+      return false;
+    }
+    async function markNotificationContextRead(recipientUid, context, accessToken) {
+      if (!phase4aSafeSegment(recipientUid) || !context || !["message", "order", "complaint"].includes(context.kind)) return 0;
+      if (["message", "order"].includes(context.kind) && !phase4aSafeSegment(context.orderId)) return 0;
+      if (context.complaintId && !phase4aSafeSegment(context.complaintId)) return 0;
+      const matches = [];
+      let cursor = null;
+      for (let page = 0; page < 4 && matches.length < 200; page++) {
+        const result = await listFirestorePage("notification_unread/" + recipientUid + "/items", 50, cursor, accessToken);
+        for (const marker of result.items) {
+          if (!phase4aSafeSegment(marker._id)) continue;
+          let item = null;
+          if (marker.orderId == null && marker.complaintId == null) item = await getFirestoreDoc("user_notifications/" + recipientUid + "/items", marker._id, accessToken);
+          if (notificationMatchesContext(item, marker, context)) matches.push(marker._id);
+        }
+        cursor = result.nextPageToken;
+        if (!cursor) break;
+      }
+      let changed = 0;
+      for (let offset = 0; offset < matches.length; offset += 50) changed += await markUnreadNotificationBatch(recipientUid, matches.slice(offset, offset + 50), accessToken);
+      return changed;
+    }
     async function markAllNotificationsRead(recipientUid, accessToken) {
       let changed = 0;
       for (let page = 0; page < 100; page++) {
         const result = await listFirestorePage("notification_unread/" + recipientUid + "/items", 50, null, accessToken);
         if (!result.items.length) break;
-        for (const marker of result.items) {
-          if (phase4aSafeSegment(marker._id)) {
-            const outcome = await mutateNotificationUnread(recipientUid, marker._id, "read", accessToken);
-            if (outcome.found) changed++;
-          }
-        }
+        changed += await markUnreadNotificationBatch(recipientUid, result.items.map((marker) => marker._id), accessToken);
         if (result.items.length < 50) break;
       }
       return changed;
@@ -3119,8 +3187,9 @@
     }
     __name(incrementReason, "incrementReason");
     __name2(incrementReason, "incrementReason");
-    async function sendAdminBroadcast(users, title, message, accessToken) {
+    async function sendAdminBroadcast(users, title, message, accessToken, notificationOutcomes) {
       const tokenOwners = /* @__PURE__ */ new Map();
+      const badgeByToken = /* @__PURE__ */ new Map();
       let totalCandidateTokens = 0;
       let invalidTokensCount = 0;
       for (const user of users) {
@@ -3133,6 +3202,8 @@
         }
         if (!tokenOwners.has(token)) tokenOwners.set(token, []);
         tokenOwners.get(token).push(user._id);
+        const badge = notificationOutcomes?.get(user._id)?.summary?.totalUnread;
+        if (Number.isInteger(badge)) badgeByToken.set(token, Math.max(badgeByToken.get(token) || 0, badge));
       }
       const validTokens = Array.from(tokenOwners.keys());
       let sentCount = 0;
@@ -3147,6 +3218,7 @@
           title,
           body: message,
           sound: "default",
+          ...(badgeByToken.has(token) ? { badge: badgeByToken.get(token) } : {}),
           data: { type: "admin_broadcast" }
         }));
         try {
@@ -3747,10 +3819,14 @@
       if (Array.isArray(recipientUids)) {
         // The inbox is authoritative and durable. Persist every intended
         // recipient before attempting the best-effort Expo transport.
+        const badgeByUid = /* @__PURE__ */ new Map();
         for (const uid of recipientUids) {
           const role = uid === order.customerUid ? "customer" : uid === order.providerUid ? "provider" : uid === order.driverUid ? "driver" : event === "driver_delivery_requested" ? "driver" : leaseContext?.data?.recipientRole;
           const content = orderNotificationContent(event, { ...order, _id: orderId }, uid, role);
-          if (content) await persistUserNotification({ ...content, eventKey: (leaseContext?.eventId || notificationEventId(orderId, event, leaseContext?.data?.stateVersion || "legacy")) + ":" + uid }, accessToken);
+          if (content) {
+            const outcome = await persistUserNotification({ ...content, eventKey: (leaseContext?.eventId || notificationEventId(orderId, event, leaseContext?.data?.stateVersion || "legacy")) + ":" + uid }, accessToken);
+            if (Number.isInteger(outcome.summary?.totalUnread)) badgeByUid.set(uid, Math.max(0, outcome.summary.totalUnread));
+          }
         }
         const tokenOwners = /* @__PURE__ */ new Map();
         for (const uid of recipientUids) {
@@ -3761,7 +3837,10 @@
         for (let i = messages.length - 1; i >= 0; i--) {
           const uid = tokenOwners.get(messages[i].to);
           if (!uid) messages.splice(i, 1);
-          else messages[i]._recipientUid = uid;
+          else {
+            messages[i]._recipientUid = uid;
+            if (badgeByUid.has(uid)) messages[i].badge = badgeByUid.get(uid);
+          }
         }
       }
       let pushResult = { acceptedCount: 0, failedCount: 0, staleTokensCount: 0, acceptedRecipientUids: [], failedRecipientUids: [], ticketByRecipient: {} };
@@ -6286,6 +6365,16 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(cleanupLimitationsFrom, "cleanupLimitationsFrom");
     __name2(cleanupLimitationsFrom, "cleanupLimitationsFrom");
+    async function deleteNotificationSubcollectionBatch(uid, rootCollection, accessToken) {
+      const page = await listFirestorePage(rootCollection + "/" + uid + "/items", 50, null, accessToken);
+      const ids = page.items.map((item) => item._id).filter(phase4aSafeSegment);
+      if (ids.length) {
+        const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + rootCollection + "/" + uid + "/items/";
+        const committed = await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken);
+        if (!committed) throw new Error("Notification cleanup changed; retry");
+      }
+      return { deletedCount: ids.length, complete: ids.length < 50 && !page.nextPageToken };
+    }
     async function buildAccountDeletionManifest(uid, user, accessToken, env) {
       const verification = await getFirestoreDoc("verifications", uid, accessToken);
       const certificatePublicId = cloudinaryPublicIdFromVerification(verification);
@@ -6312,6 +6401,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         phoneIndexDeleted: !indexedPhoneMustBeRemoved,
         publicProfileDeleted: false,
         privateDeviceDeleted: false,
+        notificationItemsDeleted: false,
+        notificationUnreadDeleted: false,
+        notificationSummaryDeleted: false,
         userDeleted: false,
         verificationDeleted: false,
         cleanupLimitations: [...new Set(cleanupLimitations)]
@@ -6348,6 +6440,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       // or a private push token behind.
       if (!Object.prototype.hasOwnProperty.call(manifest, "publicProfileDeleted")) manifest.publicProfileDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "privateDeviceDeleted")) manifest.privateDeviceDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "notificationItemsDeleted")) manifest.notificationItemsDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "notificationUnreadDeleted")) manifest.notificationUnreadDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "notificationSummaryDeleted")) manifest.notificationSummaryDeleted = false;
       const failures = [];
       if (manifest.phoneIndexDeleted !== true) {
         if (!manifest.phoneIndexKey) {
@@ -6410,6 +6505,33 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("private_device_delete_failed"); }
       }
+      if (manifest.notificationItemsDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          const result = await deleteNotificationSubcollectionBatch(uid, "user_notifications", accessToken);
+          manifest.notificationItemsDeleted = result.complete;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("notification_items_delete_failed"); }
+      }
+      if (manifest.notificationUnreadDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          const result = await deleteNotificationSubcollectionBatch(uid, "notification_unread", accessToken);
+          manifest.notificationUnreadDeleted = result.complete;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("notification_unread_delete_failed"); }
+      }
+      if (manifest.notificationSummaryDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument("notification_summaries", uid, accessToken);
+          manifest.notificationSummaryDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("notification_summary_delete_failed"); }
+      }
       if (manifest.userDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -6428,7 +6550,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("verification_delete_failed"); }
       }
-      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
+      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.notificationItemsDeleted === true && manifest.notificationUnreadDeleted === true && manifest.notificationSummaryDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
       const final = await writeDeletionState(uid, owner, {
         status: complete ? "completed" : "cleanup_pending",
         cleanupManifest: manifest,
@@ -6629,10 +6751,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         persistNotificationBatch,
         listFirestorePage,
         mutateNotificationUnread,
+        markUnreadNotificationBatch,
+        markNotificationContextRead,
         markAllNotificationsRead,
         normalizedNotificationSummary,
         notificationSummaryField,
-        orderNotificationContent
+        orderNotificationContent,
+        deleteNotificationSubcollectionBatch
       };
     }
     addEventListener("scheduled", (event) => {
@@ -7354,7 +7479,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               ];
               if (!(await phase4aCommit(writes, accessToken))) continue;
               const token = await getUserPushToken(recipientUid, accessToken);
-              if (token) await sendExpoPush([{ to: token, title: prepared.notification.title, body: prepared.notification.body, data: { type: "complaint_updated", complaintId, orderId: complaint.orderId || "", role: complaint.source }, sound: "default", _recipientUid: recipientUid }], accessToken);
+              if (token) await sendExpoPush([{ to: token, title: prepared.notification.title, body: prepared.notification.body, data: { type: "complaint_updated", complaintId, orderId: complaint.orderId || "", role: complaint.source }, sound: "default", badge: prepared.summary.totalUnread, _recipientUid: recipientUid }], accessToken);
               return jsonResponse({ success: true, updated: Object.keys(fields) });
             }
             return jsonResponse({ error: "Complaint changed; retry" }, 409);
@@ -7677,20 +7802,37 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             try {
               const body = await request.json();
               const uid = body.uid;
-              if (!uid) return jsonResponse({ error: "Missing uid" }, 400);
+              if (!phase4aSafeSegment(uid)) return jsonResponse({ error: "Missing or invalid uid" }, 400);
               const user = await getFirestoreDoc("users", uid, accessToken);
               if (!user) return jsonResponse({ error: "User not found" }, 404);
               const endDate = user.subscriptionEndsAt || user.trialEndsAt;
               const daysLeft = endDate ? Math.ceil((new Date(endDate) - Date.now()) / (1e3 * 60 * 60 * 24)) : 0;
               const name = user.displayName || "";
+              const reminderTitle = "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643";
+              const reminderBody = "\u0647\u0644\u0627 " + name + "\n\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F " + daysLeft + " \u0623\u064A\u0627\u0645";
+              const normalizedEndDate = endDate && Number.isFinite(new Date(endDate).getTime()) ? new Date(endDate).toISOString() : "none";
+              const notificationOutcome = await persistUserNotification({
+                recipientUid: uid,
+                eventKey: "subscription_reminder:" + normalizedEndDate + ":days_" + daysLeft,
+                type: "subscription_reminder",
+                category: "subscription",
+                title: reminderTitle,
+                body: reminderBody,
+                titleEn: "Subscription reminder",
+                bodyEn: "Your Tabbakheen subscription ends in " + daysLeft + " days.",
+                target: "account",
+                role: user.role
+              }, accessToken);
               const pushToken = await getUserPushToken(uid, accessToken);
               if (pushToken) {
                 await sendExpoPush([{
                   to: pushToken,
-                  title: "\u062A\u0646\u0628\u064A\u0647 \u0627\u0646\u062A\u0647\u0627\u0621 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",
-                  body: "\u0647\u0644\u0627 " + name + "\n\u0627\u0634\u062A\u0631\u0627\u0643\u0643 \u0641\u064A \u062A\u0637\u0628\u064A\u0642 \u0637\u0628\u0627\u062E\u064A\u0646 \u0628\u064A\u0646\u062A\u0647\u064A \u0628\u0639\u062F " + daysLeft + " \u0623\u064A\u0627\u0645",
+                  title: reminderTitle,
+                  body: reminderBody,
                   data: { type: "subscription_reminder" },
-                  sound: "default"
+                  sound: "default",
+                  badge: notificationOutcome.summary.totalUnread,
+                  _recipientUid: uid
                 }], accessToken);
               }
               if (user.email) {
@@ -7773,7 +7915,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const totalUsersMatched = allMatchedUsers.length;
               const now = (/* @__PURE__ */ new Date()).toISOString();
               const histId = "broadcast_" + Date.now();
-              await persistNotificationBatch(allMatchedUsers, (user) => ({
+              const notificationOutcomes = await persistNotificationBatch(allMatchedUsers, (user) => ({
                 recipientUid: user._id,
                 eventKey: "admin_broadcast:" + histId,
                 type: "admin_broadcast",
@@ -7786,7 +7928,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
                 role: user.role,
                 createdAt: now
               }), accessToken);
-              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
+              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken, notificationOutcomes);
               const histFields = {
                 title,
                 message,
@@ -7838,7 +7980,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const totalUsersMatched = allMatchedUsers.length;
               const now = (/* @__PURE__ */ new Date()).toISOString();
               const newHistId = "broadcast_" + Date.now();
-              await persistNotificationBatch(allMatchedUsers, (user) => ({
+              const notificationOutcomes = await persistNotificationBatch(allMatchedUsers, (user) => ({
                 recipientUid: user._id,
                 eventKey: "admin_broadcast:" + newHistId,
                 type: "admin_broadcast",
@@ -7851,7 +7993,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
                 role: user.role,
                 createdAt: now
               }), accessToken);
-              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
+              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken, notificationOutcomes);
               await createFirestoreDocument("admin_broadcast_notifications", newHistId, {
                 title,
                 message,
@@ -8052,6 +8194,23 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch (error) {
           console.error("[Notifications] Read all failed:", error && error.message ? error.message : error);
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to mark notifications read" }, 500);
+        }
+      }
+      if (path === "/notifications/context/read" && request.method === "POST") {
+        if (hasServiceKey || !phase4aSafeSegment(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "User authentication required" }, 403);
+        try {
+          const body = await request.json();
+          if (!phase4aKeysOnly(body, ["kind", "orderId", "complaintId"]) || !["order", "complaint"].includes(body?.kind) || (body.kind === "order" && !phase4aSafeSegment(body.orderId)) || (body.complaintId !== undefined && !phase4aSafeSegment(body.complaintId))) return jsonResponse({ success: false, code: "invalid_request", error: "Invalid notification context" }, 400);
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (body.kind === "order") {
+            const order = await getFirestoreDoc("orders", body.orderId, accessToken);
+            if (!order || ![order.customerUid, order.providerUid, order.driverUid].includes(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "Order is unavailable" }, 403);
+          }
+          const changed = await markNotificationContextRead(callerUid, { kind: body.kind, orderId: body.orderId, complaintId: body.complaintId }, accessToken);
+          return jsonResponse({ success: true, changed });
+        } catch (error) {
+          console.error("[Notifications] Context read failed:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to update notification context" }, 500);
         }
       }
       const notificationMutationMatch = path.match(/^\/notifications\/([^/]+)\/(read|dismiss)$/);

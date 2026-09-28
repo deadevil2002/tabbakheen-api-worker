@@ -115,7 +115,7 @@ global.fetch = async (url, init = {}) => {
     const documents = [...docs.entries()].filter(([path]) => path.startsWith(rawPath + "/")).map(([path, record]) => firestoreDoc(path, record));
     return response({ documents });
   }
-  if (/^order_messages\/[^/]+\/messages$/.test(rawPath)) {
+  if (/^(?:order_messages\/[^/]+\/messages|user_notifications\/[^/]+\/items|notification_unread\/[^/]+\/items)$/.test(rawPath)) {
     const pageSize = Number(new URLSearchParams(query).get("pageSize") || 300);
     const offset = Number(new URLSearchParams(query).get("pageToken") || 0);
     const all = [...docs.entries()]
@@ -316,6 +316,9 @@ function assertStoreSubscriptionRequired(profile) {
   put("phoneLoginIndex/" + deletionKey, { uid: "delete-me", status: "eligible" });
   put("users/delete-me", { phone, phoneIndexStatus: "indexed" });
   put("verifications/delete-me", {});
+  put("user_notifications/delete-me/items/notification-1", { recipientUid: "delete-me", createdAt: now() });
+  put("notification_unread/delete-me/items/notification-1", { notificationId: "notification-1", category: "order", createdAt: now() });
+  put("notification_summaries/delete-me", { totalUnread: 1, ordersUnread: 1 });
   put("account_deletion_requests/delete-me", {
     status: "in_progress", executionLeaseOwner: "owner", executionLeaseUntil: "2099-01-01T00:00:00.000Z",
     cleanupManifest: { remainingOfferIds: [], certificateDeleted: true, phoneIndexKey: deletionKey, phoneIndexDeleted: false, userDeleted: false, verificationDeleted: false }
@@ -323,6 +326,9 @@ function assertStoreSubscriptionRequired(profile) {
   const final = await hooks.executeAccountDeletionCleanup("delete-me", env, "token", docs.get("account_deletion_requests/delete-me").data, "owner");
   assert.equal(final.status, "completed");
   assert.equal(docs.has("phoneLoginIndex/" + deletionKey), false);
+  assert.equal(docs.has("user_notifications/delete-me/items/notification-1"), false);
+  assert.equal(docs.has("notification_unread/delete-me/items/notification-1"), false);
+  assert.equal(docs.has("notification_summaries/delete-me"), false);
 
   // Privacy separation tests invoke the actual Worker handlers (not a
   // parallel authorization model). A customer may only obtain the assigned
