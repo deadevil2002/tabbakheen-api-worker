@@ -47,6 +47,12 @@ has('has_no_public_id');
 has('buildAccountDeletionManifest');
 has('executeAccountDeletionCleanup');
 has('remainingOfferIds');
+has('notificationItemsDeleted');
+has('notificationUnreadDeleted');
+has('notificationSummaryDeleted');
+has('deleteNotificationSubcollectionBatch(uid, "user_notifications"');
+has('deleteNotificationSubcollectionBatch(uid, "notification_unread"');
+has('deleteFirestoreDocument("notification_summaries", uid');
 has('certificateDeleted');
 has('userDeleted');
 has('verificationDeleted');
@@ -70,6 +76,7 @@ assert(
 );
 has("Orders, complaints, ratings, and audit records are intentionally preserved");
 assert(!source.includes('deleteFirestoreDocument("orders"'), "account deletion must preserve orders");
+assert(!source.includes('deleteFirestoreDocument("complaints"'), "account deletion must preserve complaints");
 has("accountDeletionActiveOrders");
 
 // Cleanup is constrained to a verification-owned, allowlisted Cloudinary public id.
