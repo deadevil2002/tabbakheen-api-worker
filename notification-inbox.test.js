@@ -15,6 +15,7 @@ const documents = new Map();
 let clock = 0;
 let subrequestCount = 0;
 let forcedReadAllCommitConflicts = 0;
+let forcedShortListPageSizeOnce = 0;
 const encode = (value) => {
   if (value === null || value === undefined) return { nullValue: null };
   if (typeof value === "string") return { stringValue: value };
@@ -98,8 +99,10 @@ global.fetch = async (rawUrl, init = {}) => {
     const items = [...documents.values()]
       .filter((item) => item.path.startsWith(prefix) && !item.path.slice(prefix.length).includes("/"))
       .sort((a, b) => String(b.data.createdAt || "").localeCompare(String(a.data.createdAt || "")));
-    const selected = items.slice(offset, offset + pageSize);
-    return response({ documents: selected.map(firestoreDoc), ...(offset + pageSize < items.length ? { nextPageToken: String(offset + pageSize) } : {}) });
+    const effectivePageSize = forcedShortListPageSizeOnce > 0 ? Math.min(pageSize, forcedShortListPageSizeOnce) : pageSize;
+    forcedShortListPageSizeOnce = 0;
+    const selected = items.slice(offset, offset + effectivePageSize);
+    return response({ documents: selected.map(firestoreDoc), ...(offset + effectivePageSize < items.length ? { nextPageToken: String(offset + effectivePageSize) } : {}) });
   }
   return response({ error: { status: "NOT_FOUND" } }, 404);
 };
@@ -146,6 +149,20 @@ const firebaseIdToken = (uid) => {
   assert.deepEqual(await hooks.markAllNotificationsRead("account-b", token), { changed: 25, hasMore: true }, "second invocation remains bounded");
   assert.deepEqual(await hooks.markAllNotificationsRead("account-b", token), { changed: 11, hasMore: false }, "final invocation reports completion");
   assert.equal(documents.get("notification_summaries/account-b").data.totalUnread, 0, "batched mark all leaves an exact zero summary");
+
+  for (let index = 0; index < 10; index++) await hooks.persistUserNotification(input("short-page-account", `short-page-${index}`), token);
+  forcedShortListPageSizeOnce = 4;
+  assert.deepEqual(
+    await hooks.markAllNotificationsRead("short-page-account", token),
+    { changed: 4, hasMore: true },
+    "a short Firestore page with nextPageToken requires continuation",
+  );
+  assert.deepEqual(
+    await hooks.markAllNotificationsRead("short-page-account", token),
+    { changed: 6, hasMore: false },
+    "the next invocation processes the remainder and reports completion",
+  );
+  assert.equal(documents.get("notification_summaries/short-page-account").data.totalUnread, 0, "short-page continuation preserves the exact summary");
 
   const categoryInputs = ["order", "message", "admin", "subscription"];
   for (const category of categoryInputs) await hooks.persistUserNotification(input("category-account", `category-${category}`, category), token);

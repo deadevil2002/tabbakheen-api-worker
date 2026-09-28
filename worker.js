@@ -2215,7 +2215,10 @@
         }
         writes.push({ update: phase4aDoc("notification_summaries", recipientUid, next), updateMask: { fieldPaths: Object.keys(next) }, currentDocument: summarySnapshot ? { updateTime: summarySnapshot.updateTime } : { exists: false } });
         writes.push(phase4aDeletionFence(recipientUid, deletionSnapshot));
-        if (await phase4aCommit(writes, accessToken)) return { changed: markers.length, hasMore: result.items.length > NOTIFICATION_READ_ALL_LIMIT };
+        if (await phase4aCommit(writes, accessToken)) {
+          const hasMore = result.items.length > NOTIFICATION_READ_ALL_LIMIT || !!result.nextPageToken;
+          return { changed: markers.length, hasMore };
+        }
       }
       throw new Error("Notification read-all state changed; retry");
     }
