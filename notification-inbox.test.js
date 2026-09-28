@@ -1,0 +1,149 @@
+"use strict";
+const assert = require("assert");
+const fs = require("fs");
+const { webcrypto } = require("crypto");
+
+if (!global.crypto) global.crypto = webcrypto;
+global.addEventListener = () => {};
+process.env.PHONE_AUTH_TEST_MODE = "1";
+
+const BASE = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents";
+const documents = new Map();
+let clock = 0;
+const encode = (value) => {
+  if (value === null || value === undefined) return { nullValue: null };
+  if (typeof value === "string") return { stringValue: value };
+  if (typeof value === "boolean") return { booleanValue: value };
+  if (typeof value === "number") return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+  if (Array.isArray(value)) return { arrayValue: { values: value.map(encode) } };
+  return { mapValue: { fields: Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encode(item)])) } };
+};
+const decode = (value) => {
+  if ("nullValue" in value) return null;
+  if ("stringValue" in value) return value.stringValue;
+  if ("booleanValue" in value) return value.booleanValue;
+  if ("integerValue" in value) return Number(value.integerValue);
+  if ("doubleValue" in value) return value.doubleValue;
+  if ("arrayValue" in value) return (value.arrayValue.values || []).map(decode);
+  if ("mapValue" in value) return Object.fromEntries(Object.entries(value.mapValue.fields || {}).map(([key, item]) => [key, decode(item)]));
+  return null;
+};
+const snapshot = (path, data, updateTime = `2026-09-29T00:00:${String(++clock).padStart(2, "0")}.000Z`) => ({ path, data, updateTime });
+const firestoreDoc = (item) => ({
+  name: `${BASE}/${item.path}`,
+  updateTime: item.updateTime,
+  fields: Object.fromEntries(Object.entries(item.data).map(([key, value]) => [key, encode(value)])),
+});
+const response = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+const preconditionMatches = (existing, condition) => {
+  if (!condition) return true;
+  if ("exists" in condition) return condition.exists === !!existing;
+  if (condition.updateTime) return existing?.updateTime === condition.updateTime;
+  return true;
+};
+
+global.fetch = async (rawUrl, init = {}) => {
+  const url = new URL(String(rawUrl));
+  if (url.href === `${BASE}:commit`) {
+    const { writes } = JSON.parse(init.body);
+    for (const write of writes) {
+      const name = write.update?.name || write.delete || write.verify;
+      const path = name.slice(name.indexOf("/documents/") + 11);
+      if (!preconditionMatches(documents.get(path), write.currentDocument)) return response({ error: { status: "FAILED_PRECONDITION" } }, 412);
+    }
+    for (const write of writes) {
+      if (write.verify) continue;
+      const name = write.update?.name || write.delete;
+      const path = name.slice(name.indexOf("/documents/") + 11);
+      if (write.delete) documents.delete(path);
+      else {
+        const incoming = Object.fromEntries(Object.entries(write.update.fields || {}).map(([key, value]) => [key, decode(value)]));
+        const existing = documents.get(path)?.data || {};
+        documents.set(path, snapshot(path, write.updateMask ? { ...existing, ...incoming } : incoming));
+      }
+    }
+    return response({ writeResults: [] });
+  }
+  if (!url.href.startsWith(BASE)) throw new Error(`Unexpected URL: ${url.href}`);
+  const path = decodeURIComponent(url.pathname.split("/documents/")[1] || "");
+  if (init.method && init.method !== "GET") throw new Error(`Unexpected method: ${init.method}`);
+  const direct = documents.get(path);
+  if (direct) return response(firestoreDoc(direct));
+  const pageSize = Number(url.searchParams.get("pageSize") || 0);
+  if (pageSize) {
+    const prefix = path + "/";
+    const offset = Number(url.searchParams.get("pageToken") || 0);
+    const items = [...documents.values()]
+      .filter((item) => item.path.startsWith(prefix) && !item.path.slice(prefix.length).includes("/"))
+      .sort((a, b) => String(b.data.createdAt || "").localeCompare(String(a.data.createdAt || "")));
+    const selected = items.slice(offset, offset + pageSize);
+    return response({ documents: selected.map(firestoreDoc), ...(offset + pageSize < items.length ? { nextPageToken: String(offset + pageSize) } : {}) });
+  }
+  return response({ error: { status: "NOT_FOUND" } }, 404);
+};
+
+require("./worker.js");
+const hooks = global.__PHONE_AUTH_TEST_HOOKS;
+assert(hooks, "notification test hooks unavailable");
+const token = "offline-token";
+const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, eventKey, type: "order_accepted", category, title: "تم التحديث", body: "لديك تحديث جديد", orderId: "order-1", role: "customer" });
+
+(async () => {
+  const first = await hooks.persistUserNotification(input("account-a", "event-1"), token);
+  const duplicate = await hooks.persistUserNotification(input("account-a", "event-1"), token);
+  assert.equal(first.id, duplicate.id, "stable event ID must deduplicate retries");
+  assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 1, "duplicate cannot increment unread");
+
+  await hooks.persistUserNotification(input("account-b", "event-1"), token);
+  const aPage = await hooks.listFirestorePage("user_notifications/account-a/items", 20, null, token);
+  assert(aPage.items.every((item) => item.recipientUid === "account-a"), "account A cannot list account B records");
+
+  for (let index = 2; index <= 25; index++) await hooks.persistUserNotification(input("account-a", `event-${index}`), token);
+  const page1 = await hooks.listFirestorePage("user_notifications/account-a/items", 20, null, token);
+  const page2 = await hooks.listFirestorePage("user_notifications/account-a/items", 20, page1.nextPageToken, token);
+  assert.equal(page1.items.length, 20);
+  assert.equal(page2.items.length, 5);
+
+  await hooks.mutateNotificationUnread("account-a", first.id, "read", token);
+  assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 24, "mark one read decrements summary");
+  await hooks.markAllNotificationsRead("account-a", token);
+  assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 0, "mark all read clears summary");
+
+  const broadcastUsers = [{ _id: "account-a", role: "customer" }, { _id: "account-b", role: "customer" }];
+  await hooks.persistNotificationBatch(broadcastUsers, (user) => ({ ...input(user._id, "broadcast-1", "admin"), type: "admin_broadcast", target: "notifications" }), token);
+  const aBroadcast = (await hooks.listFirestorePage("user_notifications/account-a/items", 50, null, token)).items.find((item) => item.type === "admin_broadcast");
+  const bBroadcast = (await hooks.listFirestorePage("user_notifications/account-b/items", 50, null, token)).items.find((item) => item.type === "admin_broadcast");
+  assert(aBroadcast && bBroadcast, "eligible audience receives durable records even without push tokens");
+  await hooks.mutateNotificationUnread("account-a", aBroadcast._id, "dismiss", token);
+  assert(documents.has(`user_notifications/account-b/items/${bBroadcast._id}`), "dismissal must be per user");
+  assert(!documents.has(`user_notifications/account-a/items/${aBroadcast._id}`), "dismissed user copy is removed");
+
+  const complaint = {
+    recipientUid: "account-a",
+    eventKey: "complaint_update:complaint-1:stable-content",
+    type: "complaint_updated",
+    category: "complaint",
+    title: "تم حل الشكوى",
+    body: "تم تحديث حالة شكواك.",
+    complaintId: "complaint-1",
+    orderId: "order-1",
+    target: "complaint",
+    role: "customer"
+  };
+  const complaintCreated = await hooks.persistUserNotification(complaint, token);
+  const complaintRepeated = await hooks.persistUserNotification(complaint, token);
+  assert.equal(complaintCreated.id, complaintRepeated.id, "identical complaint update cannot spam duplicate notifications");
+  assert.equal(complaintCreated.notification.category, "complaint");
+
+  assert.equal(hooks.notificationSummaryField("message"), "messagesUnread");
+  assert.equal(hooks.notificationSummaryField("complaint"), "accountUnread");
+  const source = fs.readFileSync(__dirname + "/worker.js", "utf8");
+  assert(source.indexOf("await persistUserNotification({ ...content") < source.indexOf("pushResult = await sendExpoPush(messages"), "durable order entry must precede push");
+  assert(source.includes('eventKey: "complaint_update:" + complaintId + ":" + digest'), "complaint updates use stable content idempotency");
+  assert(source.includes("const meaningful = Object.entries(requested).some"), "identical complaint saves must not notify");
+  assert(source.includes("await persistNotificationBatch(allMatchedUsers"), "admin audience must receive durable records");
+  console.log("notification inbox tests: PASS (ownership, pagination, summary, read, read-all, dismiss, idempotency, broadcast durability)");
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exitCode = 1;
+});

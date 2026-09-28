@@ -1978,6 +1978,136 @@
       const out = {}; for (const [key, value] of Object.entries(fields)) out[key] = toFirestoreValue(value);
       return { name: "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id, fields: out };
     }
+    const NOTIFICATION_SUMMARY_FIELDS = ["totalUnread", "ordersUnread", "messagesUnread", "accountUnread", "adminUnread"];
+    function emptyNotificationSummary() {
+      return { totalUnread: 0, ordersUnread: 0, messagesUnread: 0, accountUnread: 0, adminUnread: 0, updatedAt: null };
+    }
+    function notificationSummaryField(category) {
+      if (category === "message") return "messagesUnread";
+      if (category === "account" || category === "complaint" || category === "subscription") return "accountUnread";
+      if (category === "admin") return "adminUnread";
+      return "ordersUnread";
+    }
+    function normalizedNotificationSummary(value) {
+      const summary = emptyNotificationSummary();
+      for (const field of NOTIFICATION_SUMMARY_FIELDS) {
+        const count = Number(value?.[field]);
+        summary[field] = Number.isInteger(count) && count > 0 ? count : 0;
+      }
+      summary.updatedAt = typeof value?.updatedAt === "string" ? value.updatedAt : null;
+      return summary;
+    }
+    async function notificationDocumentId(recipientUid, eventKey) {
+      return "n_" + (await sha256Hex(recipientUid + "|" + eventKey)).slice(0, 48);
+    }
+    async function prepareNotificationCreate(input, accessToken) {
+      const recipientUid = input && input.recipientUid;
+      if (!phase4aSafeSegment(recipientUid) || typeof input?.eventKey !== "string" || !input.eventKey || typeof input?.title !== "string" || !input.title.trim() || typeof input?.body !== "string" || !input.body.trim()) throw new Error("Invalid notification input");
+      const id = await notificationDocumentId(recipientUid, input.eventKey);
+      const collection = "user_notifications/" + recipientUid + "/items";
+      const existing = await getFirestoreSnapshot(collection, id, accessToken);
+      if (existing) return { existing: true, id, notification: { ...existing.data, id } };
+      const [summarySnapshot, deletionSnapshot] = await Promise.all([
+        getFirestoreSnapshot("notification_summaries", recipientUid, accessToken),
+        getFirestoreSnapshot("account_deletion_requests", recipientUid, accessToken)
+      ]);
+      if (publicProfileDeletionActive(deletionSnapshot)) return { skipped: true, id };
+      const now = typeof input.createdAt === "string" ? input.createdAt : new Date().toISOString();
+      const category = ["order", "delivery", "message", "complaint", "subscription", "account", "admin"].includes(input.category) ? input.category : "account";
+      const record = {
+        recipientUid,
+        eventKey: input.eventKey,
+        type: typeof input.type === "string" ? input.type : "system",
+        category,
+        title: input.title.trim().slice(0, 160),
+        body: input.body.trim().slice(0, 1e3),
+        titleEn: typeof input.titleEn === "string" ? input.titleEn.trim().slice(0, 160) : "",
+        bodyEn: typeof input.bodyEn === "string" ? input.bodyEn.trim().slice(0, 1e3) : "",
+        createdAt: now,
+        readAt: null,
+        orderId: phase4aSafeSegment(input.orderId) ? input.orderId : null,
+        complaintId: phase4aSafeSegment(input.complaintId) ? input.complaintId : null,
+        target: typeof input.target === "string" ? input.target.slice(0, 40) : null,
+        role: ["customer", "provider", "driver"].includes(input.role) ? input.role : null
+      };
+      const prior = normalizedNotificationSummary(summarySnapshot?.data);
+      const categoryField = notificationSummaryField(category);
+      const next = { ...prior, totalUnread: prior.totalUnread + 1, [categoryField]: prior[categoryField] + 1, updatedAt: now };
+      const marker = { notificationId: id, category, createdAt: now };
+      const writes = [
+        { update: phase4aDoc(collection, id, record), updateMask: { fieldPaths: Object.keys(record) }, currentDocument: { exists: false } },
+        { update: phase4aDoc("notification_unread/" + recipientUid + "/items", id, marker), updateMask: { fieldPaths: Object.keys(marker) }, currentDocument: { exists: false } },
+        { update: phase4aDoc("notification_summaries", recipientUid, next), updateMask: { fieldPaths: Object.keys(next) }, currentDocument: summarySnapshot ? { updateTime: summarySnapshot.updateTime } : { exists: false } },
+        phase4aDeletionFence(recipientUid, deletionSnapshot)
+      ];
+      return { existing: false, id, notification: { ...record, id }, writes };
+    }
+    async function persistUserNotification(input, accessToken) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const prepared = await prepareNotificationCreate(input, accessToken);
+        if (prepared.existing || prepared.skipped) return prepared;
+        if (await phase4aCommit(prepared.writes, accessToken)) return { ...prepared, created: true };
+      }
+      throw new Error("Notification state changed; retry");
+    }
+    async function persistNotificationBatch(users, makeInput, accessToken) {
+      const unique = [...new Map((Array.isArray(users) ? users : []).filter((user) => user && phase4aSafeSegment(user._id || user.uid)).map((user) => [user._id || user.uid, user])).values()];
+      for (let offset = 0; offset < unique.length; offset += 20) {
+        await Promise.all(unique.slice(offset, offset + 20).map((user) => persistUserNotification(makeInput(user), accessToken)));
+      }
+    }
+    async function listFirestorePage(collectionPath, pageSize, pageToken, accessToken) {
+      const bounded = Math.max(1, Math.min(50, Number(pageSize) || 20));
+      let url = FIRESTORE_BASE + "/" + collectionPath + "?pageSize=" + bounded + "&orderBy=createdAt%20desc";
+      if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
+      const response = await fetch(url, { headers: { "Authorization": "Bearer " + accessToken } });
+      if (!response.ok) throw new Error("Notification list failed: " + response.status);
+      const data = await response.json();
+      return { items: (data.documents || []).map(parseFirestoreDoc).filter(Boolean), nextPageToken: typeof data.nextPageToken === "string" ? data.nextPageToken : null };
+    }
+    async function mutateNotificationUnread(recipientUid, notificationId, action, accessToken) {
+      if (!phase4aSafeSegment(recipientUid) || !phase4aSafeSegment(notificationId) || !["read", "dismiss"].includes(action)) return { found: false };
+      const collection = "user_notifications/" + recipientUid + "/items";
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const [itemSnapshot, markerSnapshot, summarySnapshot, deletionSnapshot] = await Promise.all([
+          getFirestoreSnapshot(collection, notificationId, accessToken),
+          getFirestoreSnapshot("notification_unread/" + recipientUid + "/items", notificationId, accessToken),
+          getFirestoreSnapshot("notification_summaries", recipientUid, accessToken),
+          getFirestoreSnapshot("account_deletion_requests", recipientUid, accessToken)
+        ]);
+        if (!itemSnapshot || itemSnapshot.data.recipientUid !== recipientUid) return { found: false };
+        if (publicProfileDeletionActive(deletionSnapshot)) return { found: false };
+        const writes = [];
+        const now = new Date().toISOString();
+        if (action === "dismiss") writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + notificationId, currentDocument: { updateTime: itemSnapshot.updateTime } });
+        else if (!itemSnapshot.data.readAt) writes.push({ update: phase4aDoc(collection, notificationId, { readAt: now }), updateMask: { fieldPaths: ["readAt"] }, currentDocument: { updateTime: itemSnapshot.updateTime } });
+        if (markerSnapshot) {
+          writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/notification_unread/" + recipientUid + "/items/" + notificationId, currentDocument: { updateTime: markerSnapshot.updateTime } });
+          const prior = normalizedNotificationSummary(summarySnapshot?.data);
+          const categoryField = notificationSummaryField(markerSnapshot.data.category || itemSnapshot.data.category);
+          const next = { ...prior, totalUnread: Math.max(0, prior.totalUnread - 1), [categoryField]: Math.max(0, prior[categoryField] - 1), updatedAt: now };
+          writes.push({ update: phase4aDoc("notification_summaries", recipientUid, next), updateMask: { fieldPaths: Object.keys(next) }, currentDocument: summarySnapshot ? { updateTime: summarySnapshot.updateTime } : { exists: false } });
+        }
+        writes.push(phase4aDeletionFence(recipientUid, deletionSnapshot));
+        if (writes.length === 1 || await phase4aCommit(writes, accessToken)) return { found: true };
+      }
+      throw new Error("Notification state changed; retry");
+    }
+    async function markAllNotificationsRead(recipientUid, accessToken) {
+      let changed = 0;
+      for (let page = 0; page < 100; page++) {
+        const result = await listFirestorePage("notification_unread/" + recipientUid + "/items", 50, null, accessToken);
+        if (!result.items.length) break;
+        for (const marker of result.items) {
+          if (phase4aSafeSegment(marker._id)) {
+            const outcome = await mutateNotificationUnread(recipientUid, marker._id, "read", accessToken);
+            if (outcome.found) changed++;
+          }
+        }
+        if (result.items.length < 50) break;
+      }
+      return changed;
+    }
     function addUtcCalendarMonths(value, months) {
       const date = new Date(value);
       if (!Number.isFinite(date.getTime()) || !Number.isInteger(months)) throw new Error("Invalid calendar date");
@@ -3226,6 +3356,44 @@
     }
     __name(sendExpoPush, "sendExpoPush");
     __name2(sendExpoPush, "sendExpoPush");
+    function orderNotificationContent(event, order, recipientUid, recipientRole) {
+      const label = order.offerTitleSnapshot || order.orderNumber || order._id || "";
+      const values = {
+        order_created: ["طلب جديد", "وصلك طلب جديد \"" + label + "\".", "New order", "You received a new order: " + label + "."],
+        order_accepted: ["تم قبول طلبك", "تم قبول طلبك \"" + label + "\" وجارٍ التحضير.", "Order accepted", "Your order " + label + " was accepted."],
+        order_rejected: ["تم رفض الطلب", "تعذر قبول طلبك \"" + label + "\".", "Order declined", "Your order " + label + " was declined."],
+        order_preparing: ["جاري تحضير طلبك", "بدأ تحضير طلبك \"" + label + "\".", "Order being prepared", "Preparation started for " + label + "."],
+        order_ready: ["طلبك جاهز", "طلبك \"" + label + "\" جاهز.", "Order ready", "Your order " + label + " is ready."],
+        order_cancelled: ["تم إلغاء الطلب", "تم إلغاء الطلب \"" + label + "\".", "Order cancelled", "Order " + label + " was cancelled."],
+        customer_cancelled: ["ألغى العميل الطلب", "ألغى العميل الطلب \"" + label + "\".", "Customer cancelled", "The customer cancelled order " + label + "."],
+        self_pickup_selected: ["استلام ذاتي", "سيستلم العميل الطلب \"" + label + "\" بنفسه.", "Self pickup selected", "The customer will collect order " + label + "."],
+        self_pickup_completed: ["تم تسليم الطلب", "تم تسليم الطلب \"" + label + "\" بنجاح.", "Order completed", "Order " + label + " was completed."],
+        driver_delivery_requested: ["طلب توصيل", "طُلب توصيل الطلب \"" + label + "\" بواسطة مندوب.", "Delivery requested", "Delivery was requested for order " + label + "."],
+        driver_assigned: ["تم تعيين مندوب", "تم تعيين مندوب للطلب \"" + label + "\".", "Driver assigned", "A driver was assigned to order " + label + "."],
+        driver_rejected: ["جاري البحث عن مندوب", "اعتذر المندوب عن الطلب \"" + label + "\" ويجري البحث عن بديل.", "Finding another driver", "A new driver is being found for order " + label + "."],
+        picked_up: ["استلم المندوب الطلب", "الطلب \"" + label + "\" في الطريق.", "Order picked up", "Order " + label + " is on the way."],
+        arrived: ["وصل المندوب", "وصل المندوب بطلبك \"" + label + "\".", "Driver arrived", "The driver arrived with order " + label + "."],
+        delivery_pending_confirmation: ["بانتظار تأكيد الاستلام", "أكد استلام الطلب \"" + label + "\" من التطبيق.", "Confirm delivery", "Confirm receipt of order " + label + "."],
+        delivered: ["تم التوصيل", "تم توصيل الطلب \"" + label + "\" بنجاح.", "Delivered", "Order " + label + " was delivered."],
+        driver_assigned_by_provider: ["توصيلة مسندة", "تم إسناد توصيل الطلب \"" + label + "\".", "Delivery assigned", "Delivery of order " + label + " was assigned."],
+        order_chat_to_customer: ["محادثة الطلب", "لديك رسالة جديدة بخصوص طلبك.", "Order chat", "You have a new message about your order."],
+        order_chat_to_provider: ["محادثة الطلب", "لديك رسالة جديدة بخصوص الطلب.", "Order chat", "You have a new message about the order."]
+      }[event];
+      if (!values) return null;
+      const driverDiscovery = event === "driver_delivery_requested" && recipientRole === "driver";
+      return {
+        recipientUid,
+        type: event.startsWith("order_chat_") ? "order_chat_message" : driverDiscovery ? "new_delivery_available" : event === "picked_up" ? "order_picked_up" : event === "arrived" ? "driver_arrived" : event === "delivered" ? "order_delivered" : event === "self_pickup_completed" ? "order_completed" : event,
+        category: event.startsWith("order_chat_") ? "message" : isDeliveryNotificationEvent(event) ? "delivery" : "order",
+        title: driverDiscovery ? "توصيلة جديدة متاحة" : values[0],
+        body: driverDiscovery ? "توصيلة جديدة متاحة للطلب \"" + label + "\"." : values[1],
+        titleEn: driverDiscovery ? "New delivery available" : values[2],
+        bodyEn: driverDiscovery ? "A new delivery is available for order " + label + "." : values[3],
+        orderId: order._id,
+        target: "order",
+        role: recipientRole
+      };
+    }
     async function handleEvent(event, orderId, accessToken, recipientUids, leaseContext) {
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) {
@@ -3577,6 +3745,13 @@
       }
       let skippedRecipientUids = [];
       if (Array.isArray(recipientUids)) {
+        // The inbox is authoritative and durable. Persist every intended
+        // recipient before attempting the best-effort Expo transport.
+        for (const uid of recipientUids) {
+          const role = uid === order.customerUid ? "customer" : uid === order.providerUid ? "provider" : uid === order.driverUid ? "driver" : event === "driver_delivery_requested" ? "driver" : leaseContext?.data?.recipientRole;
+          const content = orderNotificationContent(event, { ...order, _id: orderId }, uid, role);
+          if (content) await persistUserNotification({ ...content, eventKey: (leaseContext?.eventId || notificationEventId(orderId, event, leaseContext?.data?.stateVersion || "legacy")) + ":" + uid }, accessToken);
+        }
         const tokenOwners = /* @__PURE__ */ new Map();
         for (const uid of recipientUids) {
           const token = await getUserPushToken(uid, accessToken);
@@ -6448,7 +6623,16 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         handleMyComplaints,
         handleComplaintCreate,
         claimNotificationEvent,
-        getEventRecipientUids
+        getEventRecipientUids,
+        prepareNotificationCreate,
+        persistUserNotification,
+        persistNotificationBatch,
+        listFirestorePage,
+        mutateNotificationUnread,
+        markAllNotificationsRead,
+        normalizedNotificationSummary,
+        notificationSummaryField,
+        orderNotificationContent
       };
     }
     addEventListener("scheduled", (event) => {
@@ -7128,17 +7312,52 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (complaintUpdateMatch && request.method === "POST") {
             const complaintId = decodeURIComponent(complaintUpdateMatch[1]);
             const body = await request.json();
-            const fields = {};
+            const requested = {};
             if ("complaintStatus" in body) {
               const complaintStatus = String(body.complaintStatus || "");
               if (!["pending", "resolved", "closed"].includes(complaintStatus)) return jsonResponse({ error: "Invalid complaint status" }, 400);
-              fields.complaintStatus = complaintStatus;
+              requested.complaintStatus = complaintStatus;
             }
-            if ("adminNote" in body) fields.adminNote = String(body.adminNote || "").slice(0, 4e3);
-            if (Object.keys(fields).length === 0) return jsonResponse({ error: "No valid complaint fields" }, 400);
-            fields.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-            await updateFirestoreDocument("delivery_complaints", complaintId, fields, accessToken);
-            return jsonResponse({ success: true, updated: Object.keys(fields) });
+            if ("adminNote" in body) requested.adminNote = String(body.adminNote || "").slice(0, 4e3);
+            if (Object.keys(requested).length === 0) return jsonResponse({ error: "No valid complaint fields" }, 400);
+            for (let attempt = 0; attempt < 4; attempt++) {
+              const complaintSnapshot = await getFirestoreSnapshot("delivery_complaints", complaintId, accessToken);
+              if (!complaintSnapshot) return jsonResponse({ error: "Complaint not found" }, 404);
+              const complaint = complaintSnapshot.data;
+              const meaningful = Object.entries(requested).some(([key, value]) => complaint[key] !== value);
+              if (!meaningful) return jsonResponse({ success: true, updated: [], idempotent: true });
+              const recipientUid = phase4aSafeSegment(complaint.reporterUid) ? complaint.reporterUid : ["customer", "provider", "driver"].includes(complaint.source) && phase4aSafeSegment(complaint[complaint.source + "Uid"]) ? complaint[complaint.source + "Uid"] : "";
+              if (!recipientUid) return jsonResponse({ error: "Complaint owner is unavailable" }, 409);
+              const fields = { ...requested, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+              const digest = await sha256Hex(JSON.stringify({ complaintId, ...requested }));
+              const statusLabel = requested.complaintStatus === "resolved" ? "تم حل الشكوى" : requested.complaintStatus === "closed" ? "تم إغلاق الشكوى" : "تم تحديث الشكوى";
+              const prepared = await prepareNotificationCreate({
+                recipientUid,
+                eventKey: "complaint_update:" + complaintId + ":" + digest,
+                type: "complaint_updated",
+                category: "complaint",
+                title: statusLabel,
+                body: requested.adminNote ? "تم تحديث شكواك وإضافة رد من فريق الدعم." : "تم تحديث حالة شكواك.",
+                titleEn: requested.complaintStatus === "resolved" ? "Complaint resolved" : requested.complaintStatus === "closed" ? "Complaint closed" : "Complaint updated",
+                bodyEn: requested.adminNote ? "Support updated your complaint and added a response." : "Your complaint status was updated.",
+                complaintId,
+                orderId: complaint.orderId,
+                target: "complaint",
+                role: complaint.source,
+                createdAt: fields.updatedAt
+              }, accessToken);
+              if (prepared.skipped) return jsonResponse({ error: "Complaint owner is unavailable" }, 409);
+              if (prepared.existing) return jsonResponse({ success: true, updated: [], idempotent: true });
+              const writes = [
+                { update: phase4aDoc("delivery_complaints", complaintId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: complaintSnapshot.updateTime } },
+                ...prepared.writes
+              ];
+              if (!(await phase4aCommit(writes, accessToken))) continue;
+              const token = await getUserPushToken(recipientUid, accessToken);
+              if (token) await sendExpoPush([{ to: token, title: prepared.notification.title, body: prepared.notification.body, data: { type: "complaint_updated", complaintId, orderId: complaint.orderId || "", role: complaint.source }, sound: "default", _recipientUid: recipientUid }], accessToken);
+              return jsonResponse({ success: true, updated: Object.keys(fields) });
+            }
+            return jsonResponse({ error: "Complaint changed; retry" }, 409);
           }
           const userUpdateMatch = path.match(/^\/admin\/api\/users\/([^/]+)\/update$/);
           if (userUpdateMatch && request.method === "POST") {
@@ -7552,9 +7771,22 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
                 allMatchedUsers = allMatchedUsers.concat(users || []);
               }
               const totalUsersMatched = allMatchedUsers.length;
-              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
               const now = (/* @__PURE__ */ new Date()).toISOString();
               const histId = "broadcast_" + Date.now();
+              await persistNotificationBatch(allMatchedUsers, (user) => ({
+                recipientUid: user._id,
+                eventKey: "admin_broadcast:" + histId,
+                type: "admin_broadcast",
+                category: "admin",
+                title,
+                body: message,
+                titleEn: title,
+                bodyEn: message,
+                target: "notifications",
+                role: user.role,
+                createdAt: now
+              }), accessToken);
+              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
               const histFields = {
                 title,
                 message,
@@ -7604,9 +7836,22 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
                 allMatchedUsers = allMatchedUsers.concat(users || []);
               }
               const totalUsersMatched = allMatchedUsers.length;
-              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
               const now = (/* @__PURE__ */ new Date()).toISOString();
               const newHistId = "broadcast_" + Date.now();
+              await persistNotificationBatch(allMatchedUsers, (user) => ({
+                recipientUid: user._id,
+                eventKey: "admin_broadcast:" + newHistId,
+                type: "admin_broadcast",
+                category: "admin",
+                title,
+                body: message,
+                titleEn: title,
+                bodyEn: message,
+                target: "notifications",
+                role: user.role,
+                createdAt: now
+              }), accessToken);
+              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken);
               await createFirestoreDocument("admin_broadcast_notifications", newHistId, {
                 title,
                 message,
@@ -7756,6 +8001,71 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch {
           console.error("[Complaints] Create failed");
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to create complaint" }, 500);
+        }
+      }
+      if (path === "/notifications/summary" && request.method === "GET") {
+        if (hasServiceKey || !phase4aSafeSegment(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "User authentication required" }, 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const summary = await getFirestoreDoc("notification_summaries", callerUid, accessToken);
+          return jsonResponse({ success: true, summary: normalizedNotificationSummary(summary) });
+        } catch (error) {
+          console.error("[Notifications] Summary failed:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to load notification summary" }, 500);
+        }
+      }
+      if (path === "/notifications" && request.method === "GET") {
+        if (hasServiceKey || !phase4aSafeSegment(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "User authentication required" }, 403);
+        try {
+          const limitValue = Number(url.searchParams.get("limit") || 20);
+          const cursor = url.searchParams.get("cursor") || null;
+          if (!Number.isInteger(limitValue) || limitValue < 1 || limitValue > 50 || (cursor && cursor.length > 2e3)) return jsonResponse({ success: false, code: "invalid_request", error: "Invalid pagination" }, 400);
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const page = await listFirestorePage("user_notifications/" + callerUid + "/items", limitValue, cursor, accessToken);
+          const notifications = page.items.filter((item) => item.recipientUid === callerUid).map((item) => ({
+            id: item._id,
+            type: item.type,
+            category: item.category,
+            title: item.title,
+            body: item.body,
+            titleEn: item.titleEn || "",
+            bodyEn: item.bodyEn || "",
+            createdAt: item.createdAt,
+            readAt: item.readAt || null,
+            orderId: item.orderId || null,
+            complaintId: item.complaintId || null,
+            target: item.target || null,
+            role: item.role || null
+          }));
+          return jsonResponse({ success: true, notifications, nextCursor: page.nextPageToken });
+        } catch (error) {
+          console.error("[Notifications] List failed:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to load notifications" }, 500);
+        }
+      }
+      if (path === "/notifications/read-all" && request.method === "POST") {
+        if (hasServiceKey || !phase4aSafeSegment(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "User authentication required" }, 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const changed = await markAllNotificationsRead(callerUid, accessToken);
+          return jsonResponse({ success: true, changed });
+        } catch (error) {
+          console.error("[Notifications] Read all failed:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to mark notifications read" }, 500);
+        }
+      }
+      const notificationMutationMatch = path.match(/^\/notifications\/([^/]+)\/(read|dismiss)$/);
+      if (notificationMutationMatch && request.method === "POST") {
+        if (hasServiceKey || !phase4aSafeSegment(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "User authentication required" }, 403);
+        try {
+          const notificationId = decodeURIComponent(notificationMutationMatch[1]);
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const result = await mutateNotificationUnread(callerUid, notificationId, notificationMutationMatch[2] === "read" ? "read" : "dismiss", accessToken);
+          if (!result.found) return jsonResponse({ success: false, code: "not_found", error: "Notification not found" }, 404);
+          return jsonResponse({ success: true });
+        } catch (error) {
+          console.error("[Notifications] Mutation failed:", error && error.message ? error.message : error);
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to update notification" }, 500);
         }
       }
       if (path === "/devices/register" && request.method === "POST") {
