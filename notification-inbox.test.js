@@ -1,15 +1,20 @@
 "use strict";
 const assert = require("assert");
 const fs = require("fs");
-const { webcrypto } = require("crypto");
+const { generateKeyPairSync, webcrypto, sign } = require("crypto");
 
 if (!global.crypto) global.crypto = webcrypto;
 global.addEventListener = () => {};
 process.env.PHONE_AUTH_TEST_MODE = "1";
 
 const BASE = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents";
+const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const PRIVATE_KEY = privateKey.export({ format: "pem", type: "pkcs8" });
+const FIREBASE_TEST_JWK = { ...publicKey.export({ format: "jwk" }), kid: "test-kid", alg: "RS256", use: "sig" };
 const documents = new Map();
 let clock = 0;
+let subrequestCount = 0;
+let forcedReadAllCommitConflicts = 0;
 const encode = (value) => {
   if (value === null || value === undefined) return { nullValue: null };
   if (typeof value === "string") return { stringValue: value };
@@ -43,13 +48,30 @@ const preconditionMatches = (existing, condition) => {
 };
 
 global.fetch = async (rawUrl, init = {}) => {
+  subrequestCount += 1;
   const url = new URL(String(rawUrl));
+  if (url.href === "https://oauth2.googleapis.com/token") return response({ access_token: "oauth-token" });
+  if (url.href.includes("securetoken@system.gserviceaccount.com")) return response({ keys: [FIREBASE_TEST_JWK] });
+  if (url.href === `${BASE}:batchGet`) {
+    const { documents: names } = JSON.parse(init.body);
+    return response(names.map((name) => {
+      const path = name.slice(name.indexOf("/documents/") + 11);
+      const item = documents.get(path);
+      return item ? { found: firestoreDoc(item) } : { missing: name };
+    }));
+  }
   if (url.href === `${BASE}:commit`) {
     const { writes } = JSON.parse(init.body);
+    if (forcedReadAllCommitConflicts > 0 && writes.some((write) => String(write.delete || "").includes("/notification_unread/"))) {
+      forcedReadAllCommitConflicts -= 1;
+      return response({ error: { status: "FAILED_PRECONDITION" } }, 412);
+    }
     for (const write of writes) {
       const name = write.update?.name || write.delete || write.verify;
       const path = name.slice(name.indexOf("/documents/") + 11);
-      if (!preconditionMatches(documents.get(path), write.currentDocument)) return response({ error: { status: "FAILED_PRECONDITION" } }, 412);
+      const existing = documents.get(path);
+      if (write.currentDocument?.exists === true && !existing) return response({ error: { status: "FAILED_PRECONDITION" } }, 412);
+      if (!preconditionMatches(existing, write.currentDocument)) return response({ error: { status: "FAILED_PRECONDITION" } }, 412);
     }
     for (const write of writes) {
       if (write.verify) continue;
@@ -87,6 +109,13 @@ const hooks = global.__PHONE_AUTH_TEST_HOOKS;
 assert(hooks, "notification test hooks unavailable");
 const token = "offline-token";
 const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, eventKey, type: "order_accepted", category, title: "تم التحديث", body: "لديك تحديث جديد", orderId: "order-1", role: "customer" });
+const firebaseIdToken = (uid) => {
+  const b64 = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64({ alg: "RS256", kid: "test-kid" });
+  const payload = b64({ aud: "tabbakheen-99883", iss: "https://securetoken.google.com/tabbakheen-99883", sub: uid, iat: now, exp: now + 300 });
+  return header + "." + payload + "." + sign("RSA-SHA256", Buffer.from(header + "." + payload), privateKey).toString("base64url");
+};
 
 (async () => {
   const first = await hooks.persistUserNotification(input("account-a", "event-1"), token);
@@ -108,13 +137,34 @@ const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, event
 
   await hooks.mutateNotificationUnread("account-a", first.id, "read", token);
   assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 24, "mark one read decrements summary");
-  await hooks.markAllNotificationsRead("account-a", token);
+  assert.deepEqual(await hooks.markAllNotificationsRead("account-a", token), { changed: 24, hasMore: false }, "one bounded invocation clears at most its current batch");
   assert.equal(documents.get("notification_summaries/account-a").data.totalUnread, 0, "mark all read clears summary");
 
   for (let index = 2; index <= 61; index++) await hooks.persistUserNotification(input("account-b", `bulk-${index}`), token);
   assert.equal(documents.get("notification_summaries/account-b").data.totalUnread, 61, "large inbox summary starts exact");
-  assert.equal(await hooks.markAllNotificationsRead("account-b", token), 61, "mark all processes more than one bounded page");
+  assert.deepEqual(await hooks.markAllNotificationsRead("account-b", token), { changed: 25, hasMore: true }, "first invocation is bounded and requests continuation");
+  assert.deepEqual(await hooks.markAllNotificationsRead("account-b", token), { changed: 25, hasMore: true }, "second invocation remains bounded");
+  assert.deepEqual(await hooks.markAllNotificationsRead("account-b", token), { changed: 11, hasMore: false }, "final invocation reports completion");
   assert.equal(documents.get("notification_summaries/account-b").data.totalUnread, 0, "batched mark all leaves an exact zero summary");
+
+  const categoryInputs = ["order", "message", "admin", "subscription"];
+  for (const category of categoryInputs) await hooks.persistUserNotification(input("category-account", `category-${category}`, category), token);
+  assert.deepEqual(await hooks.markAllNotificationsRead("category-account", token), { changed: 4, hasMore: false });
+  assert.deepEqual(
+    { ...documents.get("notification_summaries/category-account").data, updatedAt: null },
+    { totalUnread: 0, ordersUnread: 0, messagesUnread: 0, accountUnread: 0, adminUnread: 0, updatedAt: null },
+    "marker categories decrement the exact summary buckets",
+  );
+
+  const missingId = "missing-notification-item";
+  documents.set(`notification_unread/missing-account/items/${missingId}`, snapshot(`notification_unread/missing-account/items/${missingId}`, { notificationId: missingId, category: "admin", createdAt: "2026-09-29T02:00:00.000Z" }));
+  documents.set("notification_summaries/missing-account", snapshot("notification_summaries/missing-account", { totalUnread: 1, ordersUnread: 0, messagesUnread: 0, accountUnread: 0, adminUnread: 1, updatedAt: "2026-09-29T02:00:00.000Z" }));
+  documents.set("notification_unread/other-account/items/other-marker", snapshot("notification_unread/other-account/items/other-marker", { notificationId: "other-marker", category: "order", createdAt: "2026-09-29T02:00:01.000Z" }));
+  assert.deepEqual(await hooks.markAllNotificationsRead("missing-account", token), { changed: 1, hasMore: false }, "orphan marker is safely acknowledged");
+  assert(!documents.has(`user_notifications/missing-account/items/${missingId}`), "missing notification item is never created by read-all");
+  assert(!documents.has(`notification_unread/missing-account/items/${missingId}`), "orphan unread marker is removed");
+  assert.equal(documents.get("notification_summaries/missing-account").data.adminUnread, 0, "orphan marker decrements its exact category");
+  assert(documents.has("notification_unread/other-account/items/other-marker"), "read-all remains isolated to the authenticated account");
 
   const broadcastUsers = [{ _id: "account-a", role: "customer" }, { _id: "account-b", role: "customer" }];
   await hooks.persistNotificationBatch(broadcastUsers, (user) => ({ ...input(user._id, "broadcast-1", "admin"), type: "admin_broadcast", target: "notifications" }), token);
@@ -176,6 +226,21 @@ const input = (uid, eventKey, category = "order") => ({ recipientUid: uid, event
   assert.equal((await hooks.deleteNotificationSubcollectionBatch("delete-me", "user_notifications", token)).deletedCount, 0, "completed item cleanup is idempotent");
   assert.equal((await hooks.deleteNotificationSubcollectionBatch("delete-me", "notification_unread", token)).complete, false, "unread markers are explicitly cleaned in bounded pages");
   assert.equal((await hooks.deleteNotificationSubcollectionBatch("delete-me", "notification_unread", token)).complete, true, "unread marker cleanup resumes to completion");
+
+  for (let index = 0; index < 26; index++) await hooks.persistUserNotification(input("budget-account", `budget-${index}`, index % 2 ? "message" : "order"), token);
+  Object.assign(global, { FIREBASE_CLIENT_EMAIL: "worker@example.test", FIREBASE_PRIVATE_KEY: PRIVATE_KEY });
+  forcedReadAllCommitConflicts = 3;
+  subrequestCount = 0;
+  const budgetResponse = await hooks.handleRequest(new Request("https://worker.test/notifications/read-all", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + firebaseIdToken("budget-account"), "Content-Type": "application/json" },
+    body: "{}",
+  }));
+  assert.equal(budgetResponse.status, 200);
+  assert.deepEqual(await budgetResponse.json(), { success: true, changed: 25, hasMore: true }, "endpoint returns its bounded continuation contract");
+  assert.equal(subrequestCount, 24, "cold-JWK auth, two OAuth paths, deletion precheck, and four full CAS attempts stay at 24 subrequests");
+  assert(subrequestCount <= 40, "worst-case read-all keeps at least ten subrequests of Free-plan headroom");
+  assert.equal(documents.get("notification_summaries/budget-account").data.totalUnread, 1, "three failed commits plus one success decrement exactly once");
 
   assert.equal(hooks.notificationSummaryField("message"), "messagesUnread");
   assert.equal(hooks.notificationSummaryField("complaint"), "accountUnread");

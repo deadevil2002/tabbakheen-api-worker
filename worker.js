@@ -2074,7 +2074,11 @@
       const response = await fetch(url, { headers: { "Authorization": "Bearer " + accessToken } });
       if (!response.ok) throw new Error("Notification list failed: " + response.status);
       const data = await response.json();
-      return { items: (data.documents || []).map(parseFirestoreDoc).filter(Boolean), nextPageToken: typeof data.nextPageToken === "string" ? data.nextPageToken : null };
+      const items = (data.documents || []).map((document) => {
+        const item = parseFirestoreDoc(document);
+        return item ? { ...item, _updateTime: document.updateTime } : null;
+      }).filter(Boolean);
+      return { items, nextPageToken: typeof data.nextPageToken === "string" ? data.nextPageToken : null };
     }
     async function mutateNotificationUnread(recipientUid, notificationId, action, accessToken) {
       if (!phase4aSafeSegment(recipientUid) || !phase4aSafeSegment(notificationId) || !["read", "dismiss"].includes(action)) return { found: false };
@@ -2166,15 +2170,54 @@
       for (let offset = 0; offset < matches.length; offset += 50) changed += await markUnreadNotificationBatch(recipientUid, matches.slice(offset, offset + 50), accessToken);
       return changed;
     }
-    async function markAllNotificationsRead(recipientUid, accessToken) {
-      let changed = 0;
-      for (let page = 0; page < 100; page++) {
-        const result = await listFirestorePage("notification_unread/" + recipientUid + "/items", 50, null, accessToken);
-        if (!result.items.length) break;
-        changed += await markUnreadNotificationBatch(recipientUid, result.items.map((marker) => marker._id), accessToken);
-        if (result.items.length < 50) break;
+    const NOTIFICATION_READ_ALL_LIMIT = 25;
+    const NOTIFICATION_READ_ALL_MAX_ATTEMPTS = 4;
+    async function batchGetNotificationItemIds(recipientUid, notificationIds, accessToken) {
+      const response = await fetch(FIRESTORE_BASE + ":batchGet", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ documents: notificationIds.map((id) => "projects/tabbakheen-99883/databases/(default)/documents/user_notifications/" + recipientUid + "/items/" + id) })
+      });
+      if (!response.ok) throw new Error("Notification batch-get failed: " + response.status);
+      const text = await response.text();
+      let entries;
+      try {
+        const parsed = JSON.parse(text);
+        entries = Array.isArray(parsed) ? parsed : [parsed];
+      } catch {
+        entries = text.split("\n").map((line) => line.trim().replace(/^,\s*|\s*,$/g, "")).filter((line) => line && line !== "[" && line !== "]").map((line) => JSON.parse(line));
       }
-      return changed;
+      return new Set(entries.filter((entry) => entry.found).map((entry) => entry.found.name.split("/").pop()));
+    }
+    async function markAllNotificationsRead(recipientUid, accessToken) {
+      for (let attempt = 0; attempt < NOTIFICATION_READ_ALL_MAX_ATTEMPTS; attempt++) {
+        const result = await listFirestorePage("notification_unread/" + recipientUid + "/items", NOTIFICATION_READ_ALL_LIMIT + 1, null, accessToken);
+        const markers = result.items.slice(0, NOTIFICATION_READ_ALL_LIMIT).filter((marker) => phase4aSafeSegment(marker._id) && typeof marker._updateTime === "string");
+        if (!markers.length) return { changed: 0, hasMore: false };
+        const ids = markers.map((marker) => marker._id);
+        const [existingItemIds, summarySnapshot, deletionSnapshot] = await Promise.all([
+          batchGetNotificationItemIds(recipientUid, ids, accessToken),
+          getFirestoreSnapshot("notification_summaries", recipientUid, accessToken),
+          getFirestoreSnapshot("account_deletion_requests", recipientUid, accessToken)
+        ]);
+        if (publicProfileDeletionActive(deletionSnapshot)) return { changed: 0, hasMore: false };
+        const now = new Date().toISOString();
+        const next = { ...normalizedNotificationSummary(summarySnapshot?.data), updatedAt: now };
+        const writes = [];
+        for (const marker of markers) {
+          if (existingItemIds.has(marker._id)) {
+            writes.push({ update: phase4aDoc("user_notifications/" + recipientUid + "/items", marker._id, { readAt: now }), updateMask: { fieldPaths: ["readAt"] }, currentDocument: { exists: true } });
+          }
+          writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/notification_unread/" + recipientUid + "/items/" + marker._id, currentDocument: { updateTime: marker._updateTime } });
+          const field = notificationSummaryField(marker.category);
+          next.totalUnread = Math.max(0, next.totalUnread - 1);
+          next[field] = Math.max(0, next[field] - 1);
+        }
+        writes.push({ update: phase4aDoc("notification_summaries", recipientUid, next), updateMask: { fieldPaths: Object.keys(next) }, currentDocument: summarySnapshot ? { updateTime: summarySnapshot.updateTime } : { exists: false } });
+        writes.push(phase4aDeletionFence(recipientUid, deletionSnapshot));
+        if (await phase4aCommit(writes, accessToken)) return { changed: markers.length, hasMore: result.items.length > NOTIFICATION_READ_ALL_LIMIT };
+      }
+      throw new Error("Notification read-all state changed; retry");
     }
     function addUtcCalendarMonths(value, months) {
       const date = new Date(value);
@@ -8189,8 +8232,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (hasServiceKey || !phase4aSafeSegment(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "User authentication required" }, 403);
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          const changed = await markAllNotificationsRead(callerUid, accessToken);
-          return jsonResponse({ success: true, changed });
+          const result = await markAllNotificationsRead(callerUid, accessToken);
+          return jsonResponse({ success: true, changed: result.changed, hasMore: result.hasMore });
         } catch (error) {
           console.error("[Notifications] Read all failed:", error && error.message ? error.message : error);
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to mark notifications read" }, 500);
