@@ -18,7 +18,7 @@ assert(hooks, "Worker test hooks unavailable");
 const adminScript = hooks.getAdminHTML().match(/<script>([\s\S]*?)<\/script>/);
 assert(adminScript, "Admin script missing");
 new Function(adminScript[1]);
-assert(hooks.getAdminHTML().includes('id="s-cvg-ios-version"'), "Version gate controls missing");
+assert(!hooks.getAdminHTML().includes('id="s-cvg-ios-version"'), "Version gate controls must remain removed");
 
 const BASE = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents/";
 let revision = 0;
@@ -343,21 +343,14 @@ const payload = () => ({
   assert.equal("notifyOnNewUser" in publicSettings.settings, false, "admin notification internals are not exposed");
 
   result = await hooks.handleRequest(new Request("https://worker.test/app-settings"));
-  assert.deepEqual((await result.json()).settings.clientVersionGate, {
-    enabled: false,
-    ios: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
-    android: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
-  });
+  assert.deepEqual((await result.json()).settings, {}, "force-update settings are no longer exposed");
   global.__settingsOutage = true;
   result = await hooks.handleRequest(new Request("https://worker.test/app-settings"));
   assert.equal(result.status, 503);
   assert.deepEqual(await result.json(), { success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" });
   global.__settingsOutage = false;
-  assert.deepEqual(hooks.normalizedClientVersionGate(undefined), {
-    enabled: false,
-    ios: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
-    android: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
-  });
+  /* Force-update validation was removed; version settings are no longer writable. /*/
+  /*
   assert.deepEqual(hooks.validateClientVersionGate({
     enabled: true,
     ios: { minimumVersion: "1.0.5", minimumBuild: "5", storeUrl: "https://apps.apple.com/us/app/tabbakheen/id123" },
@@ -367,12 +360,7 @@ const payload = () => ({
     enabled: true,
     ios: { minimumVersion: "bad", minimumBuild: "5", storeUrl: "https://apps.apple.com/us/app/tabbakheen/id123" },
     android: { minimumVersion: "1.0.5", minimumBuild: "5", storeUrl: "https://example.test/store" },
-  }), null);
-  assert.equal(hooks.validateClientVersionGate({
-    enabled: true,
-    ios: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
-    android: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
-  }), null);
+  }), null); */
   console.log("offers-cutover.test.js: passed");
 })().catch((error) => {
   console.error(error);

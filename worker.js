@@ -221,64 +221,8 @@
         phonePasswordLoginEnabled: false
       };
     }
-    const CLIENT_VERSION_GATE_DEFAULT = {
-      enabled: false,
-      ios: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
-      android: { minimumVersion: "", minimumBuild: "", storeUrl: "" }
-    };
-    function cloneClientVersionGateDefault() {
-      return {
-        enabled: false,
-        ios: { ...CLIENT_VERSION_GATE_DEFAULT.ios },
-        android: { ...CLIENT_VERSION_GATE_DEFAULT.android }
-      };
-    }
     function validClientSemver(value) {
       return typeof value === "string" && value.length <= 64 && (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/).test(value);
-    }
-    function validClientBuild(value) {
-      return typeof value === "string" && (/^(0|[1-9]\d{0,8})$/).test(value);
-    }
-    function validOfficialStoreUrl(platform, value) {
-      if (typeof value !== "string" || value.length > 2048) return false;
-      if (!value) return true;
-      try {
-        const url = new URL(value);
-        if (url.protocol !== "https:" || url.username || url.password || url.hash) return false;
-        return platform === "ios" ? url.hostname === "apps.apple.com" && /^\/(?:[a-z]{2}(?:-[A-Z]{2})?\/)?app\//.test(url.pathname) : url.hostname === "play.google.com" && url.pathname === "/store/apps/details" && !!url.searchParams.get("id");
-      } catch {
-        return false;
-      }
-    }
-    // Gate data is public configuration, so it is normalized before every
-    // response. A malformed legacy value fails open (disabled), never blocks
-    // a client, and is never repaired by a read.
-    function normalizedClientVersionGate(value) {
-      if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.enabled !== "boolean") return cloneClientVersionGateDefault();
-      const normalized = { enabled: value.enabled, ios: {}, android: {} };
-      for (const platform of ["ios", "android"]) {
-        const config = value[platform];
-        if (!config || typeof config !== "object" || Array.isArray(config)) return cloneClientVersionGateDefault();
-        const minimumVersion = typeof config.minimumVersion === "string" ? config.minimumVersion : "";
-        const minimumBuild = typeof config.minimumBuild === "string" ? config.minimumBuild : "";
-        const storeUrl = typeof config.storeUrl === "string" ? config.storeUrl : "";
-        if (minimumVersion && !validClientSemver(minimumVersion) || minimumBuild && !validClientBuild(minimumBuild) || !validOfficialStoreUrl(platform, storeUrl) || minimumBuild && !minimumVersion) return cloneClientVersionGateDefault();
-        normalized[platform] = { minimumVersion, minimumBuild, storeUrl };
-      }
-      return normalized;
-    }
-    function validateClientVersionGate(value) {
-      if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 3 || typeof value.enabled !== "boolean") return null;
-      const normalized = normalizedClientVersionGate(value);
-      // Normalization returning the safe default is ambiguous with a valid
-      // default, so compare every submitted member to require the exact schema.
-      for (const platform of ["ios", "android"]) {
-        const config = value[platform];
-        if (!config || typeof config !== "object" || Array.isArray(config) || Object.keys(config).length !== 3 || typeof config.minimumVersion !== "string" || typeof config.minimumBuild !== "string" || typeof config.storeUrl !== "string") return null;
-        if (normalized[platform].minimumVersion !== config.minimumVersion || normalized[platform].minimumBuild !== config.minimumBuild || normalized[platform].storeUrl !== config.storeUrl) return null;
-      }
-      if (normalized.enabled && !normalized.ios.minimumVersion && !normalized.android.minimumVersion) return null;
-      return normalized;
     }
     const PUBLIC_APP_SETTINGS_DEFAULT = {
       bannerImageUrl: "",
@@ -4931,6 +4875,7 @@ html[dir="rtl"] .nav-item{border-left:none;border-right:3px solid transparent}
 .nav-item.active{background:var(--sidebar-hover);color:#fff;border-left-color:var(--primary)}
 html[dir="rtl"] .nav-item.active{border-left-color:transparent;border-right-color:var(--primary)}
 .nav-item svg{width:18px;height:18px;flex-shrink:0}
+.nav-label{flex:1}.nav-badge{display:none;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:#c83f49;color:#fff;font-size:11px;font-weight:700;line-height:20px;text-align:center}.nav-badge.show{display:inline-block}.nav-badge.pulse{animation:navBadgePulse .45s ease-out}@keyframes navBadgePulse{0%{transform:scale(1)}50%{transform:scale(1.18)}100%{transform:scale(1)}}
 .sidebar-footer{padding:16px 20px;border-top:1px solid rgba(255,255,255,.08)}
 .sidebar-footer .nav-item{padding:10px 0}
 .main{flex:1;padding:24px 32px;min-height:100vh}
@@ -5166,11 +5111,11 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
         </div>
         <div class="nav-item" data-page="complaints" onclick="navigate('complaints')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><path d="M8 9h8M8 13h5"/></svg>
-          <span id="nav-complaints"></span>
+          <span id="nav-complaints-label" class="nav-label"></span><span id="nav-complaints" class="nav-badge" aria-label="بلاغات قيد المراجعة"></span>
         </div>
         <div class="nav-item" data-page="verification" onclick="navigate('verification')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
-          <span id="nav-verification"></span>
+          <span id="nav-verification-label" class="nav-label"></span><span id="nav-verification" class="nav-badge" aria-label="طلبات توثيق قيد المراجعة"></span>
         </div>
         <div class="nav-item" data-page="invoices" onclick="navigate('invoices')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
@@ -5221,8 +5166,8 @@ function updateStaticLabels(){
   document.getElementById("nav-users").textContent=t("users");
   var nrEl=document.getElementById("nav-releases");if(nrEl)nrEl.textContent=lang==="ar"?"إصدارات التطبيق":"App releases";
   var naEl=document.getElementById("nav-advertisements");if(naEl)naEl.textContent=lang==="ar"?"الإعلانات":"Advertisements";
-   var ncEl=document.getElementById("nav-complaints");if(ncEl)ncEl.textContent=ct("nav");
-  var nvEl=document.getElementById("nav-verification");if(nvEl)nvEl.textContent=t("verification");
+   var ncEl=document.getElementById("nav-complaints-label");if(ncEl)ncEl.textContent=ct("nav");
+  var nvEl=document.getElementById("nav-verification-label");if(nvEl)nvEl.textContent=t("verification");
   document.getElementById("nav-invoices").textContent=t("invoices");
   document.getElementById("nav-settings").textContent=t("settings");
   document.getElementById("nav-logout").textContent=t("logout");
@@ -5383,6 +5328,7 @@ function updateMobilePageName(){var el=document.getElementById("mobile-page-name
 
 function navigate(page){
   stopReleasePolling();
+  stopAdminLivePolling();
   currentPage=page;
   document.querySelectorAll(".nav-item[data-page]").forEach(function(el){el.classList.toggle("active",el.dataset.page===page);});
   if(isMobile()){forceSidebarClosed();}else{closeSidebar();}
@@ -5603,6 +5549,7 @@ async function renderPage(){
     else if(currentPage==="settings")await renderSettings(c);
     else if(currentPage==="notifications")await renderNotifications(c);
     c.focus({preventScroll:true});
+    startAdminLivePolling();
   }catch(e){c.innerHTML='<div class="inline-error"><strong>'+(lang==="ar"?"تعذر تحميل الصفحة":"Page failed to load")+'</strong><div>'+esc(e.message)+'</div><button class="btn btn-sm btn-secondary" style="margin-top:10px" onclick="renderPage()">'+(lang==="ar"?"إعادة المحاولة":"Retry")+'</button></div>';}
 }
 
@@ -5624,16 +5571,16 @@ async function renderDashboard(c){
     statCard("providersInTrial",s.providersInTrial,"amber")+
     statCard("driversInTrial",s.driversInTrial,"amber")+
     statCard("activeSubs",s.activeSubscriptions,"teal")+
-    '<div class="stat-card blue"><div class="label">'+(lang==="ar"?"الحسابات الموثقة":"Verified accounts")+'</div><div class="value">'+(s.verifiedAccounts||0)+'</div></div>'+
+    '<div id="live-stat-verifiedAccounts" class="stat-card blue"><div class="label">'+(lang==="ar"?"الحسابات الموثقة":"Verified accounts")+'</div><div class="value">'+(s.verifiedAccounts||0)+'</div></div>'+
     '</div>'+
     '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"حالة إصدارات التطبيق":"App release health")+'</h2><p>'+(lang==="ar"?"ملخص المستخدمين حسب إصدار التطبيق المسجل لكل مستخدم.":"Users classified by their recorded app version.")+'</p></div><button class="btn btn-sm btn-secondary" onclick="navigate(\\'releases\\')">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button></div>'+
-    '<div class="release-grid">'+releaseMetric("CURRENT",rc.CURRENT||0)+releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0)+releaseMetric("UNKNOWN",rc.UNKNOWN||0)+'</div></section>'+
+    '<div class="release-grid"><div><div class="metric-label">على أحدث إصدار</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">يحتاجون تحديث</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">غير معروف</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
     '<div id="drill-down"></div>';
 }
 
 function statCard(labelKey,value,color,drillRole){
   var onclick=drillRole?'onclick="drillDown(\\''+drillRole+'\\')"':"";
-  return '<div class="stat-card '+color+'" '+onclick+'><div class="label">'+t(labelKey)+'</div><div class="value">'+(value||0)+'</div></div>';
+  return '<div id="live-stat-'+labelKey+'" class="stat-card '+color+'" '+onclick+'><div class="label">'+t(labelKey)+'</div><div class="value">'+(value||0)+'</div></div>';
 }
 
 function drillDown(role){
@@ -5731,6 +5678,47 @@ function paintReleaseIntelligence(){
 function paintUsersTable(){
   var count=document.getElementById("users-count");if(count)count.textContent=allUsers.length;
   filterUsers();
+}
+
+var adminLiveState={timer:null,inFlight:false,controller:null,epoch:0,lastSignature:"",lastUpdatedAt:0,visibilityBound:false,data:null};
+function adminLiveSignature(data){return JSON.stringify(data||{});}
+function stopAdminLivePolling(){
+  adminLiveState.epoch++;
+  if(adminLiveState.timer){clearTimeout(adminLiveState.timer);adminLiveState.timer=null;}
+  if(adminLiveState.controller){try{adminLiveState.controller.abort();}catch(e){}adminLiveState.controller=null;}
+  adminLiveState.inFlight=false;
+}
+function setLiveBadge(id,count,label){
+  var el=document.getElementById(id);if(!el)return;
+  var n=Math.max(0,Number(count)||0),next=n>99?"99+":String(n),previous=el.textContent;
+  el.textContent=next;el.classList.toggle("show",n>0);el.setAttribute("aria-label",label+": "+next);
+  if(n>0&&previous&&previous!==next){el.classList.remove("pulse");void el.offsetWidth;el.classList.add("pulse");}
+}
+function paintAdminLiveSummary(data){
+  var s=data&&data.stats||{},r=data&&data.releases||{},p=data&&data.pending||{};
+  ["totalUsers","customers","providers","drivers","providersInTrial","driversInTrial","activeSubscriptions","verifiedAccounts"].forEach(function(key){var el=document.getElementById("live-stat-"+key);if(el){var value=el.querySelector(".value");if(value)value.textContent=String(s[key]||0);}});
+  ["CURRENT","UPDATE_REQUIRED","UNKNOWN"].forEach(function(key){var el=document.getElementById("live-release-"+key);if(el)el.textContent=String(r[key]||0);});
+  setLiveBadge("nav-complaints",p.complaints,"بلاغات قيد المراجعة");
+  setLiveBadge("nav-verification",p.verification,"طلبات توثيق قيد المراجعة");
+  var indicator=document.getElementById("admin-live-indicator");if(indicator)indicator.textContent="● يتم التحديث تلقائيًا · آخر تحديث: الآن";
+}
+function scheduleAdminLivePolling(epoch){
+  if(epoch!==adminLiveState.epoch||document.visibilityState!=="visible")return;
+  if(adminLiveState.timer)clearTimeout(adminLiveState.timer);
+  adminLiveState.timer=setTimeout(function(){refreshAdminLive(true,epoch);},10000);
+}
+async function refreshAdminLive(silent,epoch){
+  if(epoch!==adminLiveState.epoch||adminLiveState.inFlight||document.visibilityState!=="visible")return;
+  adminLiveState.inFlight=true;var requestEpoch=adminLiveState.epoch;adminLiveState.controller=new AbortController();
+  try{var data=await api("/live-summary",{signal:adminLiveState.controller.signal});if(requestEpoch!==adminLiveState.epoch||!data||data.success===false)return;var signature=adminLiveSignature({stats:data.stats,releases:data.releases,pending:data.pending});if(signature!==adminLiveState.lastSignature){adminLiveState.data=data;adminLiveState.lastSignature=signature;paintAdminLiveSummary(data);}adminLiveState.lastUpdatedAt=Date.now();}
+  catch(e){/* Keep the last good counters and retry on the next cycle. */}
+  finally{adminLiveState.controller=null;adminLiveState.inFlight=false;scheduleAdminLivePolling(requestEpoch);}
+}
+function startAdminLivePolling(){
+  stopAdminLivePolling();
+  if(!adminLiveState.visibilityBound){document.addEventListener("visibilitychange",function(){if(document.visibilityState==="visible"){refreshAdminLive(true,adminLiveState.epoch);scheduleAdminLivePolling(adminLiveState.epoch);}else if(adminLiveState.timer){clearTimeout(adminLiveState.timer);adminLiveState.timer=null;}});adminLiveState.visibilityBound=true;}
+  if(adminLiveState.data)paintAdminLiveSummary(adminLiveState.data);
+  refreshAdminLive(true,adminLiveState.epoch);scheduleAdminLivePolling(adminLiveState.epoch);
 }
 
 function releaseDistributionHtml(){var distribution=releaseIntelligence.distribution||{},grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(rows||'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
@@ -5988,9 +5976,6 @@ async function renderSettings(c){
   var bannerEnabled=appSettings.bannerEnabled!==false;
   var requirePhoneAtSignup=appSettings.requirePhoneAtSignup!==false;
   var providerDiscoveryRadiusKm=[10,25,50,100].indexOf(appSettings.providerDiscoveryRadiusKm)>=0?appSettings.providerDiscoveryRadiusKm:"";
-  var clientVersionGate=appSettings.clientVersionGate||{enabled:false,ios:{minimumVersion:"",minimumBuild:"",storeUrl:""},android:{minimumVersion:"",minimumBuild:"",storeUrl:""}};
-  var iosGate=clientVersionGate.ios||{minimumVersion:"",minimumBuild:"",storeUrl:""};
-  var androidGate=clientVersionGate.android||{minimumVersion:"",minimumBuild:"",storeUrl:""};
   c.innerHTML='<h1 class="page-title">'+t("appSettings")+'</h1>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"أمان الحساب":"Account security")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup" onchange="updatePhoneSignupRequirementHint()"'+(requirePhoneAtSignup?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+' <span id="s-requirePhoneAtSignup-status">'+(requirePhoneAtSignup?"ON":"OFF")+'</span></label><p id="s-requirePhoneAtSignup-hint" style="font-size:12px;color:var(--text2);margin-top:8px">'+(requirePhoneAtSignup?(lang==="ar"?"عند التفعيل، يجب على المستخدم الجديد إدخال رقم الجوال عند إنشاء الحساب.":"When enabled, new users must enter a phone number when creating an account."):(lang==="ar"?"يمكن للمستخدم الجديد إنشاء حساب بدون رقم جوال.":"When disabled, new users may create an account without a phone number."))+'</p></div>'+
@@ -6004,12 +5989,6 @@ async function renderSettings(c){
     '<div class="provider-list" style="margin-top:18px"><div class="provider-list-head"><strong>'+(lang==="ar"?"سجل تنبيهات الموقع":"Location reminder history")+'</strong><button type="button" class="btn btn-sm btn-secondary" onclick="loadProviderReminderHistory()">'+(lang==="ar"?"تحديث السجل":"Refresh history")+'</button></div><div id="provider-reminder-history-body" class="provider-list-body"><div class="loading">'+(lang==="ar"?"جاري تحميل السجل...":"Loading history...")+'</div></div></div>'+
     '<div id="provider-discovery-modal" class="provider-discovery-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="provider-discovery-modal-title"><div class="provider-discovery-modal-card"><div class="provider-discovery-modal-head"><h3 id="provider-discovery-modal-title" class="provider-discovery-modal-title"></h3><button type="button" class="provider-discovery-modal-close" onclick="closeProviderDiscoveryModal()" aria-label="'+(lang==="ar"?"إغلاق":"Close")+'">×</button></div><p id="provider-discovery-modal-message" class="provider-discovery-modal-message"></p><div class="provider-discovery-modal-actions"><button type="button" id="provider-discovery-modal-cancel" class="btn btn-secondary" onclick="closeProviderDiscoveryModal()">'+(lang==="ar"?"إلغاء":"Cancel")+'</button><button type="button" id="provider-discovery-modal-confirm" class="btn btn-primary">'+(lang==="ar"?"حسنًا":"OK")+'</button></div></div></div>'+
     '<div class="provider-radius-box"><div class="form-group"><label>'+(lang==="ar"?"نطاق «القريب منك» للنسخة القادمة":"Nearby radius for next app release")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div><div class="provider-radius-note">'+(lang==="ar"?"الإعداد الحالي «مفتوح» يعني بدون حد مسافة. التطبيق المنشور حالياً لا يستخدم هذا الخيار بعد، والخريطة تعرض كل من نشر موقع اكتشاف عام عند عمل Zoom Out.":"Unlimited means no distance cap. The currently published app does not consume this setting yet; zooming out shows every provider who published a public discovery location.")+'</div></div></div>'+
-    '<div class="settings-section"><h3>'+(lang==="ar"?"بوابة تحديث التطبيق":"App update gate")+'</h3>'+
-    '<p style="font-size:12px;color:var(--warning);margin-bottom:16px">'+(lang==="ar"?"اتركها متوقفة حتى يصبح الإصدار الجديد متاحاً في المتجر. عند التفعيل لا يمكن للتطبيقات الأقدم تجاوز شاشة التحديث.":"Leave this disabled until the new release is available in the store. Once enabled, older clients cannot bypass the update screen.")+'</p>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-cvg-enabled"'+(clientVersionGate.enabled?" checked":"")+'> '+(lang==="ar"?"فرض التحديث الأدنى":"Enforce minimum app version")+'</label></div>'+
-    '<div class="grid-2"><div><strong>iOS</strong><div class="form-group"><label>'+(lang==="ar"?"أدنى إصدار (x.y.z)":"Minimum version (x.y.z)")+'</label><input id="s-cvg-ios-version" value="'+esc(iosGate.minimumVersion||"")+'" placeholder="1.0.5"></div><div class="form-group"><label>'+(lang==="ar"?"أدنى رقم بناء":"Minimum build")+'</label><input id="s-cvg-ios-build" inputmode="numeric" value="'+esc(iosGate.minimumBuild||"")+'" placeholder="5"></div><div class="form-group"><label>App Store URL</label><input id="s-cvg-ios-url" type="url" value="'+esc(iosGate.storeUrl||"")+'" placeholder="https://apps.apple.com/.../app/..."></div></div>'+
-    '<div><strong>Android</strong><div class="form-group"><label>'+(lang==="ar"?"أدنى إصدار (x.y.z)":"Minimum version (x.y.z)")+'</label><input id="s-cvg-android-version" value="'+esc(androidGate.minimumVersion||"")+'" placeholder="1.0.5"></div><div class="form-group"><label>'+(lang==="ar"?"أدنى رقم بناء":"Minimum build")+'</label><input id="s-cvg-android-build" inputmode="numeric" value="'+esc(androidGate.minimumBuild||"")+'" placeholder="5"></div><div class="form-group"><label>Google Play URL</label><input id="s-cvg-android-url" type="url" value="'+esc(androidGate.storeUrl||"")+'" placeholder="https://play.google.com/store/apps/details?id=..."></div></div></div>'+
-    '</div>'+
     '<div class="settings-section"><h3>'+t("language")+'</h3>'+
     '<div class="lang-switch"><button class="'+(lang==="ar"?"active":"")+'" onclick="setLang(\\'ar\\')">'+t("arabic")+'</button><button class="'+(lang==="en"?"active":"")+'" onclick="setLang(\\'en\\')">'+t("english")+'</button></div>'+
     '</div>'+
@@ -6196,19 +6175,6 @@ async function saveSettings(){
     return Number.isFinite(parsed)?parsed:fallback;
   }
   function stringValue(id){var el=document.getElementById(id);return el?el.value.trim():"";}
-  function validGatePlatform(platform,version,build,storeUrl){
-    if(version&&!/^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$/.test(version))return false;
-    if(build&&!/^(0|[1-9]\\d{0,8})$/.test(build))return false;
-    if(build&&!version)return false;
-    if(!storeUrl)return true;
-    try{var u=new URL(storeUrl);return u.protocol==="https:"&&!u.username&&!u.password&&!u.hash&&(platform==="ios"?u.hostname==="apps.apple.com"&&/^\\/(?:[a-z]{2}(?:-[A-Z]{2})?\\/)?app\\//.test(u.pathname):u.hostname==="play.google.com"&&u.pathname==="/store/apps/details"&&!!u.searchParams.get("id"));}catch(e){return false;}
-  }
-  var clientVersionGate={
-    enabled:document.getElementById("s-cvg-enabled")?document.getElementById("s-cvg-enabled").checked:false,
-    ios:{minimumVersion:stringValue("s-cvg-ios-version"),minimumBuild:stringValue("s-cvg-ios-build"),storeUrl:stringValue("s-cvg-ios-url")},
-    android:{minimumVersion:stringValue("s-cvg-android-version"),minimumBuild:stringValue("s-cvg-android-build"),storeUrl:stringValue("s-cvg-android-url")}
-  };
-  if(!validGatePlatform("ios",clientVersionGate.ios.minimumVersion,clientVersionGate.ios.minimumBuild,clientVersionGate.ios.storeUrl)||!validGatePlatform("android",clientVersionGate.android.minimumVersion,clientVersionGate.android.minimumBuild,clientVersionGate.android.storeUrl)){toast(lang==="ar"?"استخدم إصدار x.y.z ورقم بناء رقمي وروابط المتاجر الرسمية HTTPS فقط.":"Use x.y.z versions, numeric builds, and official HTTPS store URLs only.","error");return;}
   var fields={
     bannerImageUrl:document.getElementById("s-bannerImageUrl")?document.getElementById("s-bannerImageUrl").value:"",
     bannerEnabled:document.getElementById("s-bannerEnabled")?document.getElementById("s-bannerEnabled").checked:true,
@@ -6230,7 +6196,6 @@ async function saveSettings(){
     notifyOnNewDriver:document.getElementById("s-notifyNewDriver")?document.getElementById("s-notifyNewDriver").checked:false,
     notifyOnCrVerification:document.getElementById("s-notifyCrVerification")?document.getElementById("s-notifyCrVerification").checked:false,
     notifyOnFreelanceRequest:document.getElementById("s-notifyFreelanceRequest")?document.getElementById("s-notifyFreelanceRequest").checked:false,
-    clientVersionGate:clientVersionGate
   };
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
@@ -7133,8 +7098,6 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
          canonicalOfferMutationRate,
          readBoundedOfferJson,
          phase4aHasEnabledPublicLocation,
-         normalizedClientVersionGate,
-         validateClientVersionGate,
          publicAppSettingsDto,
          publicOfferDto,
          handlePublicOffers,
@@ -7288,12 +7251,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/app-settings" && request.method === "GET") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-          return jsonResponse({ success: true, settings: { clientVersionGate: normalizedClientVersionGate(settings?.clientVersionGate) } });
+          await getFirestoreDoc("app_settings", "main", accessToken);
+          return jsonResponse({ success: true, settings: {} });
         } catch {
-          // Never turn an already-enforced cached gate off because Firestore
-          // is unavailable. Missing configuration is handled above as the
-          // true disabled default; outages are explicit and retryable.
           return jsonResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
         }
       }
@@ -7783,6 +7743,30 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const { users: _releaseUsers, ...release } = intelligence;
             return jsonResponse({ success: true, stats, release, users, orders, offers });
           }
+          if (path === "/admin/api/live-summary" && request.method === "GET") {
+            // Bounded, PII-free polling DTO. It intentionally avoids orders,
+            // offers, notification bodies, and user lists used by /stats.
+            const [users, versions, complaints] = await Promise.all([
+              listAllUsers(accessToken),
+              listClientVersions(accessToken),
+              listAllComplaints(accessToken)
+            ]);
+            const stats = {
+              totalUsers: users.length,
+              customers: users.filter((u) => u.role === "customer").length,
+              providers: users.filter((u) => u.role === "provider").length,
+              drivers: users.filter((u) => u.role === "driver").length,
+              activeSubscriptions: users.filter((u) => u.subscriptionStatus === "active").length,
+              providersInTrial: users.filter((u) => u.role === "provider" && (u.accountStatus === "trial" || u.subscriptionStatus === "trialing")).length,
+              driversInTrial: users.filter((u) => u.role === "driver" && (u.accountStatus === "trial" || u.subscriptionStatus === "trialing")).length,
+              verifiedAccounts: users.filter((u) => u.verificationStatus === "verified").length
+            };
+            const intelligence = releaseIntelligenceForUsers(users, versions);
+            return jsonResponse({ success: true, stats, releases: intelligence.counts || {}, pending: {
+              complaints: complaints.filter((item) => item.complaintStatus === "pending").length,
+              verification: users.filter((u) => u.verificationStatus === "pending_review").length
+            } });
+          }
           if (path === "/admin/api/users" && request.method === "GET") {
             const [users, versions] = await Promise.all([
               listAllUsers(accessToken),
@@ -8047,12 +8031,6 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
               phonePasswordLoginEnabled: false
             };
-            // Preserve the exact legacy missing-settings DTO. The Admin UI has
-            // its own disabled default and receives this field once an admin
-            // explicitly saves the new configuration.
-            if (settings && Object.prototype.hasOwnProperty.call(settings, "clientVersionGate")) {
-              adminSettings.clientVersionGate = normalizedClientVersionGate(settings.clientVersionGate);
-            }
             return jsonResponse({ success: true, settings: adminSettings });
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
@@ -8061,11 +8039,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if ("requirePhoneAtSignup" in body && typeof body.requirePhoneAtSignup !== "boolean") return jsonResponse({ error: "requirePhoneAtSignup must be boolean" }, 400);
             if ("providerDiscoveryRadiusKm" in body && body.providerDiscoveryRadiusKm !== null && ![10,25,50,100].includes(body.providerDiscoveryRadiusKm)) return jsonResponse({ error: "providerDiscoveryRadiusKm must be null, 10, 25, 50, or 100" }, 400);
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
-            if ("clientVersionGate" in body) {
-              const gate = validateClientVersionGate(body.clientVersionGate);
-              if (!gate) return jsonResponse({ error: "clientVersionGate must use enabled plus valid iOS/Android semver, numeric build, and official HTTPS store URLs" }, 400);
-              body.clientVersionGate = gate;
-            }
+            if ("clientVersionGate" in body) return jsonResponse({ error: "Unsupported settings field" }, 400);
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -8094,8 +8068,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "notifyOnNewDriver",
               "notifyOnCrVerification",
               "notifyOnFreelanceRequest",
-              "requirePhoneAtSignup",
-              "clientVersionGate"
+              "requirePhoneAtSignup"
             ];
             const fields = {};
             for (const key of allowedSettings) {
