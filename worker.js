@@ -2067,11 +2067,8 @@
       }
       return results;
     }
-    const CLIENT_INSTALLATION_HEARTBEAT_MS = 24 * 60 * 60 * 1e3;
-    const CLIENT_INSTALLATION_ACTIVE_MS = 30 * 24 * 60 * 60 * 1e3;
-    const CLIENT_INSTALLATION_MAX_SUMMARY_DEVICES = 12;
     const RELEASE_REMINDER_COOLDOWN_MS = 72 * 60 * 60 * 1e3;
-    const RELEASE_CURRENT_VERSIONS = { android: "1.0.6", ios: "1.0.6" };
+    const RELEASE_CURRENT_VERSION = "1.0.6";
     function compareReleaseSemver(left, right) {
       const parse = /* @__PURE__ */ __name((value) => String(value || "").split(".").map((part) => Number(part)), "parse");
       const a = parse(left);
@@ -2080,160 +2077,100 @@
       for (let index = 0; index < 3; index++) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
       return 0;
     }
-    function classifyClientInstallation(installation, gate, nowMs = Date.now()) {
-      if (!installation || !["android", "ios"].includes(installation.platform) || !validClientSemver(installation.appVersion)) return "UNKNOWN";
-      const lastSeen = Date.parse(installation.lastSeenAt || "");
-      if (!Number.isFinite(lastSeen) || nowMs - lastSeen > CLIENT_INSTALLATION_ACTIVE_MS) return "UNKNOWN";
-      const platformGate = gate?.[installation.platform] || {};
-      const minimumVersion = validClientSemver(platformGate.minimumVersion) ? platformGate.minimumVersion : "";
-      const versionVsMinimum = minimumVersion ? compareReleaseSemver(installation.appVersion, minimumVersion) : 1;
-      if (versionVsMinimum !== null && versionVsMinimum < 0) return "UPDATE_REQUIRED";
-      if (versionVsMinimum === 0 && validClientBuild(platformGate.minimumBuild)) {
-        const build = Number(installation.buildNumber);
-        const minimumBuild = Number(platformGate.minimumBuild);
-        if (!Number.isInteger(build) || build < minimumBuild) return "UPDATE_REQUIRED";
-      }
-      const currentVersion = RELEASE_CURRENT_VERSIONS[installation.platform];
-      const versionVsCurrent = compareReleaseSemver(installation.appVersion, currentVersion);
-      return versionVsCurrent !== null && versionVsCurrent >= 0 ? "CURRENT" : "SUPPORTED_OLD";
+    function classifyClientVersion(record) {
+      if (!record || !validClientSemver(record.appVersion)) return "UNKNOWN";
+      const comparison = compareReleaseSemver(record.appVersion, RELEASE_CURRENT_VERSION);
+      return comparison !== null && comparison >= 0 ? "CURRENT" : "UPDATE_REQUIRED";
     }
-    function summarizeClientInstallations(summary, gate, nowMs = Date.now()) {
-      const devices = Array.isArray(summary?.devices) ? summary.devices.slice(0, CLIENT_INSTALLATION_MAX_SUMMARY_DEVICES) : [];
-      const enriched = devices.map((device) => ({ ...device, classification: classifyClientInstallation(device, gate, nowMs) }));
-      const active = enriched.filter((device) => device.classification !== "UNKNOWN");
-      const rank = { UPDATE_REQUIRED: 3, SUPPORTED_OLD: 2, CURRENT: 1, UNKNOWN: 0 };
-      const classification = active.length ? active.reduce((worst, device) => rank[device.classification] > rank[worst] ? device.classification : worst, "CURRENT") : "UNKNOWN";
-      const newest = active.slice().sort((left, right) => String(right.lastSeenAt || "").localeCompare(String(left.lastSeenAt || "")))[0] || null;
+    function summarizeClientVersion(record) {
       return {
-        classification,
-        hasOutdatedDevice: active.some((device) => device.classification === "SUPPORTED_OLD" || device.classification === "UPDATE_REQUIRED"),
-        newest,
-        devices: enriched,
-        activeDeviceCount: active.length,
-        lastTelemetryAt: typeof summary?.lastTelemetryAt === "string" ? summary.lastTelemetryAt : null,
-        lastReminderAt: typeof summary?.lastReminderAt === "string" ? summary.lastReminderAt : null
+        appVersion: validClientSemver(record?.appVersion) ? record.appVersion : null,
+        classification: classifyClientVersion(record),
+        lastReminderAt: typeof record?.lastReminderAt === "string" ? record.lastReminderAt : null
       };
     }
-    function validClientInstallationPayload(body) {
-      if (!phase4aKeysOnly(body, ["installationId", "platform", "appVersion", "buildNumber", "runtimeVersion", "updateId", "channel"])) return null;
-      if (typeof body?.installationId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.installationId)) return null;
-      if (!["android", "ios"].includes(body.platform) || !validClientSemver(body.appVersion)) return null;
-      if (typeof body.buildNumber !== "string" || !/^\d{0,12}$/.test(body.buildNumber)) return null;
-      if (typeof body.runtimeVersion !== "string" || body.runtimeVersion.length > 64 || !/^[A-Za-z0-9._-]*$/.test(body.runtimeVersion)) return null;
-      if (body.updateId !== null && (typeof body.updateId !== "string" || body.updateId.length > 128 || !/^[A-Za-z0-9_-]+$/.test(body.updateId))) return null;
-      if (body.channel !== null && (typeof body.channel !== "string" || body.channel.length > 64 || !/^[A-Za-z0-9._-]+$/.test(body.channel))) return null;
-      return {
-        installationId: body.installationId.toLowerCase(), platform: body.platform, appVersion: body.appVersion,
-        buildNumber: body.buildNumber, runtimeVersion: body.runtimeVersion, updateId: body.updateId, channel: body.channel
-      };
+    function validClientVersionPayload(body) {
+      if (!phase4aKeysOnly(body, ["appVersion"]) || !validClientSemver(body?.appVersion)) return null;
+      return { appVersion: body.appVersion };
     }
-    function clientInstallationFingerprint(value) {
-      return [value.platform, value.appVersion, value.buildNumber, value.runtimeVersion, value.updateId || "", value.channel || ""].join("|");
-    }
-    async function recordClientInstallationHeartbeat(uid, input, accessToken, now = new Date()) {
+    async function recordClientVersion(uid, input, accessToken, now = new Date()) {
       if (!phase4aSafeSegment(uid)) throw new Error("Invalid authenticated user");
-      const parsed = validClientInstallationPayload(input);
+      const parsed = validClientVersionPayload(input);
       if (!parsed) return { invalid: true };
       const nowIso = now.toISOString();
-      const collection = "client_installations/" + uid + "/devices";
       for (let attempt = 0; attempt < 4; attempt++) {
-        const [deviceSnapshot, summarySnapshot, deletionSnapshot] = await Promise.all([
-          getFirestoreSnapshot(collection, parsed.installationId, accessToken),
-          getFirestoreSnapshot("client_installation_summaries", uid, accessToken),
+        const [versionSnapshot, deletionSnapshot] = await Promise.all([
+          getFirestoreSnapshot("client_versions", uid, accessToken),
           getFirestoreSnapshot("account_deletion_requests", uid, accessToken)
         ]);
         if (publicProfileDeletionActive(deletionSnapshot)) return { blocked: true };
-        const previous = deviceSnapshot?.data || null;
-        const previousTime = Date.parse(previous?.lastSeenAt || "");
-        if (previous && clientInstallationFingerprint(previous) === clientInstallationFingerprint(parsed) && Number.isFinite(previousTime) && now.getTime() - previousTime < CLIENT_INSTALLATION_HEARTBEAT_MS) {
-          return { changed: false, nextHeartbeatAt: new Date(previousTime + CLIENT_INSTALLATION_HEARTBEAT_MS).toISOString() };
-        }
-        const device = { ...parsed, firstSeenAt: previous?.firstSeenAt || nowIso, createdAt: previous?.createdAt || previous?.firstSeenAt || nowIso, lastSeenAt: nowIso };
-        const summaryDevices = Array.isArray(summarySnapshot?.data?.devices) ? summarySnapshot.data.devices.filter((item) => item && item.installationId !== parsed.installationId) : [];
-        summaryDevices.push(device);
-        summaryDevices.sort((left, right) => String(right.lastSeenAt || "").localeCompare(String(left.lastSeenAt || "")));
-        const summary = {
-          uid,
-          devices: summaryDevices.slice(0, CLIENT_INSTALLATION_MAX_SUMMARY_DEVICES),
-          lastTelemetryAt: nowIso,
-          lastReminderAt: summarySnapshot?.data?.lastReminderAt || null,
-          updatedAt: nowIso
-        };
+        const previous = versionSnapshot?.data || null;
+        const comparison = validClientSemver(previous?.appVersion) ? compareReleaseSemver(parsed.appVersion, previous.appVersion) : 1;
+        if (comparison !== null && comparison <= 0) return { changed: false, appVersion: previous.appVersion };
+        const record = { appVersion: parsed.appVersion, updatedAt: nowIso, lastReminderAt: previous?.lastReminderAt || null };
         const writes = [
-          { update: phase4aDoc(collection, parsed.installationId, device), updateMask: { fieldPaths: Object.keys(device) }, currentDocument: deviceSnapshot ? { updateTime: deviceSnapshot.updateTime } : { exists: false } },
-          { update: phase4aDoc("client_installation_summaries", uid, summary), updateMask: { fieldPaths: Object.keys(summary) }, currentDocument: summarySnapshot ? { updateTime: summarySnapshot.updateTime } : { exists: false } },
+          { update: phase4aDoc("client_versions", uid, record), updateMask: { fieldPaths: Object.keys(record) }, currentDocument: versionSnapshot ? { updateTime: versionSnapshot.updateTime } : { exists: false } },
           phase4aDeletionFence(uid, deletionSnapshot)
         ];
-        if (await phase4aCommit(writes, accessToken)) return { changed: true, installation: device };
+        if (await phase4aCommit(writes, accessToken)) return { changed: true, appVersion: record.appVersion };
       }
-      throw new Error("Installation state changed; retry");
+      throw new Error("Client version state changed; retry");
     }
-    async function listClientInstallationSummaries(accessToken) {
-      const summaries = [];
+    async function listClientVersions(accessToken) {
+      const versions = [];
       let pageToken = null;
       do {
-        let endpoint = FIRESTORE_BASE + "/client_installation_summaries?pageSize=300";
+        let endpoint = FIRESTORE_BASE + "/client_versions?pageSize=300";
         if (pageToken) endpoint += "&pageToken=" + encodeURIComponent(pageToken);
         const response = await fetch(endpoint, { headers: { Authorization: "Bearer " + accessToken } });
-        if (!response.ok) throw new Error("Failed to list client installation summaries");
+        if (!response.ok) throw new Error("Failed to list client versions");
         const data = await response.json();
         for (const document of data.documents || []) {
           const parsed = parseFirestoreDoc(document);
-          if (parsed) summaries.push(parsed);
+          if (parsed) versions.push(parsed);
         }
         pageToken = data.nextPageToken || null;
       } while (pageToken);
-      return summaries;
+      return versions;
     }
-    function releaseIntelligenceForUsers(users, summaries, gate, nowMs = Date.now()) {
-      const summaryByUid = new Map((summaries || []).map((summary) => [summary._id || summary.uid, summary]));
-      const counts = { CURRENT: 0, SUPPORTED_OLD: 0, UPDATE_REQUIRED: 0, UNKNOWN: 0 };
-      const installationCounts = { CURRENT: 0, SUPPORTED_OLD: 0, UPDATE_REQUIRED: 0 };
-      const platformCounts = { android: 0, ios: 0 };
-      const distribution = { android: {}, ios: {} };
-      let lastTelemetryAt = null;
+    function releaseIntelligenceForUsers(users, versions) {
+      const versionByUid = new Map((versions || []).map((record) => [record._id || record.uid, record]));
+      const counts = { CURRENT: 0, UPDATE_REQUIRED: 0, UNKNOWN: 0 };
+      const distribution = {};
       const enrichedUsers = (users || []).map((user) => {
-        const release = summarizeClientInstallations(summaryByUid.get(user._id), gate, nowMs);
+        const release = summarizeClientVersion(versionByUid.get(user._id));
         counts[release.classification]++;
-        for (const device of release.devices.filter((item) => item.classification !== "UNKNOWN")) {
-          const label = device.appVersion;
-          installationCounts[device.classification]++;
-          platformCounts[device.platform]++;
-          distribution[device.platform][label] = (distribution[device.platform][label] || 0) + 1;
-        }
-        if (release.lastTelemetryAt && (!lastTelemetryAt || release.lastTelemetryAt > lastTelemetryAt)) lastTelemetryAt = release.lastTelemetryAt;
+        const distributionKey = release.appVersion || "غير معروف";
+        distribution[distributionKey] = (distribution[distributionKey] || 0) + 1;
         return { ...user, releaseIntelligence: release };
       });
-      const readiness = counts.UPDATE_REQUIRED === 0 && counts.UNKNOWN === 0 ? "READY_FOR_REVIEW" : "NOT_READY";
-      const activeInstallations = installationCounts.CURRENT + installationCounts.SUPPORTED_OLD + installationCounts.UPDATE_REQUIRED;
-      const adoptionPercent = activeInstallations ? Math.round(installationCounts.CURRENT * 1e4 / activeInstallations) / 100 : 0;
-      const compatibleUsers = counts.CURRENT + counts.SUPPORTED_OLD;
-      const readinessPercent = users.length ? Math.round(compatibleUsers * 1e4 / users.length) / 100 : 0;
-      return { users: enrichedUsers, counts, installationCounts, platformCounts, distribution, activeInstallations, adoptionPercent, compatibleUsers, readinessPercent, readiness, activeWindowDays: 30, lastTelemetryAt };
+      const totalUsers = (users || []).length;
+      const adoptionPercent = totalUsers ? Math.round(counts.CURRENT * 1e4 / totalUsers) / 100 : 0;
+      return { users: enrichedUsers, counts, distribution, totalUsers, currentVersion: RELEASE_CURRENT_VERSION, adoptionPercent };
     }
     function releaseReminderCandidate(user, release, nowMs = Date.now()) {
-      if (!user || !release || !["SUPPORTED_OLD", "UPDATE_REQUIRED"].includes(release.classification)) return false;
+      if (!user || !release || release.classification !== "UPDATE_REQUIRED") return false;
       const lastReminder = Date.parse(release.lastReminderAt || "");
       return !Number.isFinite(lastReminder) || nowMs - lastReminder >= RELEASE_REMINDER_COOLDOWN_MS;
     }
     async function claimReleaseReminder(uid, accessToken, nowIso) {
-      const snapshot = await getFirestoreSnapshot("client_installation_summaries", uid, accessToken);
+      const snapshot = await getFirestoreSnapshot("client_versions", uid, accessToken);
       if (!snapshot) return { ok: false, reason: "unknown" };
+      if (classifyClientVersion(snapshot.data) !== "UPDATE_REQUIRED") return { ok: false, reason: "not_eligible" };
       const lastReminder = Date.parse(snapshot.data.lastReminderAt || "");
       if (Number.isFinite(lastReminder) && Date.parse(nowIso) - lastReminder < RELEASE_REMINDER_COOLDOWN_MS) return { ok: false, reason: "cooldown" };
-      const result = await compareAndSetFirestoreDocument("client_installation_summaries", uid, { lastReminderAt: nowIso, updatedAt: nowIso }, snapshot.updateTime, accessToken);
+      const result = await compareAndSetFirestoreDocument("client_versions", uid, { lastReminderAt: nowIso }, snapshot.updateTime, accessToken);
       return result.ok ? { ok: true } : { ok: false, reason: "conflict" };
     }
-    async function sendReleaseUpdateReminder(user, release, gate, env, accessToken, nowIso = new Date().toISOString()) {
+    async function sendReleaseUpdateReminder(user, release, env, accessToken, nowIso = new Date().toISOString()) {
       const uid = user?._id || user?.uid;
       if (!phase4aSafeSegment(uid) || !releaseReminderCandidate(user, release, Date.parse(nowIso))) return { sent: false, reason: "not_eligible" };
       const claim = await claimReleaseReminder(uid, accessToken, nowIso);
       if (!claim.ok) return { sent: false, reason: claim.reason };
-      const required = release.classification === "UPDATE_REQUIRED";
-      const title = required ? "تحديث تطبيق طباخين مطلوب" : "يتوفر تحديث جديد لطباخين";
-      const body = required ? "يلزم تحديث تطبيق طباخين للاستمرار باستخدام أحدث إصدار مدعوم." : "يتوفر تحديث جديد لطباخين. حدّث التطبيق للحصول على أحدث التحسينات والاستمرار بأفضل تجربة.";
-      const titleEn = required ? "Tabbakheen update required" : "A Tabbakheen update is available";
-      const bodyEn = required ? "Update Tabbakheen to continue using the latest supported release." : "Update Tabbakheen for the latest improvements and best experience.";
+      const title = "تحديث تطبيق طباخين مطلوب";
+      const body = "يلزم تحديث تطبيق طباخين للاستمرار باستخدام أحدث إصدار مدعوم.";
+      const titleEn = "Tabbakheen update required";
+      const bodyEn = "Update Tabbakheen to continue using the latest supported release.";
       const outcome = await persistUserNotification({
         recipientUid: uid, eventKey: "release_update:" + uid + ":" + nowIso, type: "app_update_required", category: "account",
         title, body, titleEn, bodyEn, target: "notifications", role: user.role, createdAt: nowIso
@@ -2244,11 +2181,8 @@
       if (token) push = await sendExpoPush([{ to: token, title, body, data: { type: "app_update_required", target: "notifications" }, sound: "default", badge: outcome.summary?.totalUnread || 0, _recipientUid: uid }], accessToken);
       let email = { sent: false, reason: "unavailable" };
       const emailAddress = typeof user.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(user.email) ? user.email : "";
-      const platform = release.devices.find((device) => device.classification === "UPDATE_REQUIRED")?.platform || release.newest?.platform;
-      const storeUrl = platform && typeof gate?.[platform]?.storeUrl === "string" ? gate[platform].storeUrl : "";
       if (emailAddress) {
-        const link = storeUrl ? '<p><a href="' + escapeHtml(storeUrl) + '">Update Tabbakheen / تحديث طباخين</a></p>' : "";
-        email = await sendEmail(emailAddress, title, "<p>" + escapeHtml(body) + "</p><p>" + escapeHtml(bodyEn) + "</p>" + link, env);
+        email = await sendEmail(emailAddress, title, "<p>" + escapeHtml(body) + "</p><p>" + escapeHtml(bodyEn) + "</p>", env);
       }
       return { sent: true, durable: !!outcome.notification, push, email: { sent: email.sent === true } };
     }
@@ -5297,7 +5231,7 @@ function updateStaticLabels(){
 var TOKEN=sessionStorage.getItem("tbk_admin_token");
 var currentPage="dashboard";
 var allUsers=[];
-var releaseIntelligence={counts:{CURRENT:0,SUPPORTED_OLD:0,UPDATE_REQUIRED:0,UNKNOWN:0},installationCounts:{CURRENT:0,SUPPORTED_OLD:0,UPDATE_REQUIRED:0},platformCounts:{android:0,ios:0},distribution:{android:{},ios:{}},activeInstallations:0,adoptionPercent:0,compatibleUsers:0,readinessPercent:0,readiness:"NOT_READY",activeWindowDays:30,lastTelemetryAt:null};
+var releaseIntelligence={counts:{CURRENT:0,UPDATE_REQUIRED:0,UNKNOWN:0},distribution:{},totalUsers:0,currentVersion:"1.0.6",adoptionPercent:0};
 var allOrders=[];
 var allOffers=[];
 var allInvoices=[];
@@ -5605,7 +5539,7 @@ async function renderDashboard(c){
   allUsers=data.users||[];
   allOrders=data.orders||[];
   allOffers=data.offers||[];
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">Tabbakheen Admin</div><h1 class="page-title">'+t("dashboard")+'</h1><p class="page-subtitle">'+(lang==="ar"?"نظرة تشغيلية مختصرة على الحسابات والاشتراكات والإصدارات.":"A compact operational view of accounts, subscriptions, and releases.")+'</p></div></div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">'+(lang==="ar"?"لوحة طباخين الإدارية":"Tabbakheen Admin")+'</div><h1 class="page-title">'+t("dashboard")+'</h1><p class="page-subtitle">'+(lang==="ar"?"نظرة تشغيلية مختصرة على الحسابات والاشتراكات والإصدارات.":"A compact operational view of accounts, subscriptions, and releases.")+'</p></div></div>'+
     '<div class="stats-grid">'+
     statCard("totalUsers",s.totalUsers,"blue","all")+
     statCard("customers",s.customers,"green","customer")+
@@ -5616,8 +5550,8 @@ async function renderDashboard(c){
     statCard("activeSubs",s.activeSubscriptions,"teal")+
     '<div class="stat-card blue"><div class="label">'+(lang==="ar"?"الحسابات الموثقة":"Verified accounts")+'</div><div class="value">'+(s.verifiedAccounts||0)+'</div></div>'+
     '</div>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"حالة إصدارات التطبيق":"App release health")+'</h2><p>'+(lang==="ar"?"ملخص المستخدمين حسب أسوأ جهاز نشط خلال 30 يومًا.":"Users classified by their worst active device in the last 30 days.")+'</p></div><button class="btn btn-sm btn-secondary" onclick="navigate(\\'releases\\')">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button></div>'+
-    '<div class="release-grid">'+releaseMetric("CURRENT",rc.CURRENT||0)+releaseMetric("SUPPORTED_OLD",rc.SUPPORTED_OLD||0)+releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0)+releaseMetric("UNKNOWN",rc.UNKNOWN||0)+'</div></section>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"حالة إصدارات التطبيق":"App release health")+'</h2><p>'+(lang==="ar"?"ملخص المستخدمين حسب إصدار التطبيق المسجل لكل مستخدم.":"Users classified by their recorded app version.")+'</p></div><button class="btn btn-sm btn-secondary" onclick="navigate(\\'releases\\')">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button></div>'+
+    '<div class="release-grid">'+releaseMetric("CURRENT",rc.CURRENT||0)+releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0)+releaseMetric("UNKNOWN",rc.UNKNOWN||0)+'</div></section>'+
     '<div id="drill-down"></div>';
 }
 
@@ -5677,82 +5611,67 @@ async function renderUsers(c){
   allUsers=data.users||[];
   setReleaseIntelligence(data);
   var versions=knownReleaseVersions();
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">Users</div><h1 class="page-title">'+t("users")+' <span class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">'+(lang==="ar"?"إدارة الحسابات مع رؤية واضحة لإصدار التطبيق على كل جهاز.":"Manage accounts with clear per-device app release visibility.")+'</p></div></div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">إدارة المستخدمين</div><h1 class="page-title">'+t("users")+' <span class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">إدارة الحسابات ومعرفة إصدار التطبيق المسجل لكل مستخدم.</p></div></div>'+
     '<div class="filters">'+
     '<select id="f-role" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
     '<select id="f-status" onchange="filterUsers()"><option value="">'+t("allStatus")+'</option><option value="active">'+t("active")+'</option><option value="trial">'+t("trial")+'</option><option value="suspended">'+t("suspend")+'</option><option value="disabled">'+t("disabled")+'</option></select>'+
-    '<select id="f-release" onchange="filterUsers()"><option value="">'+(lang==="ar"?"حالة الإصدار: الكل":"Release status: All")+'</option><option value="CURRENT">CURRENT</option><option value="SUPPORTED_OLD">SUPPORTED_OLD</option><option value="UPDATE_REQUIRED">UPDATE_REQUIRED</option><option value="UNKNOWN">UNKNOWN</option></select>'+
-    '<select id="f-platform" onchange="filterUsers()"><option value="">'+(lang==="ar"?"المنصة: الكل":"Platform: All")+'</option><option value="android">Android</option><option value="ios">iOS</option></select>'+
-    '<select id="f-version" onchange="filterUsers()"><option value="">'+(lang==="ar"?"الإصدار: الكل":"Version: All")+'</option>'+versions.map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("")+'</select>'+
+    '<select id="f-release" onchange="filterUsers()"><option value="">حالة الإصدار: الكل</option><option value="CURRENT">محدّث</option><option value="UPDATE_REQUIRED">يحتاج تحديث</option><option value="UNKNOWN">غير معروف</option></select>'+
+    '<select id="f-version" onchange="filterUsers()"><option value="">الإصدار: الكل</option>'+versions.map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("")+'</select>'+
     '<input type="text" id="f-search" placeholder="'+t("searchPlaceholder")+'" oninput="filterUsers()">'+
     '</div>'+
-    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>App Version</th><th>Build</th><th>Platform</th><th>Last Seen</th><th>Devices</th><th>Release Status</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div>';
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>إصدار التطبيق</th><th>حالة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div>';
   filterUsers();
 }
 
-function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},installationCounts:data.installationCounts||{},platformCounts:data.platformCounts||{},distribution:data.distribution||{android:{},ios:{}},activeInstallations:data.activeInstallations||0,adoptionPercent:data.adoptionPercent||0,compatibleUsers:data.compatibleUsers||0,readinessPercent:data.readinessPercent||0,readiness:data.readiness||"NOT_READY",activeWindowDays:data.activeWindowDays||30,lastTelemetryAt:data.lastTelemetryAt||null};}
-function releaseStatusText(value){return value==="CURRENT"?"CURRENT":value==="SUPPORTED_OLD"?"SUPPORTED_OLD":value==="UPDATE_REQUIRED"?"UPDATE_REQUIRED":"UNKNOWN";}
-function releaseStatusBadge(value){var cls=value==="CURRENT"?"status-current":value==="SUPPORTED_OLD"?"status-supported":value==="UPDATE_REQUIRED"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
-function releaseMetric(key,value,note){var labels={ACTIVE:lang==="ar"?"التثبيتات النشطة":"Active installations",CURRENT:lang==="ar"?"الإصدار الحالي":"Current",SUPPORTED_OLD:lang==="ar"?"قديم ومدعوم":"Supported old",UPDATE_REQUIRED:lang==="ar"?"يحتاج تحديث":"Update required",UNKNOWN:lang==="ar"?"غير معروف":"Unknown",ANDROID:"Android",IOS:"iOS",ADOPTION:lang==="ar"?"نسبة التبنّي":"Adoption"};var cls=key==="CURRENT"?"current":key==="SUPPORTED_OLD"?"supported":key==="UPDATE_REQUIRED"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
-function knownReleaseVersions(){var values={};allUsers.forEach(function(u){userReleaseDevices(u).forEach(function(d){if(d.appVersion)values[d.appVersion]=true;});});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
-function formatReleaseDate(value){if(!value)return lang==="ar"?"غير معروف":"Unknown";var date=new Date(value);return isNaN(date.getTime())?(lang==="ar"?"غير معروف":"Unknown"):date.toLocaleString(lang==="ar"?"ar-SA":"en-US");}
-function userReleaseDevices(u){return u.releaseIntelligence&&Array.isArray(u.releaseIntelligence.devices)?u.releaseIntelligence.devices:[];}
-function userVersionText(u){var values={};userReleaseDevices(u).forEach(function(d){if(d.appVersion)values[d.appVersion]=true;});var list=Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});return list.length?list.join(" · "):(lang==="ar"?"غير معروف":"Unknown");}
-function userPlatformText(u){var values={};userReleaseDevices(u).forEach(function(d){if(d.platform)values[d.platform]=true;});var list=Object.keys(values);return list.length?list.map(function(v){return v==="ios"?"iOS":"Android";}).join(" + "):(lang==="ar"?"غير معروف":"Unknown");}
+function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",adoptionPercent:data.adoptionPercent||0};}
+function releaseStatusText(value){return value==="CURRENT"?"محدّث":value==="UPDATE_REQUIRED"?"يحتاج تحديث":"غير معروف";}
+function releaseStatusBadge(value){var cls=value==="CURRENT"?"status-current":value==="UPDATE_REQUIRED"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
+function releaseMetric(key,value,note){var labels={TOTAL:"إجمالي المستخدمين",CURRENT:"على أحدث إصدار",UPDATE_REQUIRED:"يحتاجون تحديث",UNKNOWN:"غير معروف",ADOPTION:"نسبة التحديث"};var cls=key==="CURRENT"?"current":key==="UPDATE_REQUIRED"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
+function knownReleaseVersions(){var values={};allUsers.forEach(function(u){var version=u.releaseIntelligence&&u.releaseIntelligence.appVersion;if(version)values[version]=true;});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
 
 async function renderReleaseIntelligence(c){
   var data=await api("/users");if(!data)return;allUsers=data.users||[];setReleaseIntelligence(data);
-  var rc=releaseIntelligence.counts||{},ic=releaseIntelligence.installationCounts||{},pc=releaseIntelligence.platformCounts||{};
-  var readinessClass=releaseIntelligence.readiness==="READY_FOR_REVIEW"?"ready":"not-ready";
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">Release Intelligence</div><h1 class="page-title">'+(lang==="ar"?"إصدارات التطبيق":"App releases")+'</h1><p class="page-subtitle">'+(lang==="ar"?"قياس التبنّي والتوافق على الأجهزة النشطة خلال 30 يومًا.":"Adoption and compatibility across devices active in the last 30 days.")+'</p></div><div class="page-actions">'+((rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">'+(lang==="ar"?"إرسال تنبيه جماعي":"Send bulk reminder")+'</button>':"")+'</div></div>'+
-    '<div class="release-grid">'+releaseMetric("ACTIVE",releaseIntelligence.activeInstallations||0,"30 days")+releaseMetric("CURRENT",ic.CURRENT||0,"installations")+releaseMetric("SUPPORTED_OLD",ic.SUPPORTED_OLD||0,"installations")+releaseMetric("UPDATE_REQUIRED",ic.UPDATE_REQUIRED||0,"installations")+releaseMetric("UNKNOWN",rc.UNKNOWN||0,"users")+releaseMetric("ANDROID",pc.android||0,"installations")+releaseMetric("IOS",pc.ios||0,"installations")+releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%","current installations")+'</div>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>Final Rules Readiness</h2><p>'+(lang==="ar"?"مؤشر معلوماتي فقط ولا ينشر Firestore Rules.":"Informational only; this never deploys Firestore Rules.")+'</p></div></div><div class="readiness-layout"><div><div class="readiness-score">'+(releaseIntelligence.readinessPercent||0)+'%</div><div>'+(lang==="ar"?"مستخدمون متوافقون":"Compatible users")+': '+(releaseIntelligence.compatibleUsers||0)+'</div><span class="readiness-state '+readinessClass+'">'+(releaseIntelligence.readiness==="READY_FOR_REVIEW"?"READY FOR REVIEW":"NOT READY")+'</span></div><div><div class="progress-meta"><span>'+(lang==="ar"?"الجاهزية":"Readiness")+'</span><span>'+((rc.UPDATE_REQUIRED||0))+' required · '+((rc.UNKNOWN||0))+' unknown</span></div><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+(releaseIntelligence.readinessPercent||0)+'"><div class="progress-fill" style="width:'+Math.max(0,Math.min(100,releaseIntelligence.readinessPercent||0))+'%"></div></div><p class="page-subtitle">'+(lang==="ar"?"آخر telemetry: ":"Last telemetry: ")+esc(formatReleaseDate(releaseIntelligence.lastTelemetryAt))+'</p></div></div></section>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"توزيع الإصدارات":"Version distribution")+'</h2><p>'+(lang==="ar"?"عدد التثبيتات النشطة مع توزيع المنصات.":"Active installations with platform breakdown.")+'</p></div></div>'+releaseDistributionHtml()+'</section>';
+  var rc=releaseIntelligence.counts||{};
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">ملخص بسيط لإصدار التطبيق المسجل لكل مستخدم. الإصدار الحالي: '+esc(releaseIntelligence.currentVersion||"1.0.6")+'</p></div><div class="page-actions">'+((rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">إرسال تنبيه جماعي</button>':"")+'</div></div>'+
+    '<div class="release-grid">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+releaseMetric("CURRENT",rc.CURRENT||0)+releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0)+releaseMetric("UNKNOWN",rc.UNKNOWN||0)+releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%")+'</div>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد المستخدمين المسجل لكل إصدار من التطبيق.</p></div></div>'+releaseDistributionHtml()+'</section>';
 }
 
-function releaseDistributionHtml(){var distribution=releaseIntelligence.distribution||{android:{},ios:{}},totals={};["android","ios"].forEach(function(platform){Object.keys(distribution[platform]||{}).forEach(function(version){if(!totals[version])totals[version]={total:0,android:0,ios:0};var count=Number(distribution[platform][version]||0);totals[version].total+=count;totals[version][platform]+=count;});});var grand=Object.keys(totals).reduce(function(sum,key){return sum+totals[key].total;},0);var rows=Object.keys(totals).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var item=totals[version],pct=grand?Math.round(item.total*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+item.total+'</span><span class="distribution-platforms">Android '+item.android+' · iOS '+item.ios+'</span></div>';}).join("");return '<div class="distribution-list">'+(rows||'<div class="empty-state"><strong>'+(lang==="ar"?"لا توجد telemetry بعد":"No telemetry yet")+'</strong>'+(lang==="ar"?"ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.":"Versions appear after users open the app.")+'</div>')+'</div>';}
-
-function showReleaseDevices(uid){var u=allUsers.find(function(item){return item._id===uid;});if(!u)return;var r=u.releaseIntelligence||{devices:[]};var rows=(r.devices||[]).map(function(d){var id=String(d.installationId||""),shortId=id.length>16?id.slice(0,8)+"…"+id.slice(-4):id,update=String(d.updateId||""),shortUpdate=update.length>18?update.slice(0,10)+"…"+update.slice(-5):update;return '<tr><td title="'+esc(id)+'">'+esc(shortId||"—")+'</td><td>'+esc(d.platform||"—")+'</td><td>'+esc(d.appVersion||"—")+'</td><td>'+esc(d.buildNumber||"—")+'</td><td>'+esc(d.runtimeVersion||"—")+'</td><td title="'+esc(update)+'">'+esc(shortUpdate||"—")+'</td><td>'+esc(formatReleaseDate(d.firstSeenAt))+'</td><td>'+esc(formatReleaseDate(d.lastSeenAt))+'</td><td>'+releaseStatusBadge(d.classification)+'</td></tr>';}).join("");openModal('<h3>'+(lang==="ar"?"الأجهزة المعروفة — ":"Known devices — ")+esc(u.displayName||u.email||uid)+'</h3><div class="table-wrap"><table style="min-width:980px"><thead><tr><th>Installation</th><th>Platform</th><th>Version</th><th>Build</th><th>Runtime</th><th>Update ID</th><th>First Seen</th><th>Last Seen</th><th>Classification</th></tr></thead><tbody>'+(rows||'<tr><td colspan="9" class="empty">'+(lang==="ar"?"لا توجد بيانات أجهزة بعد":"No device telemetry yet")+'</td></tr>')+'</tbody></table></div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+(lang==="ar"?"إغلاق":"Close")+'</button></div>',true);}
+function releaseDistributionHtml(){var distribution=releaseIntelligence.distribution||{},grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(rows||'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
 
 function filterUsers(){
   var role=document.getElementById("f-role")?document.getElementById("f-role").value:"";
   var status=document.getElementById("f-status")?document.getElementById("f-status").value:"";
   var release=document.getElementById("f-release")?document.getElementById("f-release").value:"";
-  var platform=document.getElementById("f-platform")?document.getElementById("f-platform").value:"";
   var version=document.getElementById("f-version")?document.getElementById("f-version").value:"";
   var search=(document.getElementById("f-search")?document.getElementById("f-search").value:"").toLowerCase();
   var filtered=allUsers;
   if(role)filtered=filtered.filter(function(u){return u.role===role;});
   if(status)filtered=filtered.filter(function(u){return u.accountStatus===status;});
   if(release)filtered=filtered.filter(function(u){return (u.releaseIntelligence&&u.releaseIntelligence.classification||"UNKNOWN")===release;});
-  if(platform)filtered=filtered.filter(function(u){return userReleaseDevices(u).some(function(d){return d.platform===platform;});});
-  if(version)filtered=filtered.filter(function(u){return userReleaseDevices(u).some(function(d){return d.appVersion===version;});});
+  if(version)filtered=filtered.filter(function(u){return (u.releaseIntelligence&&u.releaseIntelligence.appVersion||"")===version;});
   if(search)filtered=filtered.filter(function(u){
     return(u.displayName||"").toLowerCase().indexOf(search)>=0||(u.email||"").toLowerCase().indexOf(search)>=0||(u.phone||"").indexOf(search)>=0;
   });
   var tbody=document.getElementById("users-tbody");
   if(!tbody)return;
-  if(!filtered.length){tbody.innerHTML='<tr><td colspan="10" class="empty">'+t("noUsersFound")+'</td></tr>';return;}
+  if(!filtered.length){tbody.innerHTML='<tr><td colspan="6" class="empty">'+t("noUsersFound")+'</td></tr>';return;}
   tbody.innerHTML=filtered.map(function(u){
-    var r=u.releaseIntelligence||{classification:"UNKNOWN",devices:[]};var d=r.newest||null;var devices=userReleaseDevices(u);
+    var r=u.releaseIntelligence||{classification:"UNKNOWN",appVersion:null};
     return "<tr>"+
       "<td><div class=\\"contact-stack\\"><strong>"+esc(u.displayName||t("noName"))+"</strong><span>"+esc(u.email||"")+"</span><span>"+esc(u.phone||"")+"</span></div></td>"+
       "<td>"+roleBadge(u.role)+"</td>"+
       "<td>"+statusBadge(u.accountStatus)+"</td>"+
-      "<td><div class=\\"version-stack\\"><strong>"+esc(userVersionText(u))+"</strong>"+(r.hasOutdatedDevice?"<small>"+(lang==="ar"?"يتضمن جهازًا قديمًا":"Includes an outdated device")+"</small>":"")+"</div></td>"+
-      "<td>"+esc(d&&d.buildNumber||"—")+"</td>"+
-      "<td>"+esc(userPlatformText(u))+"</td>"+
-      "<td>"+esc(formatReleaseDate(d&&d.lastSeenAt))+"</td>"+
-      "<td><button class=\\"btn btn-sm btn-secondary devices-button\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"showReleaseDevices(this.dataset.userId)\\">"+(lang==="ar"?"عرض الأجهزة":"View devices")+" ("+devices.length+")</button></td>"+
+      "<td><strong>"+esc(r.appVersion||"—")+"</strong></td>"+
       "<td>"+releaseStatusBadge(r.classification)+"</td>"+
-      "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(["SUPPORTED_OLD","UPDATE_REQUIRED"].includes(r.classification)?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">"+(lang==="ar"?"طلب تحديث":"Update reminder")+"</button>":"")+"</div></td>"+
+      "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(r.classification==="UPDATE_REQUIRED"?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">طلب تحديث</button>":"")+"</div></td>"+
     "</tr>";
   }).join("");
 }
 
 function confirmReleaseReminder(uid){
   var u=allUsers.find(function(item){return item._id===uid;});if(!u)return;
-  openModal('<h3>تأكيد إرسال طلب تحديث</h3><p>سيتم إرسال إشعار داخل التطبيق، Push، وبريد إلكتروني عند توفره إلى '+esc(u.displayName||u.email||"المستخدم")+'.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="sendReleaseReminder(this.dataset.userId)">إرسال</button></div>');
+  openModal('<h3>تأكيد إرسال طلب تحديث</h3><p>سيتم إرسال إشعار داخل التطبيق، وإشعار فوري، وبريد إلكتروني عند توفره إلى '+esc(u.displayName||u.email||"المستخدم")+'.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="sendReleaseReminder(this.dataset.userId)">إرسال</button></div>');
 }
 async function sendReleaseReminder(uid){
   var data=await api("/release-intelligence/remind",{method:"POST",body:JSON.stringify({uid:uid})});
@@ -5760,14 +5679,13 @@ async function sendReleaseReminder(uid){
 }
 function confirmBulkReleaseReminder(){
   var targets=allUsers.filter(function(u){return u.releaseIntelligence&&u.releaseIntelligence.classification==="UPDATE_REQUIRED";});
-  var android=0,ios=0;targets.forEach(function(u){var d=(u.releaseIntelligence.devices||[]).find(function(x){return x.classification==="UPDATE_REQUIRED";});if(d&&d.platform==="android")android++;if(d&&d.platform==="ios")ios++;});
-  openModal('<h3>تأكيد إرسال تنبيهات التحديث</h3><p>الإجمالي: <b>'+targets.length+'</b> — Android: <b>'+android+'</b> — iOS: <b>'+ios+'</b></p><p>سيتم اختيار المستلمين في الخادم وتطبيق مهلة 72 ساعة.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" onclick="runBulkReleaseReminder()">إرسال</button></div>');
+  openModal('<h3>تأكيد إرسال تنبيهات التحديث</h3><p>سيتم إرسال تنبيه إلى <b>'+targets.length+'</b> مستخدم يحتاج إلى تحديث التطبيق، مع تطبيق مهلة 72 ساعة لمنع التكرار.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" onclick="runBulkReleaseReminder()">إرسال</button></div>');
 }
 async function runBulkReleaseReminder(){
   var total=0,sent=0,failed=0,skippedCooldown=0,hasMore=true,calls=0;
   while(hasMore&&calls<50){var data=await api("/release-intelligence/remind-required",{method:"POST",body:"{}"});if(!data||!data.success){toast(data&&data.error||"تعذر إرسال التنبيهات","error");return;}if(calls===0)skippedCooldown=data.skippedCooldown||0;total+=data.processed||0;sent+=data.sent||0;failed+=data.failed||0;hasMore=data.hasMore===true;calls++;}
   if(hasMore){toast("توقف الإرسال الآمن؛ أعد المحاولة لإكمال الباقي","error");return;}
-  openModal('<h3>'+(lang==="ar"?"نتيجة تنبيهات التحديث":"Update reminder results")+'</h3><div class="release-grid"><div class="release-metric"><div class="metric-label">Targeted</div><div class="metric-value">'+total+'</div></div><div class="release-metric current"><div class="metric-label">Sent</div><div class="metric-value">'+sent+'</div></div><div class="release-metric supported"><div class="metric-label">Skipped cooldown</div><div class="metric-value">'+skippedCooldown+'</div></div><div class="release-metric required"><div class="metric-label">Failed</div><div class="metric-value">'+failed+'</div></div></div><div class="modal-actions"><button class="btn btn-primary" onclick="closeModal();renderPage()">'+(lang==="ar"?"تم":"Done")+'</button></div>');
+  openModal('<h3>نتيجة تنبيهات التحديث</h3><div class="release-grid"><div class="release-metric"><div class="metric-label">المستهدفون</div><div class="metric-value">'+total+'</div></div><div class="release-metric current"><div class="metric-label">تم الإرسال</div><div class="metric-value">'+sent+'</div></div><div class="release-metric supported"><div class="metric-label">ضمن مهلة الانتظار</div><div class="metric-value">'+skippedCooldown+'</div></div><div class="release-metric required"><div class="metric-label">تعذر الإرسال</div><div class="metric-value">'+failed+'</div></div></div><div class="modal-actions"><button class="btn btn-primary" onclick="closeModal();renderPage()">تم</button></div>');
 }
 
 function editUser(uid){
@@ -6760,6 +6678,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         notificationItemsDeleted: false,
         notificationUnreadDeleted: false,
         notificationSummaryDeleted: false,
+        clientVersionDeleted: false,
         clientInstallationsDeleted: false,
         clientInstallationSummaryDeleted: false,
         userDeleted: false,
@@ -6801,6 +6720,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (!Object.prototype.hasOwnProperty.call(manifest, "notificationItemsDeleted")) manifest.notificationItemsDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "notificationUnreadDeleted")) manifest.notificationUnreadDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "notificationSummaryDeleted")) manifest.notificationSummaryDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "clientVersionDeleted")) manifest.clientVersionDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientInstallationsDeleted")) manifest.clientInstallationsDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientInstallationSummaryDeleted")) manifest.clientInstallationSummaryDeleted = false;
       const failures = [];
@@ -6891,6 +6811,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("notification_summary_delete_failed"); }
+      }
+      if (manifest.clientVersionDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument("client_versions", uid, accessToken);
+          manifest.clientVersionDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("client_version_delete_failed"); }
       }
       if (manifest.clientInstallationsDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -7136,11 +7065,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         notificationSummaryField,
         orderNotificationContent,
         deleteNotificationSubcollectionBatch,
-        validClientInstallationPayload,
-        recordClientInstallationHeartbeat,
+        validClientVersionPayload,
+        recordClientVersion,
         compareReleaseSemver,
-        classifyClientInstallation,
-        summarizeClientInstallations,
+        classifyClientVersion,
+        summarizeClientVersion,
         releaseIntelligenceForUsers,
         releaseReminderCandidate,
         sendReleaseUpdateReminder,
@@ -7737,12 +7666,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           if (path === "/admin/api/stats" && request.method === "GET") {
-            const [users, orders, offers, summaries, settings] = await Promise.all([
+            const [users, orders, offers, versions] = await Promise.all([
               listAllUsers(accessToken),
               listAllOrders(accessToken),
               listAllOffers(accessToken),
-              listClientInstallationSummaries(accessToken),
-              getFirestoreDoc("app_settings", "main", accessToken)
+              listClientVersions(accessToken)
             ]);
             const stats = {
               totalUsers: users.length,
@@ -7755,56 +7683,48 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               activeSubscriptions: users.filter((u) => u.subscriptionStatus === "active").length,
               verifiedAccounts: users.filter((u) => u.verificationStatus === "verified").length
             };
-            const intelligence = releaseIntelligenceForUsers(users, summaries, normalizedClientVersionGate(settings?.clientVersionGate));
+            const intelligence = releaseIntelligenceForUsers(users, versions);
             const { users: _releaseUsers, ...release } = intelligence;
             return jsonResponse({ success: true, stats, release, users, orders, offers });
           }
           if (path === "/admin/api/users" && request.method === "GET") {
-            const [users, summaries, settings] = await Promise.all([
+            const [users, versions] = await Promise.all([
               listAllUsers(accessToken),
-              listClientInstallationSummaries(accessToken),
-              getFirestoreDoc("app_settings", "main", accessToken)
+              listClientVersions(accessToken)
             ]);
-            const intelligence = releaseIntelligenceForUsers(users, summaries, normalizedClientVersionGate(settings?.clientVersionGate));
+            const intelligence = releaseIntelligenceForUsers(users, versions);
             return jsonResponse({ success: true, ...intelligence });
           }
           if (path === "/admin/api/release-intelligence/remind" && request.method === "POST") {
             const body = await request.json();
             if (!phase4aKeysOnly(body, ["uid"]) || !phase4aSafeSegment(body?.uid)) return jsonResponse({ error: "Invalid user" }, 400);
-            const [user, summary, settings] = await Promise.all([
+            const [user, version] = await Promise.all([
               getFirestoreDoc("users", body.uid, accessToken),
-              getFirestoreDoc("client_installation_summaries", body.uid, accessToken),
-              getFirestoreDoc("app_settings", "main", accessToken)
+              getFirestoreDoc("client_versions", body.uid, accessToken)
             ]);
             if (!user) return jsonResponse({ error: "User not found" }, 404);
-            const gate = normalizedClientVersionGate(settings?.clientVersionGate);
-            const release = summarizeClientInstallations(summary, gate);
+            const release = summarizeClientVersion(version);
             if (!releaseReminderCandidate(user, release)) return jsonResponse({ error: "User is current, unknown, or in cooldown", code: "not_eligible" }, 409);
             const now = new Date().toISOString();
-            const result = await sendReleaseUpdateReminder({ ...user, _id: body.uid }, release, gate, env, accessToken, now);
+            const result = await sendReleaseUpdateReminder({ ...user, _id: body.uid }, release, env, accessToken, now);
             await createFirestoreDocument("admin_audit_logs", "release_reminder_" + Date.now(), { action: "release_update_reminder", changedBy: "admin_token", targetCount: 1, sent: result.sent ? 1 : 0, failed: result.sent ? 0 : 1, changedAt: now }, accessToken);
             return jsonResponse({ success: result.sent, result }, result.sent ? 200 : 409);
           }
           if (path === "/admin/api/release-intelligence/remind-required" && request.method === "POST") {
             const body = await request.json().catch(() => ({}));
             if (!phase4aKeysOnly(body, [])) return jsonResponse({ error: "Unsupported request fields" }, 400);
-            const [users, summaries, settings] = await Promise.all([
-              listAllUsers(accessToken), listClientInstallationSummaries(accessToken), getFirestoreDoc("app_settings", "main", accessToken)
+            const [users, versions] = await Promise.all([
+              listAllUsers(accessToken), listClientVersions(accessToken)
             ]);
-            const gate = normalizedClientVersionGate(settings?.clientVersionGate);
-            const intelligence = releaseIntelligenceForUsers(users, summaries, gate);
+            const intelligence = releaseIntelligenceForUsers(users, versions);
             const required = intelligence.users.filter((user) => user.releaseIntelligence.classification === "UPDATE_REQUIRED");
             const eligible = required.filter((user) => releaseReminderCandidate(user, user.releaseIntelligence));
             const batch = eligible.slice(0, 5);
-            const counts = { total: eligible.length, android: 0, ios: 0 };
-            for (const user of eligible) {
-              const platform = user.releaseIntelligence.devices.find((device) => device.classification === "UPDATE_REQUIRED")?.platform;
-              if (platform === "android" || platform === "ios") counts[platform]++;
-            }
+            const counts = { total: eligible.length };
             let sent = 0;
             let failed = 0;
             for (const user of batch) {
-              const result = await sendReleaseUpdateReminder(user, user.releaseIntelligence, gate, env, accessToken);
+              const result = await sendReleaseUpdateReminder(user, user.releaseIntelligence, env, accessToken);
               if (result.sent) sent++; else failed++;
             }
             const now = new Date().toISOString();
@@ -8485,18 +8405,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: false, error: "Authorization unavailable" }, 503);
         }
       }
-      if (path === "/client/installations/heartbeat" && request.method === "POST") {
+      if (path === "/client/version" && request.method === "POST") {
         if (hasServiceKey || !phase4aSafeSegment(callerUid)) return jsonResponse({ success: false, code: "forbidden", error: "User authentication required" }, 403);
         try {
           const body = await request.json();
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          const result = await recordClientInstallationHeartbeat(callerUid, body, accessToken);
-          if (result.invalid) return jsonResponse({ success: false, code: "invalid_request", error: "Invalid installation heartbeat" }, 400);
+          const result = await recordClientVersion(callerUid, body, accessToken);
+          if (result.invalid) return jsonResponse({ success: false, code: "invalid_request", error: "Invalid client version" }, 400);
           if (result.blocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "Account deletion is in progress" }, 403);
-          return jsonResponse({ success: true, changed: result.changed, nextHeartbeatAt: result.nextHeartbeatAt || null });
+          return jsonResponse({ success: true, changed: result.changed, appVersion: result.appVersion });
         } catch (error) {
-          console.error("[ClientInstallation] Heartbeat failed");
-          return jsonResponse({ success: false, code: "internal_error", error: "Unable to record installation" }, 500);
+          console.error("[ClientVersion] Report failed");
+          return jsonResponse({ success: false, code: "internal_error", error: "Unable to record client version" }, 500);
         }
       }
       if (path === "/verify-cr" && request.method === "POST") {
