@@ -265,7 +265,8 @@ const firebaseIdToken = (uid) => {
   assert(source.indexOf("await persistUserNotification({ ...content") < source.indexOf("pushResult = await sendExpoPush(messages"), "durable order entry must precede push");
   assert(source.includes('eventKey: "complaint_update:" + complaintId + ":" + digest'), "complaint updates use stable content idempotency");
   assert(source.includes("const meaningful = Object.entries(requested).some"), "identical complaint saves must not notify");
-  assert(source.includes("await persistNotificationBatch(allMatchedUsers"), "admin audience must receive durable records");
+  assert(source.includes("await persistBroadcastNotificationBatch(users"), "admin audience must receive durable records in bounded batches");
+  assert(source.includes("createBroadcastJob"), "admin broadcast uses a resumable durable job");
   assert(source.includes('badge: notificationOutcome.summary.totalUnread'), "subscription push uses the durable authoritative badge");
   assert(source.indexOf('eventKey: "subscription_reminder:"') < source.indexOf('data: { type: "subscription_reminder" }'), "subscription record must be durable before push");
   assert(source.includes('path === "/notifications/context/read"'), "normal navigation has a narrow authenticated context-read endpoint");
