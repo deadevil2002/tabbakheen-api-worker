@@ -3993,7 +3993,7 @@
     __name2(handleEvent, "handleEvent");
     async function createAdminToken(env) {
       const exp = Date.now() + 24 * 60 * 60 * 1e3;
-      const payload = btoa(JSON.stringify({ exp, r: Math.random().toString(36).slice(2) }));
+      const payload = btoa(JSON.stringify({ exp, r: Math.random().toString(36).slice(2), a: "admin" }));
       const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
       const key = await crypto.subtle.importKey(
         "raw",
@@ -4035,6 +4035,15 @@
     }
     __name(verifyAdminToken, "verifyAdminToken");
     __name2(verifyAdminToken, "verifyAdminToken");
+    function adminIdentityFromToken(token) {
+      try {
+        const payload = token && token.split(".")[0];
+        const data = payload ? JSON.parse(atob(payload)) : null;
+        return data && typeof data.a === "string" && data.a ? data.a : "admin";
+      } catch (e) {
+        return "admin";
+      }
+    }
     async function verifyAdminPassword(password, env, accessToken) {
       if (password === env.ADMIN_PASSWORD) return true;
       try {
@@ -5703,12 +5712,8 @@ function paintUsersTable(){
   filterUsers();
 }
 
-var ADMIN_SEEN_COMPLAINTS_KEY="tabbakheen_admin_seen_complaints_v1",ADMIN_SEEN_VERIFICATIONS_KEY="tabbakheen_admin_seen_verifications_v1";
-function readAdminSeen(key){try{var value=JSON.parse(localStorage.getItem(key)||"[]");return new Set(Array.isArray(value)?value.filter(function(item){return typeof item==="string";}):[]);}catch(e){return new Set();}}
-function writeAdminSeen(key,set){try{localStorage.setItem(key,JSON.stringify(Array.from(set).slice(-1000)));}catch(e){}}
-function rememberAdminItems(kind,items){var key=kind==="complaints"?ADMIN_SEEN_COMPLAINTS_KEY:ADMIN_SEEN_VERIFICATIONS_KEY;var seen=readAdminSeen(key);(items||[]).forEach(function(item){if(item&&item.token)seen.add(item.token);});writeAdminSeen(key,seen);}
-function unseenAdminItems(kind,items){var key=kind==="complaints"?ADMIN_SEEN_COMPLAINTS_KEY:ADMIN_SEEN_VERIFICATIONS_KEY;var seen=readAdminSeen(key);return(items||[]).filter(function(item){return item&&item.token&&!seen.has(item.token);});}
-function markAdminSectionSeen(page){var attention=adminLiveState.data&&adminLiveState.data.attention||{};if(page==="complaints")rememberAdminItems("complaints",attention.complaints);if(page==="verification")rememberAdminItems("verifications",attention.verification);}
+var adminSeenInFlight={complaints:false,verification:false};
+function markAdminSectionSeen(page){var attention=adminLiveState.data&&adminLiveState.data.attention||{};var kind=page==="complaints"?"complaints":page==="verification"?"verification":"";if(!kind||adminSeenInFlight[kind])return;var items=attention[kind]||[];if(!items.length)return;adminSeenInFlight[kind]=true;api("/live-summary/seen",{method:"POST",body:JSON.stringify({section:kind,tokens:items.map(function(item){return item.token;})})}).then(function(result){if(result&&result.success&&adminLiveState.data&&adminLiveState.data.attention){adminLiveState.data.attention[kind]=[];paintAdminLiveSummary(adminLiveState.data);}}).catch(function(){}).finally(function(){adminSeenInFlight[kind]=false;});}
 var adminLiveState={timer:null,inFlight:false,controller:null,epoch:0,lastSignature:"",lastUpdatedAt:0,visibilityBound:false,data:null};
 function adminLiveSignature(data){return JSON.stringify(data||{});}
 function stopAdminLivePolling(){
@@ -5726,12 +5731,12 @@ function setLiveBadge(id,count,label){
 function paintAdminLiveSummary(data){
   var s=data&&data.stats||{},r=data&&data.releases||{},p=data&&data.pending||{};
   var attention=data&&data.attention||{};
-  if(currentPage==="complaints")rememberAdminItems("complaints",attention.complaints);
-  if(currentPage==="verification")rememberAdminItems("verifications",attention.verification);
+  if(currentPage==="complaints")markAdminSectionSeen("complaints");
+  if(currentPage==="verification")markAdminSectionSeen("verification");
   ["totalUsers","customers","providers","drivers","providersInTrial","driversInTrial","activeSubscriptions","verifiedAccounts"].forEach(function(key){var el=document.getElementById("live-stat-"+key);if(el){var value=el.querySelector(".value");if(value)value.textContent=String(s[key]||0);}});
   ["CURRENT","UPDATE_REQUIRED","UNKNOWN"].forEach(function(key){var el=document.getElementById("live-release-"+key);if(el)el.textContent=String(r[key]||0);});
-  setLiveBadge("nav-complaints",unseenAdminItems("complaints",attention.complaints).length,"بلاغات جديدة");
-  setLiveBadge("nav-verification",unseenAdminItems("verifications",attention.verification).length,"طلبات توثيق جديدة");
+  setLiveBadge("nav-complaints",(attention.complaints||[]).length,"بلاغات جديدة");
+  setLiveBadge("nav-verification",(attention.verification||[]).length,"طلبات توثيق جديدة");
   var indicator=document.getElementById("admin-live-indicator");if(indicator)indicator.textContent="● يتم التحديث تلقائيًا · آخر تحديث: الآن";
 }
 function scheduleAdminLivePolling(epoch){
@@ -7751,6 +7756,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (!valid) {
           return jsonResponse({ error: "Unauthorized" }, 401);
         }
+        const adminIdentity = adminIdentityFromToken(token);
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           if (path === "/admin/api/stats" && request.method === "GET") {
@@ -7795,7 +7801,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               verifiedAccounts: users.filter((u) => u.verificationStatus === "verified").length
             };
             const intelligence = releaseIntelligenceForUsers(users, versions);
-            const complaintActivity = complaints.filter((item) => item.complaintStatus === "pending").map((item) => ({ token: String(item._id || item.id || "") + ":" + String(item.createdAt || "") })).filter((item) => item.token.startsWith(":" ) === false).slice(-200);
+            const complaintActivity = complaints.filter((item) => item.complaintStatus === "pending").map((item) => ({ token: String(item._id || item.id || "") + ":" + String(item.createdAt || "") })).filter((item) => !item.token.startsWith(":" )).slice(-200);
             const userById = Object.fromEntries(users.map((user) => [user._id, user]));
             const verificationActivity = [];
             for (const request of verificationRequests) {
@@ -7807,10 +7813,27 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               if (crPending) verificationActivity.push({ token: "cr:" + uid + ":" + String(request.submittedAt || "") });
               if (freelancePending) verificationActivity.push({ token: "freelance:" + uid + ":" + String(freelance.submittedAt || "") });
             }
+            const seenState = await getFirestoreDoc("admin_seen_state", adminIdentity, accessToken) || {};
+            const seenComplaints = new Set(Array.isArray(seenState.complaintTokens) ? seenState.complaintTokens : []);
+            const seenVerifications = new Set(Array.isArray(seenState.verificationTokens) ? seenState.verificationTokens : []);
+            const unseenComplaints = complaintActivity.filter((item) => !seenComplaints.has(item.token));
+            const unseenVerifications = verificationActivity.slice(-200).filter((item) => !seenVerifications.has(item.token));
             return jsonResponse({ success: true, stats, releases: intelligence.counts || {}, pending: {
               complaints: complaintActivity.length,
               verification: verificationActivity.length
-            }, attention: { complaints: complaintActivity, verification: verificationActivity.slice(-200) } });
+            }, attention: { complaints: unseenComplaints, verification: unseenVerifications } });
+          }
+          if (path === "/admin/api/live-summary/seen" && request.method === "POST") {
+            let body;
+            try { body = await request.json(); } catch (e) { return jsonResponse({ error: "Invalid request" }, 400); }
+            const section = body && body.section;
+            if (!["complaints", "verification"].includes(section) || !Array.isArray(body.tokens)) return jsonResponse({ error: "Invalid section" }, 400);
+            const tokens = body.tokens.filter((token) => typeof token === "string" && token.length > 0 && token.length <= 256).slice(-200);
+            const existing = await getFirestoreDoc("admin_seen_state", adminIdentity, accessToken) || {};
+            const field = section === "complaints" ? "complaintTokens" : "verificationTokens";
+            const merged = Array.from(new Set([...(Array.isArray(existing[field]) ? existing[field] : []), ...tokens])).slice(-2000);
+            await updateFirestoreDocument("admin_seen_state", adminIdentity, { [field]: merged, updatedAt: new Date().toISOString() }, accessToken);
+            return jsonResponse({ success: true });
           }
           if (path === "/admin/api/users" && request.method === "GET") {
             const [users, versions] = await Promise.all([

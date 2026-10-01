@@ -6,11 +6,12 @@ assert(source.includes('path === "/admin/api/live-summary"'), "live summary endp
 assert(source.includes('listAllComplaints(accessToken)'), "complaint pending count uses existing complaints source");
 assert(source.includes('complaintStatus === "pending"'), "complaint badge is pending-only");
 assert(source.includes('verificationStatus === "pending_review"'), "verification badge uses pending_review");
-assert(source.includes('attention: { complaints: complaintActivity, verification: verificationActivity.slice(-200) }'), "summary returns bounded stable activity tokens");
-assert(source.includes("tabbakheen_admin_seen_complaints_v1") && source.includes("tabbakheen_admin_seen_verifications_v1"), "seen state uses localStorage keys");
+assert(source.includes('attention: { complaints: unseenComplaints, verification: unseenVerifications }'), "summary returns bounded stable activity tokens");
+assert(source.includes('api("/live-summary/seen"') && source.includes('section:kind'), "seen state is persisted server-side");
+assert(!source.includes("tabbakheen_admin_seen_complaints_v1") && !source.includes("tabbakheen_admin_seen_verifications_v1"), "localStorage is not the source of truth");
 assert(source.includes("markAdminSectionSeen(page)"), "opening a section marks current items seen");
 assert(source.includes('currentPage==="complaints"') && source.includes('currentPage==="verification"'), "visible section auto-sees arriving items");
-assert(source.includes("unseenAdminItems(\"complaints\",attention.complaints).length"), "badges count unseen tokens rather than pending totals");
+assert(source.includes('(attention.complaints||[]).length') && source.includes('(attention.verification||[]).length'), "badges count server-filtered unseen tokens");
 assert(source.includes('setTimeout(function(){refreshAdminLive(true,epoch);},10000)'), "admin polling interval is 10 seconds");
 assert(source.includes('document.visibilityState==="visible"'), "hidden tabs pause and visible tabs resume");
 assert(source.includes("new AbortController()") && source.includes("adminLiveState.inFlight"), "admin polling prevents overlap and aborts stale requests");
