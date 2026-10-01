@@ -162,6 +162,23 @@
       const results = await response.json();
       return results.filter((r) => r.document).map((r) => parseFirestoreDoc(r.document));
     }
+    // Bounded collection scan used by resumable admin jobs. Unlike runQuery,
+    // listDocuments exposes a page token so one invocation never has to load
+    // the entire audience into memory or exceed the Worker subrequest budget.
+    async function listFirestoreDocumentsPage(collectionId, pageSize, pageToken, accessToken) {
+      let url = `${FIRESTORE_BASE}/${collectionId}?pageSize=${Math.max(1, Math.min(25, Number(pageSize) || 25))}`;
+      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+      const response = await fetch(url, { headers: { "Authorization": `Bearer ${accessToken}` } });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Firestore list failed: ${response.status} ${text}`);
+      }
+      const data = await response.json();
+      return {
+        documents: (data.documents || []).map(parseFirestoreDoc).filter(Boolean),
+        nextPageToken: typeof data.nextPageToken === "string" && data.nextPageToken ? data.nextPageToken : null
+      };
+    }
     __name(queryFirestore, "queryFirestore");
     __name2(queryFirestore, "queryFirestore");
     function toFirestoreValue(value) {
@@ -2033,6 +2050,13 @@
       }
       return results;
     }
+    // Cloudflare Free plan has a 50-subrequest ceiling. A broadcast recipient
+    // can require notification reads/commit, token lookup and one Expo call;
+    // three recipients leaves conservative headroom for auth, job and history
+    // reads/writes and a single retry without making the request unbounded.
+    const ADMIN_BROADCAST_BATCH_SIZE = 3;
+    const ADMIN_BROADCAST_AUDIENCE_PAGE_SIZE = 25;
+    const ADMIN_BROADCAST_MAX_PROCESS_CALLS = 1000;
     const RELEASE_REMINDER_COOLDOWN_MS = 72 * 60 * 60 * 1e3;
     const RELEASE_CURRENT_VERSION = "1.0.6";
     function compareReleaseSemver(left, right) {
@@ -3416,6 +3440,157 @@
         staleTokensCount,
         failureReasons
       };
+    }
+    function broadcastJobId() {
+      return "broadcast_" + Date.now().toString(36) + "_" + crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+    }
+    function broadcastRoles(audience) {
+      return audience === "all" ? ["customer", "provider", "driver"] : [audience];
+    }
+    function mergeBroadcastFailureReasons(target, source) {
+      for (const [code, item] of Object.entries(source || {})) {
+        if (!target[code]) target[code] = { count: 0, message: item?.message || "" };
+        target[code].count += Number(item?.count) || 0;
+        if (!target[code].message && item?.message) target[code].message = item.message;
+      }
+      return target;
+    }
+    async function createBroadcastJob(body, accessToken) {
+      const now = new Date().toISOString();
+      const id = broadcastJobId();
+      const fields = {
+        broadcastId: id,
+        title: body.title.trim().slice(0, 160),
+        message: body.message.trim().slice(0, 1000),
+        audience: body.audience,
+        roles: broadcastRoles(body.audience),
+        roleIndex: 0,
+        pageToken: null,
+        pendingRecipients: [],
+        processedUids: [],
+        totalUsersMatched: 0,
+        processedCount: 0,
+        sentCount: 0,
+        failedCount: 0,
+        totalCandidateTokens: 0,
+        validTokensCount: 0,
+        invalidTokensCount: 0,
+        staleTokensCount: 0,
+        failureReasons: {},
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+        createdBy: "admin"
+      };
+      if (body.sourceNotificationId) {
+        fields.sourceNotificationId = body.sourceNotificationId;
+        fields.resendType = body.resendType || "edited";
+      }
+      await createFirestoreDocument("admin_broadcast_jobs", id, fields, accessToken);
+      await createFirestoreDocument("admin_broadcast_notifications", id, {
+        title: fields.title,
+        message: fields.message,
+        audience: fields.audience,
+        totalUsersMatched: 0,
+        sentCount: 0,
+        failedCount: 0,
+        status: "pending",
+        hasMore: true,
+        createdAt: now,
+        createdBy: "admin",
+        ...(fields.sourceNotificationId ? { sourceNotificationId: fields.sourceNotificationId, resendType: fields.resendType } : {})
+      }, accessToken);
+      return fields;
+    }
+    async function processBroadcastJob(job, accessToken) {
+      if (!job || !job.broadcastId) throw new Error("Broadcast job not found");
+      if (job.status === "completed") return { ...job, hasMore: false };
+      const roles = Array.isArray(job.roles) && job.roles.length ? job.roles : broadcastRoles(job.audience);
+      let roleIndex = Number.isInteger(job.roleIndex) ? job.roleIndex : 0;
+      let pageToken = job.pageToken || null;
+      let pending = Array.isArray(job.pendingRecipients) ? job.pendingRecipients.slice() : [];
+      let scanComplete = Boolean(job.scanComplete);
+
+      // Scan at most one bounded Firestore page per invocation. Matching users
+      // are kept as compact uid/role pairs; no PII is persisted in job state.
+      if (!pending.length && !scanComplete) {
+        const role = roles[roleIndex];
+        if (!role) {
+          scanComplete = true;
+        } else {
+          const page = await listFirestoreDocumentsPage("users", ADMIN_BROADCAST_AUDIENCE_PAGE_SIZE, pageToken, accessToken);
+          pending = page.documents.filter((user) => user.role === role && phase4aSafeSegment(user._id)).map((user) => ({ uid: user._id, role }));
+          pageToken = page.nextPageToken;
+          if (!pageToken) {
+            roleIndex += 1;
+            pageToken = null;
+            if (roleIndex >= roles.length) scanComplete = true;
+          }
+        }
+      }
+
+      const alreadyProcessed = new Set(Array.isArray(job.processedUids) ? job.processedUids : []);
+      pending = pending.filter((recipient) => recipient && phase4aSafeSegment(recipient.uid) && !alreadyProcessed.has(recipient.uid));
+      const batch = pending.splice(0, ADMIN_BROADCAST_BATCH_SIZE);
+      const users = batch.map((recipient) => ({ _id: recipient.uid, role: recipient.role }));
+      const now = new Date().toISOString();
+      const outcomes = await persistNotificationBatch(users, (user) => ({
+        recipientUid: user._id,
+        eventKey: "admin_broadcast:" + job.broadcastId,
+        type: "admin_broadcast",
+        category: "admin",
+        title: job.title,
+        body: job.message,
+        titleEn: job.title,
+        bodyEn: job.message,
+        target: "notifications",
+        role: user.role,
+        createdAt: now
+      }), accessToken);
+      const delivery = batch.length ? await sendAdminBroadcast(users, job.title, job.message, accessToken, outcomes) : {
+        totalCandidateTokens: 0, validTokensCount: 0, sentCount: 0, acceptedCount: 0,
+        failedCount: 0, invalidTokensCount: 0, staleTokensCount: 0, failureReasons: {}
+      };
+      for (const recipient of batch) alreadyProcessed.add(recipient.uid);
+      const processedCount = (Number(job.processedCount) || 0) + batch.length;
+      const totalUsersMatched = (Number(job.totalUsersMatched) || 0) + batch.length;
+      const hasMore = pending.length > 0 || !scanComplete;
+      const nextStatus = hasMore ? "processing" : "completed";
+      const next = {
+        pendingRecipients: pending,
+        processedUids: Array.from(alreadyProcessed).slice(-5000),
+        roleIndex,
+        pageToken,
+        scanComplete,
+        totalUsersMatched,
+        processedCount,
+        sentCount: (Number(job.sentCount) || 0) + delivery.sentCount,
+        failedCount: (Number(job.failedCount) || 0) + delivery.failedCount,
+        totalCandidateTokens: (Number(job.totalCandidateTokens) || 0) + delivery.totalCandidateTokens,
+        validTokensCount: (Number(job.validTokensCount) || 0) + delivery.validTokensCount,
+        invalidTokensCount: (Number(job.invalidTokensCount) || 0) + delivery.invalidTokensCount,
+        staleTokensCount: (Number(job.staleTokensCount) || 0) + delivery.staleTokensCount,
+        failureReasons: mergeBroadcastFailureReasons(job.failureReasons || {}, delivery.failureReasons),
+        status: nextStatus,
+        hasMore,
+        updatedAt: new Date().toISOString()
+      };
+      await updateFirestoreDocument("admin_broadcast_jobs", job.broadcastId, next, accessToken);
+      await updateFirestoreDocument("admin_broadcast_notifications", job.broadcastId, {
+        totalUsersMatched: next.totalUsersMatched,
+        processedCount: next.processedCount,
+        sentCount: next.sentCount,
+        failedCount: next.failedCount,
+        totalCandidateTokens: next.totalCandidateTokens,
+        validTokensCount: next.validTokensCount,
+        invalidTokensCount: next.invalidTokensCount,
+        staleTokensCount: next.staleTokensCount,
+        failureReasons: next.failureReasons,
+        status: next.status,
+        hasMore,
+        updatedAt: next.updatedAt
+      }, accessToken);
+      return { ...job, ...next };
     }
     __name(sendAdminBroadcast, "sendAdminBroadcast");
     __name2(sendAdminBroadcast, "sendAdminBroadcast");
@@ -6390,32 +6565,49 @@ async function doSendBroadcast(){
   var payload={title:title,message:message,audience:audience};
   if(_bcSourceId){payload.sourceNotificationId=_bcSourceId;payload.resendType="edited";}
   var data=await api("/broadcast-notifications/send",{method:"POST",body:JSON.stringify(payload)});
-  _bcSending=false;
-  _bcSourceId=null;
-  if(sendBtn){sendBtn.disabled=false;sendBtn.textContent=t("broadcastSend");}
-  if(!data){if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=t("connectionError");}return;}
-  if(data.success){
-    if(resultEl){
-      resultEl.style.background="#f0fdf4";resultEl.style.color="var(--success)";
-      resultEl.innerHTML=
-        '<strong>'+t("broadcastResult")+'</strong><br>'+
-        t("broadcastMatched")+': <strong>'+esc(String(data.totalUsersMatched||0))+'</strong><br>'+
-        (lang==="ar"?"\u0627\u0644\u0631\u0645\u0648\u0632 \u0627\u0644\u0645\u0631\u0634\u062D\u0629":"Candidate tokens")+': <strong>'+esc(String(data.totalCandidateTokens||0))+'</strong><br>'+
-        t("broadcastTokens")+': <strong>'+esc(String(data.validTokensCount||0))+'</strong><br>'+
-        t("broadcastSentCount")+': <strong>'+esc(String(data.sentCount||0))+'</strong><br>'+
-        t("broadcastFailed")+': <strong>'+esc(String(data.failedCount||0))+'</strong><br>'+
-        (lang==="ar"?"\u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629/\u0642\u062F\u064A\u0645\u0629":"Invalid/Stale")+': <strong>'+esc(String((data.invalidTokensCount||0)+(data.staleTokensCount||0)))+'</strong><br>'+
-        formatFailureReasons(data.failureReasons);
+  if(!data||!data.success||!data.broadcastId){
+    _bcSending=false; _bcSourceId=null; if(sendBtn)sendBtn.disabled=false;
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=(data&&data.error)||t("connectionError");}
+    return;
+  }
+  var broadcastId=data.broadcastId, progressCalls=0, latest=data;
+  try{
+    while(latest.hasMore!==false && progressCalls<1000){
+      progressCalls++;
+      if(resultEl){resultEl.style.background="#eff6ff";resultEl.style.color="var(--info)";resultEl.textContent=(lang==="ar"?"جاري الإرسال… ":"Sending… ")+String(latest.processedCount||0);}
+      latest=await api("/broadcast-notifications/process",{method:"POST",body:JSON.stringify({broadcastId:broadcastId})});
+      if(!latest||!latest.success)throw new Error((latest&&latest.error)||t("broadcastFailed"));
     }
+    if(latest.hasMore===true)throw new Error(lang==="ar"?"تعذر إكمال الإرسال تلقائيًا؛ يمكنك استكماله لاحقًا":"Broadcast continuation limit reached");
+    if(resultEl){resultEl.style.background="#f0fdf4";resultEl.style.color="var(--success)";resultEl.innerHTML='<strong>'+t("broadcastResult")+'</strong><br>'+t("broadcastMatched")+': <strong>'+esc(String(latest.totalUsersMatched||0))+'</strong><br>'+t("broadcastSentCount")+': <strong>'+esc(String(latest.sentCount||0))+'</strong><br>'+t("broadcastFailed")+': <strong>'+esc(String(latest.failedCount||0))+'</strong><br>'+formatFailureReasons(latest.failureReasons);}
     if(document.getElementById("bc-title"))document.getElementById("bc-title").value="";
     if(document.getElementById("bc-message"))document.getElementById("bc-message").value="";
     if(document.getElementById("bc-audience"))document.getElementById("bc-audience").value="";
     toast(t("broadcastResult"));
-    setTimeout(function(){navigate("notifications");},600);
-  }else{
-    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=data.error||t("broadcastFailed");}
-    toast(data.error||t("broadcastFailed"),"error");
+    if(typeof loadBroadcastHistory==="function")loadBroadcastHistory();
+  }catch(e){
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.innerHTML=esc(e.message||t("broadcastFailed"))+"<br><button class=\"btn btn-secondary\" style=\"margin-top:8px\" onclick=\"resumeBroadcast('"+esc(broadcastId)+"')\">"+(lang==="ar"?"استكمال الإرسال":"Resume")+"</button>";}
+    toast(e.message||t("broadcastFailed"),"error");
+  }finally{
+    _bcSending=false; _bcSourceId=null; if(sendBtn){sendBtn.disabled=false;sendBtn.textContent=t("broadcastSend");}
   }
+}
+async function resumeBroadcast(broadcastId){
+  if(_bcSending||!broadcastId)return;
+  _bcSending=true;
+  var resultEl=document.getElementById("bc-result"), calls=0, latest={hasMore:true};
+  try{
+    while(latest.hasMore!==false&&calls<1000){
+      calls++;
+      if(resultEl){resultEl.style.background="#eff6ff";resultEl.style.color="var(--info)";resultEl.textContent=(lang==="ar"?"جاري استكمال الإرسال…":"Resuming…");}
+      latest=await api("/broadcast-notifications/process",{method:"POST",body:JSON.stringify({broadcastId:broadcastId})});
+      if(!latest||!latest.success)throw new Error((latest&&latest.error)||t("broadcastFailed"));
+    }
+    if(latest.hasMore===true)throw new Error(lang==="ar"?"تعذر استكمال الإرسال":"Broadcast continuation limit reached");
+    if(resultEl){resultEl.style.background="#f0fdf4";resultEl.style.color="var(--success)";resultEl.textContent=t("broadcastResult");}
+    if(typeof loadBroadcastHistory==="function")loadBroadcastHistory();
+  }catch(e){if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=e.message||t("broadcastFailed");}toast(e.message||t("broadcastFailed"),"error");}
+  finally{_bcSending=false;}
 }
 function formatFailureReasons(reasons){
   if(!reasons||typeof reasons!=="object"||!Object.keys(reasons).length)return "";
@@ -8403,47 +8595,24 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               if (!validAudiences.includes(audience)) {
                 return jsonResponse({ error: "Invalid audience. Must be customer, provider, driver, or all" }, 400);
               }
-              const rolesToQuery = audience === "all" ? ["customer", "provider", "driver"] : [audience];
-              let allMatchedUsers = [];
-              for (const role of rolesToQuery) {
-                const users = await queryFirestore("users", "role", "EQUAL", role, accessToken);
-                allMatchedUsers = allMatchedUsers.concat(users || []);
-              }
-              const totalUsersMatched = allMatchedUsers.length;
-              const now = (/* @__PURE__ */ new Date()).toISOString();
-              const histId = "broadcast_" + Date.now();
-              const notificationOutcomes = await persistNotificationBatch(allMatchedUsers, (user) => ({
-                recipientUid: user._id,
-                eventKey: "admin_broadcast:" + histId,
-                type: "admin_broadcast",
-                category: "admin",
-                title,
-                body: message,
-                titleEn: title,
-                bodyEn: message,
-                target: "notifications",
-                role: user.role,
-                createdAt: now
-              }), accessToken);
-              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken, notificationOutcomes);
-              const histFields = {
-                title,
-                message,
-                audience,
-                totalUsersMatched,
-                ...delivery,
-                createdAt: now,
-                createdBy: "admin"
-              };
-              if (sourceNotificationId) {
-                histFields.sourceNotificationId = sourceNotificationId;
-                histFields.resendType = resendType || "edited";
-              }
-              await createFirestoreDocument("admin_broadcast_notifications", histId, histFields, accessToken);
-              return jsonResponse({ success: true, totalUsersMatched, ...delivery });
+              const job = await createBroadcastJob({ title, message, audience, sourceNotificationId, resendType }, accessToken);
+              return jsonResponse({ success: true, broadcastId: job.broadcastId, status: job.status, hasMore: true, batchSize: ADMIN_BROADCAST_BATCH_SIZE });
             } catch (e) {
               console.error("[Admin] Broadcast send error:", e);
               return jsonResponse({ error: e.message || "Failed to send broadcast" }, 500);
+            }
+          }
+          if (path === "/admin/api/broadcast-notifications/process" && request.method === "POST") {
+            try {
+              const body = await request.json();
+              if (!body?.broadcastId || !phase4aSafeSegment(body.broadcastId)) return jsonResponse({ error: "broadcastId is required" }, 400);
+              const job = await getFirestoreDoc("admin_broadcast_jobs", body.broadcastId, accessToken);
+              if (!job) return jsonResponse({ error: "Broadcast job not found" }, 404);
+              const result = await processBroadcastJob(job, accessToken);
+              return jsonResponse({ success: true, broadcastId: result.broadcastId, status: result.status, hasMore: Boolean(result.hasMore), totalUsersMatched: result.totalUsersMatched || 0, processedCount: result.processedCount || 0, totalCandidateTokens: result.totalCandidateTokens || 0, validTokensCount: result.validTokensCount || 0, sentCount: result.sentCount || 0, failedCount: result.failedCount || 0, invalidTokensCount: result.invalidTokensCount || 0, staleTokensCount: result.staleTokensCount || 0, failureReasons: result.failureReasons || {} });
+            } catch (e) {
+              console.error("[Admin] Broadcast process error:", e);
+              return jsonResponse({ error: e.message || "Failed to process broadcast", retryable: true }, 500);
             }
           }
           const bcDeleteMatch = path.match(/^\/admin\/api\/broadcast-notifications\/([^\/]+)$/);
@@ -8468,41 +8637,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               if (!title || !message || !audience) return jsonResponse({ error: "Original record missing required fields" }, 400);
               const validAudiences = ["customer", "provider", "driver", "all"];
               if (!validAudiences.includes(audience)) return jsonResponse({ error: "Invalid audience in original record" }, 400);
-              const rolesToQuery = audience === "all" ? ["customer", "provider", "driver"] : [audience];
-              let allMatchedUsers = [];
-              for (const role of rolesToQuery) {
-                const users = await queryFirestore("users", "role", "EQUAL", role, accessToken);
-                allMatchedUsers = allMatchedUsers.concat(users || []);
-              }
-              const totalUsersMatched = allMatchedUsers.length;
-              const now = (/* @__PURE__ */ new Date()).toISOString();
-              const newHistId = "broadcast_" + Date.now();
-              const notificationOutcomes = await persistNotificationBatch(allMatchedUsers, (user) => ({
-                recipientUid: user._id,
-                eventKey: "admin_broadcast:" + newHistId,
-                type: "admin_broadcast",
-                category: "admin",
-                title,
-                body: message,
-                titleEn: title,
-                bodyEn: message,
-                target: "notifications",
-                role: user.role,
-                createdAt: now
-              }), accessToken);
-              const delivery = await sendAdminBroadcast(allMatchedUsers, title, message, accessToken, notificationOutcomes);
-              await createFirestoreDocument("admin_broadcast_notifications", newHistId, {
-                title,
-                message,
-                audience,
-                totalUsersMatched,
-                ...delivery,
-                createdAt: now,
-                createdBy: "admin",
-                sourceNotificationId: notifId,
-                resendType: "resend"
-              }, accessToken);
-              return jsonResponse({ success: true, totalUsersMatched, ...delivery });
+              const job = await createBroadcastJob({ title, message, audience, sourceNotificationId: notifId, resendType: "resend" }, accessToken);
+              return jsonResponse({ success: true, broadcastId: job.broadcastId, status: job.status, hasMore: true, batchSize: ADMIN_BROADCAST_BATCH_SIZE });
             } catch (e) {
               console.error("[Admin] Resend notification error:", e);
               return jsonResponse({ error: e.message || "Failed to resend" }, 500);
