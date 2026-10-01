@@ -425,6 +425,28 @@
     }
     __name(listAllComplaints, "listAllComplaints");
     __name2(listAllComplaints, "listAllComplaints");
+    async function listAllVerificationRequests(accessToken) {
+      const requests = [];
+      let pageToken = null;
+      do {
+        let url = `${FIRESTORE_BASE}/verifications?pageSize=300`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const response = await fetch(url, { headers: { "Authorization": `Bearer ${accessToken}` } });
+        if (!response.ok) {
+          if (response.status === 404) return [];
+          throw new Error(`Failed to list verification requests: ${response.status}`);
+        }
+        const data = await response.json();
+        for (const doc of data.documents || []) {
+          const parsed = parseFirestoreDoc(doc);
+          if (parsed) requests.push(parsed);
+        }
+        pageToken = data.nextPageToken || null;
+      } while (pageToken);
+      return requests;
+    }
+    __name(listAllVerificationRequests, "listAllVerificationRequests");
+    __name2(listAllVerificationRequests, "listAllVerificationRequests");
     async function listAllInvoices(accessToken) {
       const invoices = [];
       let pageToken = null;
@@ -5327,6 +5349,7 @@ function initSidebar(){var sb=document.getElementById("sidebar");if(!sb)return;s
 function updateMobilePageName(){var el=document.getElementById("mobile-page-name");if(!el)return;el.textContent=currentPage==="releases"?(lang==="ar"?"إصدارات التطبيق":"App releases"):currentPage==="advertisements"?(lang==="ar"?"الإعلانات":"Advertisements"):t(currentPage)||"";}
 
 function navigate(page){
+  markAdminSectionSeen(page);
   stopReleasePolling();
   stopAdminLivePolling();
   currentPage=page;
@@ -5680,6 +5703,12 @@ function paintUsersTable(){
   filterUsers();
 }
 
+var ADMIN_SEEN_COMPLAINTS_KEY="tabbakheen_admin_seen_complaints_v1",ADMIN_SEEN_VERIFICATIONS_KEY="tabbakheen_admin_seen_verifications_v1";
+function readAdminSeen(key){try{var value=JSON.parse(localStorage.getItem(key)||"[]");return new Set(Array.isArray(value)?value.filter(function(item){return typeof item==="string";}):[]);}catch(e){return new Set();}}
+function writeAdminSeen(key,set){try{localStorage.setItem(key,JSON.stringify(Array.from(set).slice(-1000)));}catch(e){}}
+function rememberAdminItems(kind,items){var key=kind==="complaints"?ADMIN_SEEN_COMPLAINTS_KEY:ADMIN_SEEN_VERIFICATIONS_KEY;var seen=readAdminSeen(key);(items||[]).forEach(function(item){if(item&&item.token)seen.add(item.token);});writeAdminSeen(key,seen);}
+function unseenAdminItems(kind,items){var key=kind==="complaints"?ADMIN_SEEN_COMPLAINTS_KEY:ADMIN_SEEN_VERIFICATIONS_KEY;var seen=readAdminSeen(key);return(items||[]).filter(function(item){return item&&item.token&&!seen.has(item.token);});}
+function markAdminSectionSeen(page){var attention=adminLiveState.data&&adminLiveState.data.attention||{};if(page==="complaints")rememberAdminItems("complaints",attention.complaints);if(page==="verification")rememberAdminItems("verifications",attention.verification);}
 var adminLiveState={timer:null,inFlight:false,controller:null,epoch:0,lastSignature:"",lastUpdatedAt:0,visibilityBound:false,data:null};
 function adminLiveSignature(data){return JSON.stringify(data||{});}
 function stopAdminLivePolling(){
@@ -5696,10 +5725,13 @@ function setLiveBadge(id,count,label){
 }
 function paintAdminLiveSummary(data){
   var s=data&&data.stats||{},r=data&&data.releases||{},p=data&&data.pending||{};
+  var attention=data&&data.attention||{};
+  if(currentPage==="complaints")rememberAdminItems("complaints",attention.complaints);
+  if(currentPage==="verification")rememberAdminItems("verifications",attention.verification);
   ["totalUsers","customers","providers","drivers","providersInTrial","driversInTrial","activeSubscriptions","verifiedAccounts"].forEach(function(key){var el=document.getElementById("live-stat-"+key);if(el){var value=el.querySelector(".value");if(value)value.textContent=String(s[key]||0);}});
   ["CURRENT","UPDATE_REQUIRED","UNKNOWN"].forEach(function(key){var el=document.getElementById("live-release-"+key);if(el)el.textContent=String(r[key]||0);});
-  setLiveBadge("nav-complaints",p.complaints,"بلاغات قيد المراجعة");
-  setLiveBadge("nav-verification",p.verification,"طلبات توثيق قيد المراجعة");
+  setLiveBadge("nav-complaints",unseenAdminItems("complaints",attention.complaints).length,"بلاغات جديدة");
+  setLiveBadge("nav-verification",unseenAdminItems("verifications",attention.verification).length,"طلبات توثيق جديدة");
   var indicator=document.getElementById("admin-live-indicator");if(indicator)indicator.textContent="● يتم التحديث تلقائيًا · آخر تحديث: الآن";
 }
 function scheduleAdminLivePolling(epoch){
@@ -5710,7 +5742,7 @@ function scheduleAdminLivePolling(epoch){
 async function refreshAdminLive(silent,epoch){
   if(epoch!==adminLiveState.epoch||adminLiveState.inFlight||document.visibilityState!=="visible")return;
   adminLiveState.inFlight=true;var requestEpoch=adminLiveState.epoch;adminLiveState.controller=new AbortController();
-  try{var data=await api("/live-summary",{signal:adminLiveState.controller.signal});if(requestEpoch!==adminLiveState.epoch||!data||data.success===false)return;var signature=adminLiveSignature({stats:data.stats,releases:data.releases,pending:data.pending});if(signature!==adminLiveState.lastSignature){adminLiveState.data=data;adminLiveState.lastSignature=signature;paintAdminLiveSummary(data);}adminLiveState.lastUpdatedAt=Date.now();}
+  try{var data=await api("/live-summary",{signal:adminLiveState.controller.signal});if(requestEpoch!==adminLiveState.epoch||!data||data.success===false)return;var signature=adminLiveSignature({stats:data.stats,releases:data.releases,pending:data.pending,attention:data.attention});if(signature!==adminLiveState.lastSignature){adminLiveState.data=data;adminLiveState.lastSignature=signature;paintAdminLiveSummary(data);}adminLiveState.lastUpdatedAt=Date.now();}
   catch(e){/* Keep the last good counters and retry on the next cycle. */}
   finally{adminLiveState.controller=null;adminLiveState.inFlight=false;scheduleAdminLivePolling(requestEpoch);}
 }
@@ -7746,10 +7778,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (path === "/admin/api/live-summary" && request.method === "GET") {
             // Bounded, PII-free polling DTO. It intentionally avoids orders,
             // offers, notification bodies, and user lists used by /stats.
-            const [users, versions, complaints] = await Promise.all([
+            const [users, versions, complaints, verificationRequests] = await Promise.all([
               listAllUsers(accessToken),
               listClientVersions(accessToken),
-              listAllComplaints(accessToken)
+              listAllComplaints(accessToken),
+              listAllVerificationRequests(accessToken)
             ]);
             const stats = {
               totalUsers: users.length,
@@ -7762,10 +7795,22 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               verifiedAccounts: users.filter((u) => u.verificationStatus === "verified").length
             };
             const intelligence = releaseIntelligenceForUsers(users, versions);
+            const complaintActivity = complaints.filter((item) => item.complaintStatus === "pending").map((item) => ({ token: String(item._id || item.id || "") + ":" + String(item.createdAt || "") })).filter((item) => item.token.startsWith(":" ) === false).slice(-200);
+            const userById = Object.fromEntries(users.map((user) => [user._id, user]));
+            const verificationActivity = [];
+            for (const request of verificationRequests) {
+              const uid = request._id || "";
+              const user = userById[uid];
+              const crPending = user && user.verificationStatus === "pending_review" && request.crNumber;
+              const freelance = request.freelanceCertificate;
+              const freelancePending = freelance && (!freelance.reviewStatus || freelance.reviewStatus === "pending");
+              if (crPending) verificationActivity.push({ token: "cr:" + uid + ":" + String(request.submittedAt || "") });
+              if (freelancePending) verificationActivity.push({ token: "freelance:" + uid + ":" + String(freelance.submittedAt || "") });
+            }
             return jsonResponse({ success: true, stats, releases: intelligence.counts || {}, pending: {
-              complaints: complaints.filter((item) => item.complaintStatus === "pending").length,
-              verification: users.filter((u) => u.verificationStatus === "pending_review").length
-            } });
+              complaints: complaintActivity.length,
+              verification: verificationActivity.length
+            }, attention: { complaints: complaintActivity, verification: verificationActivity.slice(-200) } });
           }
           if (path === "/admin/api/users" && request.method === "GET") {
             const [users, versions] = await Promise.all([
