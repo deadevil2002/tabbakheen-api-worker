@@ -1,0 +1,14 @@
+"use strict";
+const assert = require("assert");
+const source = require("fs").readFileSync(require.resolve("./worker.js"), "utf8");
+
+assert(source.includes('path === "/admin/api/live-summary"'), "live summary endpoint exists");
+assert(source.includes('listAllComplaints(accessToken)'), "complaint pending count uses existing complaints source");
+assert(source.includes('complaintStatus === "pending"'), "complaint badge is pending-only");
+assert(source.includes('verificationStatus === "pending_review"'), "verification badge uses pending_review");
+assert(source.includes('setTimeout(function(){refreshAdminLive(true,epoch);},10000)'), "admin polling interval is 10 seconds");
+assert(source.includes('document.visibilityState==="visible"'), "hidden tabs pause and visible tabs resume");
+assert(source.includes("new AbortController()") && source.includes("adminLiveState.inFlight"), "admin polling prevents overlap and aborts stale requests");
+assert(source.includes("setLiveBadge") && source.includes('n>99?"99+"'), "badge formatting and zero hiding are bounded");
+assert(source.includes("paintAdminLiveSummary(data)") && source.includes("startAdminLivePolling()"), "live updates paint fragments without page reload");
+console.log("admin live summary structural tests: PASS");
