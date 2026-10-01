@@ -5097,6 +5097,7 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
 .surface-panel{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px;margin-bottom:16px}.surface-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px}.surface-head h2,.surface-head h3{font-size:17px;margin:0}.surface-head p{font-size:12px;color:var(--text2);margin-top:4px}
 .release-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.release-metric{padding:14px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}.release-metric .metric-label{font-size:12px;color:var(--text2);font-weight:600}.release-metric .metric-value{font-size:24px;font-weight:800;margin-top:5px;font-variant-numeric:tabular-nums}.release-metric .metric-note{font-size:11px;color:var(--text3);margin-top:2px}
 .release-metric.current .metric-value{color:var(--success)}.release-metric.supported .metric-value{color:var(--warning)}.release-metric.required .metric-value{color:var(--error)}.release-metric.unknown .metric-value{color:var(--text2)}
+.release-live-indicator{display:inline-flex;align-items:center;gap:6px;color:var(--text2);font-size:12px;white-space:nowrap}.release-live-dot{color:var(--success);font-size:15px;line-height:1}.release-live-separator{color:var(--text3)}
 .status-badge{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:800}.status-badge:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}.status-current{background:#e8f7f0;color:#126a4c}.status-supported{background:#fff5dc;color:#8b5b09}.status-required{background:#fdecee;color:#a72f3a}.status-unknown{background:#eef1f5;color:#5e6b7e}
 .progress-track{height:9px;border-radius:99px;background:#e9edf3;overflow:hidden}.progress-fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--orange),#f5a25d)}.progress-meta{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--text2);margin-bottom:7px}.readiness-layout{display:grid;grid-template-columns:minmax(240px,.8fr) minmax(0,1.2fr);gap:18px;align-items:center}.readiness-score{font-size:34px;font-weight:850;color:var(--navy);font-variant-numeric:tabular-nums}.readiness-state{display:inline-flex;margin-top:8px;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:800}.readiness-state.ready{background:#e8f7f0;color:#126a4c}.readiness-state.not-ready{background:#fdecee;color:#a72f3a}
 .distribution-list{display:grid;gap:10px}.distribution-row{display:grid;grid-template-columns:90px minmax(110px,1fr) 52px 120px;gap:10px;align-items:center;font-size:12px}.distribution-version{font-weight:800}.distribution-platforms{color:var(--text2);text-align:end}.distribution-count{font-variant-numeric:tabular-nums;font-weight:700}
@@ -5232,6 +5233,80 @@ var TOKEN=sessionStorage.getItem("tbk_admin_token");
 var currentPage="dashboard";
 var allUsers=[];
 var releaseIntelligence={counts:{CURRENT:0,UPDATE_REQUIRED:0,UNKNOWN:0},distribution:{},totalUsers:0,currentVersion:"1.0.6",adoptionPercent:0};
+var releasePolling={timer:null,ageTimer:null,inFlight:false,controller:null,epoch:0,lastSignature:"",lastUpdatedAt:0,visibilityBound:false};
+function releaseDataSignature(data){
+  return JSON.stringify({counts:data&&data.counts||{},distribution:data&&data.distribution||{},totalUsers:data&&data.totalUsers||0,currentVersion:data&&data.currentVersion||"",users:(data&&data.users||[]).map(function(u){var r=u.releaseIntelligence||{};return [u._id||"",r.appVersion||"",r.classification||"UNKNOWN"];})});
+}
+function releaseLiveIndicator(){
+  var el=document.getElementById("release-live-indicator");
+  if(!el)return;
+  var text=releasePolling.lastUpdatedAt&&Date.now()-releasePolling.lastUpdatedAt>=10000?"منذ 10 ثوانٍ":"الآن";
+  el.innerHTML='<span class="release-live-dot" aria-hidden="true">●</span><span>تحديث تلقائي</span><span class="release-live-separator">·</span><span>آخر تحديث: '+text+'</span>';
+}
+function stopReleasePolling(){
+  releasePolling.epoch++;
+  if(releasePolling.timer){clearTimeout(releasePolling.timer);releasePolling.timer=null;}
+  if(releasePolling.ageTimer){clearTimeout(releasePolling.ageTimer);releasePolling.ageTimer=null;}
+  if(releasePolling.controller){try{releasePolling.controller.abort();}catch(e){}releasePolling.controller=null;}
+  releasePolling.inFlight=false;
+}
+function scheduleReleaseLiveAge(epoch){
+  if(releasePolling.ageTimer)clearTimeout(releasePolling.ageTimer);
+  if(!releasePolling.lastUpdatedAt)return;
+  releasePolling.ageTimer=setTimeout(function(){
+    releasePolling.ageTimer=null;
+    if(epoch===releasePolling.epoch&&document.visibilityState==="visible"&&(currentPage==="releases"||currentPage==="users"))releaseLiveIndicator();
+  },10000);
+}
+function scheduleReleasePolling(epoch){
+  if(epoch!==releasePolling.epoch||document.visibilityState!=="visible"||(currentPage!=="releases"&&currentPage!=="users"))return;
+  if(releasePolling.timer)clearTimeout(releasePolling.timer);
+  releasePolling.timer=setTimeout(function(){releaseRefresh(true,epoch);},10000);
+}
+async function releaseRefresh(silent,epoch){
+  if(epoch!==releasePolling.epoch||releasePolling.inFlight||document.visibilityState!=="visible"||(currentPage!=="releases"&&currentPage!=="users"))return;
+  releasePolling.inFlight=true;
+  var requestEpoch=releasePolling.epoch;
+  releasePolling.controller=new AbortController();
+  try{
+    var data=await api("/users",{signal:releasePolling.controller.signal});
+    if(requestEpoch!==releasePolling.epoch||!data||data.success===false)return;
+    var signature=releaseDataSignature(data);
+    if(signature!==releasePolling.lastSignature){
+      allUsers=data.users||[];
+      setReleaseIntelligence(data);
+      releasePolling.lastSignature=signature;
+      if(currentPage==="releases")paintReleaseIntelligence();
+      if(currentPage==="users")paintUsersTable();
+    }
+    releasePolling.lastUpdatedAt=Date.now();
+    releaseLiveIndicator();
+    scheduleReleaseLiveAge(requestEpoch);
+  }catch(e){
+    /* Silent polling keeps the last known good data and retries next cycle. */
+  }finally{
+    releasePolling.controller=null;
+    releasePolling.inFlight=false;
+    scheduleReleasePolling(requestEpoch);
+  }
+}
+function startReleasePolling(){
+  stopReleasePolling();
+  if(currentPage!=="releases"&&currentPage!=="users")return;
+  if(!releasePolling.visibilityBound){
+    document.addEventListener("visibilitychange",function(){
+      if(currentPage!=="releases"&&currentPage!=="users")return;
+      if(document.visibilityState==="visible"){releaseRefresh(true,releasePolling.epoch);scheduleReleasePolling(releasePolling.epoch);}
+      else if(releasePolling.timer){clearTimeout(releasePolling.timer);releasePolling.timer=null;}
+    });
+    releasePolling.visibilityBound=true;
+  }
+  releasePolling.lastSignature=releaseDataSignature({counts:releaseIntelligence.counts,distribution:releaseIntelligence.distribution,totalUsers:releaseIntelligence.totalUsers,currentVersion:releaseIntelligence.currentVersion,users:allUsers});
+  releasePolling.lastUpdatedAt=Date.now();
+  releaseLiveIndicator();
+  scheduleReleaseLiveAge(releasePolling.epoch);
+  scheduleReleasePolling(releasePolling.epoch);
+}
 var allOrders=[];
 var allOffers=[];
 var allInvoices=[];
@@ -5307,6 +5382,7 @@ function initSidebar(){var sb=document.getElementById("sidebar");if(!sb)return;s
 function updateMobilePageName(){var el=document.getElementById("mobile-page-name");if(!el)return;el.textContent=currentPage==="releases"?(lang==="ar"?"إصدارات التطبيق":"App releases"):currentPage==="advertisements"?(lang==="ar"?"الإعلانات":"Advertisements"):t(currentPage)||"";}
 
 function navigate(page){
+  stopReleasePolling();
   currentPage=page;
   document.querySelectorAll(".nav-item[data-page]").forEach(function(el){el.classList.toggle("active",el.dataset.page===page);});
   if(isMobile()){forceSidebarClosed();}else{closeSidebar();}
@@ -5611,7 +5687,7 @@ async function renderUsers(c){
   allUsers=data.users||[];
   setReleaseIntelligence(data);
   var versions=knownReleaseVersions();
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">إدارة المستخدمين</div><h1 class="page-title">'+t("users")+' <span class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">إدارة الحسابات ومعرفة إصدار التطبيق المسجل لكل مستخدم.</p></div></div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">إدارة المستخدمين</div><h1 class="page-title">'+t("users")+' <span id="users-count" class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">إدارة الحسابات ومعرفة إصدار التطبيق المسجل لكل مستخدم.</p></div></div>'+
     '<div class="filters">'+
     '<select id="f-role" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
     '<select id="f-status" onchange="filterUsers()"><option value="">'+t("allStatus")+'</option><option value="active">'+t("active")+'</option><option value="trial">'+t("trial")+'</option><option value="suspended">'+t("suspend")+'</option><option value="disabled">'+t("disabled")+'</option></select>'+
@@ -5621,6 +5697,7 @@ async function renderUsers(c){
     '</div>'+
     '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>إصدار التطبيق</th><th>حالة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div>';
   filterUsers();
+  startReleasePolling();
 }
 
 function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",adoptionPercent:data.adoptionPercent||0};}
@@ -5631,10 +5708,29 @@ function knownReleaseVersions(){var values={};allUsers.forEach(function(u){var v
 
 async function renderReleaseIntelligence(c){
   var data=await api("/users");if(!data)return;allUsers=data.users||[];setReleaseIntelligence(data);
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">ملخص بسيط لإصدار التطبيق المسجل لكل مستخدم. الإصدار الحالي: <span id="release-current-version">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span></p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
+    '<div class="release-grid"><div id="release-metric-total">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+'</div><div id="release-metric-current">'+releaseMetric("CURRENT",(releaseIntelligence.counts||{}).CURRENT||0)+'</div><div id="release-metric-required">'+releaseMetric("UPDATE_REQUIRED",(releaseIntelligence.counts||{}).UPDATE_REQUIRED||0)+'</div><div id="release-metric-unknown">'+releaseMetric("UNKNOWN",(releaseIntelligence.counts||{}).UNKNOWN||0)+'</div><div id="release-metric-adoption">'+releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%")+'</div></div>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد المستخدمين المسجل لكل إصدار من التطبيق.</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>';
+  paintReleaseIntelligence();
+  startReleasePolling();
+}
+function paintReleaseIntelligence(){
   var rc=releaseIntelligence.counts||{};
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">ملخص بسيط لإصدار التطبيق المسجل لكل مستخدم. الإصدار الحالي: '+esc(releaseIntelligence.currentVersion||"1.0.6")+'</p></div><div class="page-actions">'+((rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">إرسال تنبيه جماعي</button>':"")+'</div></div>'+
-    '<div class="release-grid">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+releaseMetric("CURRENT",rc.CURRENT||0)+releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0)+releaseMetric("UNKNOWN",rc.UNKNOWN||0)+releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%")+'</div>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد المستخدمين المسجل لكل إصدار من التطبيق.</p></div></div>'+releaseDistributionHtml()+'</section>';
+  var set=function(id,html){var el=document.getElementById(id);if(el)el.innerHTML=html;};
+  set("release-current-version",esc(releaseIntelligence.currentVersion||"1.0.6"));
+  set("release-metric-total",releaseMetric("TOTAL",releaseIntelligence.totalUsers||0));
+  set("release-metric-current",releaseMetric("CURRENT",rc.CURRENT||0));
+  set("release-metric-required",releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0));
+  set("release-metric-unknown",releaseMetric("UNKNOWN",rc.UNKNOWN||0));
+  set("release-metric-adoption",releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%"));
+  var action=document.getElementById("release-reminder-action");
+  if(action)action.innerHTML=(rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">إرسال تنبيه جماعي</button>':"";
+  set("release-distribution",releaseDistributionHtml());
+  releaseLiveIndicator();
+}
+function paintUsersTable(){
+  var count=document.getElementById("users-count");if(count)count.textContent=allUsers.length;
+  filterUsers();
 }
 
 function releaseDistributionHtml(){var distribution=releaseIntelligence.distribution||{},grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(rows||'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
