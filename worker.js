@@ -6686,7 +6686,11 @@ async function doSendBroadcast(){
     toast(t("broadcastResult"));
     if(typeof loadBroadcastHistory==="function")loadBroadcastHistory();
   }catch(e){
-    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.innerHTML=esc(e.message||t("broadcastFailed"))+"<br><button class=\"btn btn-secondary\" style=\"margin-top:8px\" onclick=\"resumeBroadcast('"+esc(broadcastId)+"')\">"+(lang==="ar"?"استكمال الإرسال":"Resume")+"</button>";}
+    if(resultEl){
+      resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";
+      var resumeButton="<br><button class='btn btn-secondary' style='margin-top:8px' onclick='resumeBroadcast("+String.fromCharCode(34)+esc(broadcastId)+String.fromCharCode(34)+")'>"+(lang==="ar"?"استكمال الإرسال":"Resume")+"</button>";
+      resultEl.innerHTML=esc(e.message||t("broadcastFailed"))+resumeButton;
+    }
     toast(e.message||t("broadcastFailed"),"error");
   }finally{
     _bcSending=false; _bcSourceId=null; if(sendBtn){sendBtn.disabled=false;sendBtn.textContent=t("broadcastSend");}
