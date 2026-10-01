@@ -363,6 +363,16 @@
     }
     __name(listAllUsers, "listAllUsers");
     __name2(listAllUsers, "listAllUsers");
+    async function listAllCollectionDocuments(collectionId, accessToken) {
+      const documents = [];
+      let pageToken = null;
+      do {
+        const page = await listFirestoreDocumentsPage(collectionId, 300, pageToken, accessToken);
+        documents.push(...page.documents);
+        pageToken = page.nextPageToken;
+      } while (pageToken);
+      return documents;
+    }
     async function listAllOrders(accessToken) {
       const orders = [];
       let pageToken = null;
@@ -3611,6 +3621,58 @@
       }, accessToken);
       return { ...job, ...next };
     }
+    async function getPushHealthDiagnostics(accessToken) {
+      const [users, privateDevices, jobs] = await Promise.all([
+        listAllUsers(accessToken),
+        listAllCollectionDocuments("private_devices", accessToken),
+        listFirestoreDocumentsPage("admin_broadcast_jobs", 50, null, accessToken)
+      ]);
+      const userCounts = { total: users.length, customers: 0, providers: 0, drivers: 0 };
+      const legacy = { pushEnabled: 0, tokenPresent: 0, validExpoToken: 0 };
+      for (const user of users) {
+        if (user.role === "customer") userCounts.customers++;
+        else if (user.role === "provider") userCounts.providers++;
+        else if (user.role === "driver") userCounts.drivers++;
+        if (user.pushNotificationsEnabled === true) legacy.pushEnabled++;
+        const token = typeof user.expoPushToken === "string" ? user.expoPushToken.trim() : "";
+        if (token) legacy.tokenPresent++;
+        if (isExpoPushToken(token)) legacy.validExpoToken++;
+      }
+      const privateStats = { documents: privateDevices.length, pushEnabled: 0, tokenPresent: 0, validExpoToken: 0, nullToken: 0, invalidToken: 0 };
+      for (const device of privateDevices) {
+        if (device.pushNotificationsEnabled === true) privateStats.pushEnabled++;
+        const token = typeof device.expoPushToken === "string" ? device.expoPushToken.trim() : "";
+        if (token) {
+          privateStats.tokenPresent++;
+          if (isExpoPushToken(token)) privateStats.validExpoToken++;
+          else privateStats.invalidToken++;
+        } else if (device.expoPushToken === null || device.expoPushToken === undefined || device.expoPushToken === "") privateStats.nullToken++;
+      }
+      const latest = (jobs.documents || []).filter((job) => job && job.createdAt).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0] || null;
+      return {
+        success: true,
+        users: userCounts,
+        privateDevices: privateStats,
+        legacyUsers: legacy,
+        latestBroadcast: {
+          broadcastIdPresent: !!latest?._id,
+          status: typeof latest?.status === "string" ? latest.status : "",
+          audience: typeof latest?.audience === "string" ? latest.audience : "",
+          processedCount: Number.isFinite(Number(latest?.processedCount)) ? Number(latest.processedCount) : 0,
+          totalUsersMatched: Number.isFinite(Number(latest?.totalUsersMatched)) ? Number(latest.totalUsersMatched) : 0,
+          totalCandidateTokens: Number.isFinite(Number(latest?.totalCandidateTokens)) ? Number(latest.totalCandidateTokens) : 0,
+          validTokensCount: Number.isFinite(Number(latest?.validTokensCount)) ? Number(latest.validTokensCount) : 0,
+          sentCount: Number.isFinite(Number(latest?.sentCount)) ? Number(latest.sentCount) : 0,
+          failedCount: Number.isFinite(Number(latest?.failedCount)) ? Number(latest.failedCount) : 0,
+          hasMore: latest?.hasMore === true
+        },
+        registration: {
+          privateDeviceReadsSupported: typeof getFirestoreSnapshot === "function",
+          legacyFallbackEnabled: typeof getUserPushToken === "function",
+          deviceRegisterEndpointPresent: true
+        }
+      };
+    }
     __name(sendAdminBroadcast, "sendAdminBroadcast");
     __name2(sendAdminBroadcast, "sendAdminBroadcast");
     async function getPrivateDeviceToken(uid, accessToken) {
@@ -6529,6 +6591,8 @@ async function renderNotifications(c){
     '<select id="bc-audience" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px"><option value="">-- '+t("broadcastAudience")+' --</option>'+optHtml+'</select></div>'+
     '<div id="bc-result" style="display:none;padding:12px;border-radius:8px;margin-bottom:12px"></div>'+
     '<button id="bc-send-btn" class="btn btn-orange" onclick="confirmBroadcast()">'+t("broadcastSend")+'</button>'+
+    ' <button id="push-health-btn" class="btn btn-secondary" onclick="diagnosePushHealth()">فحص حالة الإشعارات</button>'+
+    '<div id="push-health-result" style="display:none;padding:12px;border-radius:8px;margin-top:12px"></div>'+
     '</div>'+
     '<div class="settings-section">'+
     '<h3>'+t("broadcastHistory")+'</h3>'+
@@ -6548,6 +6612,23 @@ async function renderNotifications(c){
     '<tbody>'+(histRows||'<tr><td colspan="10" class="empty">'+t("noBroadcastHistory")+'</td></tr>')+'</tbody>'+
     '</table></div>'+
     '</div>';
+}
+async function diagnosePushHealth(){
+  var el=document.getElementById("push-health-result"),btn=document.getElementById("push-health-btn");
+  if(el){el.style.display="block";el.style.background="#eff6ff";el.style.color="var(--info)";el.textContent="جاري الفحص…";}
+  if(btn)btn.disabled=true;
+  try{
+    var data=await api("/push-health");
+    if(!data||!data.success)throw new Error((data&&data.error)||"تعذر فحص حالة الإشعارات");
+    var u=data.users||{},p=data.privateDevices||{},l=data.legacyUsers||{},b=data.latestBroadcast||{};
+    if(el){el.style.background="#f8fafc";el.style.color="var(--text)";el.innerHTML=
+      '<strong>حالة الإشعارات</strong><br>'+
+      'المستخدمون: '+esc(String(u.total||0))+' (عملاء '+esc(String(u.customers||0))+', مقدمو خدمة '+esc(String(u.providers||0))+', سائقون '+esc(String(u.drivers||0))+')<br>'+
+      'الأجهزة الخاصة: '+esc(String(p.documents||0))+'، مفعلة '+esc(String(p.pushEnabled||0))+'، رموز صالحة '+esc(String(p.validExpoToken||0))+'، بدون رمز '+esc(String(p.nullToken||0))+'<br>'+
+      'الرموز القديمة الصالحة: '+esc(String(l.validExpoToken||0))+'<br>'+
+      'آخر Broadcast: '+esc(String(b.status||"-"))+'، تمت معالجة '+esc(String(b.processedCount||0))+' من '+esc(String(b.totalUsersMatched||0))+'، مرشحون '+esc(String(b.totalCandidateTokens||0))+'، صالحون '+esc(String(b.validTokensCount||0))+'، أرسل '+esc(String(b.sentCount||0))+'، فشل '+esc(String(b.failedCount||0));}
+  }catch(e){if(el){el.style.background="#fef2f2";el.style.color="var(--error)";el.textContent=e.message||"تعذر الفحص";}}
+  finally{if(btn)btn.disabled=false;}
 }
 function confirmBroadcast(){
   var title=document.getElementById("bc-title")?document.getElementById("bc-title").value.trim():"";
@@ -8601,6 +8682,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               return jsonResponse({ success: true, history });
             } catch (e) {
               return jsonResponse({ error: e.message }, 500);
+            }
+          }
+          if (path === "/admin/api/push-health" && request.method === "GET") {
+            try {
+              return jsonResponse(await getPushHealthDiagnostics(accessToken));
+            } catch (e) {
+              console.error("[Admin] Push health diagnostics error:", e && e.message ? e.message : e);
+              return jsonResponse({ error: "Push health diagnostics unavailable" }, 500);
             }
           }
           if (path === "/admin/api/broadcast-notifications/send" && request.method === "POST") {
