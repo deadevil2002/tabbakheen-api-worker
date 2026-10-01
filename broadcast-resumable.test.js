@@ -4,6 +4,7 @@ const fs = require("fs");
 const source = fs.readFileSync(require.resolve("./worker.js"), "utf8");
 
 assert(source.includes("const ADMIN_BROADCAST_BATCH_SIZE = 3"), "broadcast batch is conservatively bounded");
+assert(source.includes("persistBroadcastNotificationBatch"), "broadcast CAS retries have a separate bounded budget");
 assert(source.includes("const ADMIN_BROADCAST_AUDIENCE_PAGE_SIZE = 25"), "audience scan page is bounded");
 assert(source.includes('listFirestoreDocumentsPage("users"'), "broadcast scans users with page tokens");
 assert(source.includes('path === "/admin/api/broadcast-notifications/process"'), "continuation endpoint exists");
@@ -23,8 +24,8 @@ assert(!source.slice(sendStart, sendEnd).includes('navigate("notifications");'),
 // auth overhead, three recipients with three notification reads, one commit
 // plus one bounded CAS retry, two token lookups, one Expo request, and two job
 // history updates.
-const worstCase = 1 + 1 + 1 + 1 + (3 * (3 + 2 + 2)) + 2;
+const worstCase = 1 + 1 + 1 + 1 + (3 * (3 * 2 + 2 + 2)) + 2;
 assert(worstCase < 50, `worst-case subrequests ${worstCase} leaves headroom`);
-assert(worstCase <= 35, "budget remains conservative even with one retry headroom");
+assert(worstCase <= 40, "budget remains conservative even with one retry headroom");
 
 console.log(`broadcast resumable structural tests: PASS (worst-case ${worstCase} subrequests)`);

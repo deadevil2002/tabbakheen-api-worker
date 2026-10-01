@@ -2050,6 +2050,25 @@
       }
       return results;
     }
+    // Broadcast jobs use a separate, explicitly bounded CAS retry budget. The
+    // general notification helper allows four retries for interactive writes;
+    // allowing that budget for three recipients could cross the 50-subrequest
+    // Free-plan ceiling. Two attempts retain race safety while staying bounded.
+    async function persistBroadcastNotificationBatch(users, makeInput, accessToken) {
+      const unique = [...new Map((Array.isArray(users) ? users : []).filter((user) => user && phase4aSafeSegment(user._id || user.uid)).map((user) => [user._id || user.uid, user])).values()];
+      const results = /* @__PURE__ */ new Map();
+      for (const user of unique) {
+        let outcome;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const prepared = await prepareNotificationCreate(makeInput(user), accessToken);
+          if (prepared.existing || prepared.skipped) { outcome = prepared; break; }
+          if (await phase4aCommit(prepared.writes, accessToken)) { outcome = { ...prepared, created: true }; break; }
+        }
+        if (!outcome) throw new Error("Broadcast notification state changed; retry");
+        results.set(user._id || user.uid, outcome);
+      }
+      return results;
+    }
     // Cloudflare Free plan has a 50-subrequest ceiling. A broadcast recipient
     // can require notification reads/commit, token lookup and one Expo call;
     // three recipients leaves conservative headroom for auth, job and history
@@ -3534,7 +3553,7 @@
       const batch = pending.splice(0, ADMIN_BROADCAST_BATCH_SIZE);
       const users = batch.map((recipient) => ({ _id: recipient.uid, role: recipient.role }));
       const now = new Date().toISOString();
-      const outcomes = await persistNotificationBatch(users, (user) => ({
+      const outcomes = await persistBroadcastNotificationBatch(users, (user) => ({
         recipientUid: user._id,
         eventKey: "admin_broadcast:" + job.broadcastId,
         type: "admin_broadcast",
