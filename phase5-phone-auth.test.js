@@ -115,7 +115,7 @@ global.fetch = async (url, init = {}) => {
     const documents = [...docs.entries()].filter(([path]) => path.startsWith(rawPath + "/")).map(([path, record]) => firestoreDoc(path, record));
     return response({ documents });
   }
-  if (/^(?:order_messages\/[^/]+\/messages|user_notifications\/[^/]+\/items|notification_unread\/[^/]+\/items)$/.test(rawPath)) {
+  if (/^(?:order_messages\/[^/]+\/messages|user_notifications\/[^/]+\/items|notification_unread\/[^/]+\/items|client_installations\/[^/]+\/devices)$/.test(rawPath)) {
     const pageSize = Number(new URLSearchParams(query).get("pageSize") || 300);
     const offset = Number(new URLSearchParams(query).get("pageToken") || 0);
     const all = [...docs.entries()]
@@ -319,6 +319,8 @@ function assertStoreSubscriptionRequired(profile) {
   put("user_notifications/delete-me/items/notification-1", { recipientUid: "delete-me", createdAt: now() });
   put("notification_unread/delete-me/items/notification-1", { notificationId: "notification-1", category: "order", createdAt: now() });
   put("notification_summaries/delete-me", { totalUnread: 1, ordersUnread: 1 });
+  put("client_installations/delete-me/devices/123e4567-e89b-42d3-a456-426614174000", { installationId: "123e4567-e89b-42d3-a456-426614174000", createdAt: now() });
+  put("client_installation_summaries/delete-me", { uid: "delete-me", devices: [] });
   put("account_deletion_requests/delete-me", {
     status: "in_progress", executionLeaseOwner: "owner", executionLeaseUntil: "2099-01-01T00:00:00.000Z",
     cleanupManifest: { remainingOfferIds: [], certificateDeleted: true, phoneIndexKey: deletionKey, phoneIndexDeleted: false, userDeleted: false, verificationDeleted: false }
@@ -329,6 +331,8 @@ function assertStoreSubscriptionRequired(profile) {
   assert.equal(docs.has("user_notifications/delete-me/items/notification-1"), false);
   assert.equal(docs.has("notification_unread/delete-me/items/notification-1"), false);
   assert.equal(docs.has("notification_summaries/delete-me"), false);
+  assert.equal(docs.has("client_installations/delete-me/devices/123e4567-e89b-42d3-a456-426614174000"), false);
+  assert.equal(docs.has("client_installation_summaries/delete-me"), false);
 
   // Privacy separation tests invoke the actual Worker handlers (not a
   // parallel authorization model). A customer may only obtain the assigned
