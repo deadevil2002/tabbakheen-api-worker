@@ -2866,6 +2866,38 @@
         return normalizeDeliveryPricing(null);
       }
     }
+    // Legacy-only compatibility for deployed clients. Their quote/finalize routes accepted
+    // missing coordinates with zero distance and base-only fee; keep this until the store
+    // force-update and Final Rules cutover. V2 must use calculateDeliveryPricing instead.
+    async function calculateLegacyDeliveryPricing(order, accessToken, route) {
+      let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
+      try {
+        const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+        if (settings && settings.deliveryPricing) pricing = { ...pricing, ...settings.deliveryPricing };
+      } catch (error) {
+        console.log(route === "quote" ? "[Worker] Could not load pricing for quote:" : "[Worker] Could not load delivery pricing, using defaults:", error.message);
+      }
+      const providerLat = order.providerLat;
+      const providerLng = order.providerLng;
+      const customerLat = order.customerLat;
+      const customerLng = order.customerLng;
+      let deliveryDistanceKm = 0;
+      let deliveryFee = pricing.baseFee || 5;
+      if (providerLat && providerLng && customerLat && customerLng) {
+        const R = 6371;
+        const dLat = (customerLat - providerLat) * Math.PI / 180;
+        const dLng = (customerLng - providerLng) * Math.PI / 180;
+        const a = route === "quote"
+          ? Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2)
+          : Math.sin(dLat / 2) ** 2 + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        deliveryDistanceKm = route === "quote" ? Math.round(R * c * 10) / 10 : Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 10) / 10;
+        deliveryFee = Math.round((pricing.baseFee || 5) + deliveryDistanceKm * (pricing.perKmInsideCity || 2));
+        if (pricing.minFee && deliveryFee < pricing.minFee) deliveryFee = pricing.minFee;
+        if (pricing.maxFee && deliveryFee > pricing.maxFee) deliveryFee = pricing.maxFee;
+      }
+      return { deliveryDistanceKm, deliveryFee };
+    }
     async function saveCustomerDeliveryPreference(uid, preference, accessToken, deletionFence, existingSnapshot) {
       const fields = { ...preference, schemaVersion: 1 };
       return phase4aCommit([{
@@ -10232,10 +10264,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "unauthorized", error: "Unauthorized" }, 401);
           }
           const body = await request.json();
-          const { orderId, method, pricingVersion: requestedPricingVersion } = body;
-          if (requestedPricingVersion !== void 0 && (typeof requestedPricingVersion !== "string" || requestedPricingVersion.length > 80)) {
-            return jsonResponse({ success: false, code: "invalid_request", error: "Invalid pricingVersion" }, 400);
-          }
+          const { orderId, method } = body;
           if (!orderId || !method || !["self_pickup", "driver"].includes(method)) {
             return jsonResponse({ success: false, code: "invalid_request", error: "Missing or invalid orderId/method" }, 400);
           }
@@ -10252,8 +10281,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               deliveryFee: order.deliveryFee || 0,
               totalAmount: order.totalAmount || order.priceSnapshot || 0,
               deliveryDistanceKm: order.deliveryDistanceKm || 0,
-              deliveryQuoteId: order.deliveryQuoteId || void 0,
-              pricingVersion: order.deliveryPricingVersion || void 0
+              deliveryQuoteId: order.deliveryQuoteId || void 0
             });
           }
           if (order.driverUid || order.deliveryMethod || order.deliveryStatus || order.status !== "ready_for_pickup") {
@@ -10280,10 +10308,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             responseData = { deliveryFee: 0, totalAmount: fields.totalAmount, deliveryDistanceKm: 0 };
             notificationEvent = "self_pickup_selected";
           } else {
-            const pricing = await loadDeliveryPricing(accessToken);
-            const quote = calculateDeliveryPricing(order, pricing);
-            if (!quote.ok) return jsonResponse({ success: false, code: quote.code, error: "Valid provider and customer coordinates are required" }, 422);
-            if (requestedPricingVersion !== void 0 && requestedPricingVersion !== quote.pricingVersion) return jsonResponse({ success: false, code: "STALE_DELIVERY_QUOTE", error: "Delivery pricing changed; request a new quote", pricingVersion: quote.pricingVersion }, 409);
+            const quote = await calculateLegacyDeliveryPricing(order, accessToken, "finalize");
             const quoteId = "dq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
             fields = {
               deliveryMethod: "driver",
@@ -10293,11 +10318,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               totalAmount: (order.priceSnapshot || 0) + quote.deliveryFee,
               deliveryDistanceKm: quote.deliveryDistanceKm,
               deliveryQuoteId: quoteId,
-              deliveryPricingVersion: quote.pricingVersion,
+              deliveryPricingVersion: "v1",
               deliveryStateVersion: nextVersion,
               updatedAt: now
             };
-            responseData = { deliveryFee: quote.deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: quote.deliveryDistanceKm, deliveryQuoteId: quoteId, pricingVersion: quote.pricingVersion };
+            responseData = { deliveryFee: quote.deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: quote.deliveryDistanceKm, deliveryQuoteId: quoteId };
             notificationEvent = "driver_delivery_requested";
           }
           const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
@@ -10328,18 +10353,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           }
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
-          const pricing = await loadDeliveryPricing(accessToken);
-          const quote = calculateDeliveryPricing(order, pricing);
-          if (!quote.ok) return jsonResponse({ success: false, code: quote.code, error: "Valid provider and customer coordinates are required" }, 422);
+          const quote = await calculateLegacyDeliveryPricing(order, accessToken, "quote");
           const priceSnapshot = order.priceSnapshot || 0;
           return Response.json({
             success: true,
             deliveryFee: quote.deliveryFee,
             totalAmount: priceSnapshot + quote.deliveryFee,
             deliveryDistanceKm: quote.deliveryDistanceKm,
-            subtotal: priceSnapshot,
-            pricingVersion: quote.pricingVersion,
-            quotedAt: new Date().toISOString()
+            subtotal: priceSnapshot
           }, {
             headers: { "Access-Control-Allow-Origin": "*" }
           });

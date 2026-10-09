@@ -27,6 +27,8 @@ const availabilityRoute = sourceBetween('if (path === "/drivers/availability-v2"
 const discoveryRoute = sourceBetween('if (path === "/deliveries/available-v2"', 'if (path === "/drivers/availability"');
 const finalizeRoute = sourceBetween('if (path === "/finalize-delivery"', 'if (path === "/delivery-quote"');
 const quoteRoute = sourceBetween('if (path === "/delivery-quote"', 'return Response.json({ success: false, error: "Not found"');
+const quoteV2Route = sourceBetween('if (path === "/delivery-quote-v2"', 'if (path === "/finalize-delivery-v2"');
+const finalizeV2Route = sourceBetween('if (path === "/finalize-delivery-v2"', 'if (path === "/order-delivery-details"');
 
 test("1 non-driver denied", () => assert(locationRoute.includes('auth.user.role !== "driver"')));
 test("2 invalid coordinates denied", () => assert.equal(hooks.validateDriverRuntimeLocationInput({ lat: 99, lng: 46.7, accuracyM: 10 }).code, "DRIVER_LOCATION_INVALID"));
@@ -103,9 +105,12 @@ test("27 matching and fee distances remain distinct", () => {
   assert.equal(dto.driverToPickupDistanceKm, 1);
 });
 
-test("28 quote and finalize use one pricing function", () => {
-  assert(finalizeRoute.includes("calculateDeliveryPricing(order, pricing)"));
-  assert(quoteRoute.includes("calculateDeliveryPricing(order, pricing)"));
+test("28 legacy pricing adapter is isolated from strict V2 pricing", () => {
+  assert(finalizeRoute.includes('calculateLegacyDeliveryPricing(order, accessToken, "finalize")'));
+  assert(quoteRoute.includes('calculateLegacyDeliveryPricing(order, accessToken, "quote")'));
+  assert(quoteV2Route.includes("calculateDeliveryPricing("));
+  assert(!quoteV2Route.includes("calculateLegacyDeliveryPricing("));
+  assert(!finalizeV2Route.includes("calculateLegacyDeliveryPricing("));
 });
 test("29 missing provider coordinates rejected", () => assert.equal(hooks.calculateDeliveryPricing({ customerLat: 24.8, customerLng: 46.8 }, {}).code, "PROVIDER_COORDINATES_REQUIRED"));
 test("30 missing customer coordinates rejected", () => assert.equal(hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7 }, {}).code, "CUSTOMER_COORDINATES_REQUIRED"));
@@ -122,8 +127,12 @@ test("35 pricing version deterministic", () => {
   const b = hooks.deliveryPricingVersion({ perKmInsideCity: 2, baseFee: 5 });
   assert.equal(a, b); assert.match(a, /^delivery-v2-[a-f0-9]{8}$/);
 });
-test("36 stale pricing version rejected for V2", () => assert(finalizeRoute.includes('code: "STALE_DELIVERY_QUOTE"')));
-test("37 legacy finalization remains compatible", () => assert(finalizeRoute.includes("requestedPricingVersion !== void 0 && requestedPricingVersion !== quote.pricingVersion")));
+test("36 stale quote rejected for V2", () => assert(finalizeV2Route.includes('phase4aError("STALE_DELIVERY_QUOTE"')));
+test("37 legacy finalization ignores pricingVersion and preserves v1 storage", () => {
+  assert(!finalizeRoute.includes("requestedPricingVersion"));
+  assert(finalizeRoute.includes('deliveryPricingVersion: "v1"'));
+  assert(!quoteRoute.includes("pricingVersion:"));
+});
 
 test("38 two drivers cannot both win", () => {
   const transition = sourceBetween("async function handleDeliveryTransition", "async function commitOrderAndOutbox");
