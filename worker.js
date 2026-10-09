@@ -3374,6 +3374,23 @@
     async function sendAdminBroadcast(users, title, message, accessToken, notificationOutcomes) {
       const tokenOwners = /* @__PURE__ */ new Map();
       const badgeByToken = /* @__PURE__ */ new Map();
+      const recipientStatuses = /* @__PURE__ */ new Map();
+      for (const user of users) {
+        if (!user?._id) continue;
+        recipientStatuses.set(user._id, {
+          uid: user._id,
+          role: user.role,
+          pushTokenState: "missing",
+          expoTicketStatus: "not_attempted",
+          expoReceiptStatus: "not_applicable",
+          failureCode: ""
+        });
+      }
+      const updateOwners = (token, fields) => {
+        for (const uid of tokenOwners.get(token) || []) {
+          recipientStatuses.set(uid, { ...(recipientStatuses.get(uid) || { uid }), ...fields });
+        }
+      };
       let totalCandidateTokens = 0;
       let invalidTokensCount = 0;
       for (const user of users) {
@@ -3382,8 +3399,10 @@
         totalCandidateTokens++;
         if (!isExpoPushToken(token)) {
           invalidTokensCount++;
+          recipientStatuses.set(user._id, { ...recipientStatuses.get(user._id), pushTokenState: "invalid", failureCode: "InvalidExpoToken" });
           continue;
         }
+        recipientStatuses.set(user._id, { ...recipientStatuses.get(user._id), pushTokenState: "valid" });
         if (!tokenOwners.has(token)) tokenOwners.set(token, []);
         tokenOwners.get(token).push(user._id);
         const badge = notificationOutcomes?.get(user._id)?.summary?.totalUnread;
@@ -3419,18 +3438,22 @@
           }
           if (!expoResp.ok) {
             failedCount += messages.length;
-            incrementReason(failureReasons, "ExpoHTTP" + expoResp.status, expoResult && (expoResult.message || expoResult.error) || "Expo Push API rejected the request");
+            const code = "ExpoHTTP" + expoResp.status;
+            incrementReason(failureReasons, code, expoResult && (expoResult.message || expoResult.error) || "Expo Push API rejected the request");
+            for (const token of tokenChunk) updateOwners(token, { expoTicketStatus: "failed", failureCode: code });
             continue;
           }
           if (!expoResult || !Array.isArray(expoResult.data)) {
             failedCount += messages.length;
             incrementReason(failureReasons, "MalformedExpoResponse", "Expo Push API returned no ticket array");
+            for (const token of tokenChunk) updateOwners(token, { expoTicketStatus: "failed", failureCode: "MalformedExpoResponse" });
             continue;
           }
           for (let i = 0; i < messages.length; i++) {
             const ticket = expoResult.data[i];
             if (ticket && ticket.status === "ok" && typeof ticket.id === "string" && ticket.id.trim().length > 0) {
               sentCount++;
+              updateOwners(tokenChunk[i], { expoTicketStatus: "accepted", expoReceiptStatus: "pending", ticketId: ticket.id, failureCode: "" });
               continue;
             }
             failedCount++;
@@ -3438,6 +3461,7 @@
             const code = malformedSuccess ? "MalformedExpoTicket" : ticket && ticket.details && ticket.details.error || "ExpoTicketError";
             const reason = malformedSuccess ? "Expo returned an accepted ticket without an ID" : ticket && ticket.message || "Expo rejected the push notification";
             incrementReason(failureReasons, code, reason);
+            updateOwners(tokenChunk[i], { expoTicketStatus: "failed", expoReceiptStatus: "not_applicable", failureCode: String(code).slice(0, 80) });
             if (code === "DeviceNotRegistered") {
               staleTokensCount++;
               const owners = tokenOwners.get(tokenChunk[i]) || [];
@@ -3453,10 +3477,12 @@
           if (expoResult.data.length < messages.length) {
             const missing = messages.length - expoResult.data.length;
             incrementReason(failureReasons, "MissingExpoTickets", "Expo returned fewer tickets than submitted messages");
+            for (let i = expoResult.data.length; i < tokenChunk.length; i++) updateOwners(tokenChunk[i], { expoTicketStatus: "failed", failureCode: "MissingExpoTickets" });
           }
         } catch (e) {
           failedCount += messages.length;
           incrementReason(failureReasons, "ExpoNetworkError", e && e.message || "Expo Push API request failed");
+          for (const token of tokenChunk) updateOwners(token, { expoTicketStatus: "failed", failureCode: "ExpoNetworkError" });
         }
       }
       return {
@@ -3467,7 +3493,8 @@
         failedCount,
         invalidTokensCount,
         staleTokensCount,
-        failureReasons
+        failureReasons,
+        recipientStatuses
       };
     }
     function broadcastJobId() {
@@ -3484,6 +3511,116 @@
       }
       return target;
     }
+    async function persistBroadcastRecipientStatuses(broadcastId, batch, outcomes, delivery, accessToken) {
+      if (!phase4aSafeSegment(broadcastId) || !Array.isArray(batch) || !batch.length) return 0;
+      const now = new Date().toISOString();
+      let durableCreatedCount = 0;
+      const writes = [];
+      for (const recipient of batch) {
+        if (!recipient || !phase4aSafeSegment(recipient.uid)) continue;
+        const outcome = outcomes?.get(recipient.uid);
+        const durableNotificationCreated = Boolean(outcome && !outcome.skipped && outcome.notification);
+        if (durableNotificationCreated) durableCreatedCount++;
+        const push = delivery?.recipientStatuses?.get(recipient.uid) || {};
+        const fields = {
+          uid: recipient.uid,
+          role: ["customer", "provider", "driver"].includes(recipient.role) ? recipient.role : null,
+          durableNotificationCreated,
+          notificationId: durableNotificationCreated && phase4aSafeSegment(outcome.id) ? outcome.id : null,
+          pushTokenState: ["missing", "invalid", "valid"].includes(push.pushTokenState) ? push.pushTokenState : "missing",
+          expoTicketStatus: ["not_attempted", "accepted", "failed"].includes(push.expoTicketStatus) ? push.expoTicketStatus : "not_attempted",
+          expoReceiptStatus: ["not_applicable", "pending", "complete", "failed", "stale"].includes(push.expoReceiptStatus) ? push.expoReceiptStatus : "not_applicable",
+          ticketId: typeof push.ticketId === "string" && push.ticketId.length <= 256 ? push.ticketId : null,
+          failureCode: typeof push.failureCode === "string" ? push.failureCode.slice(0, 80) : "",
+          updatedAt: now
+        };
+        writes.push({
+          update: phase4aDoc("admin_broadcast_jobs/" + broadcastId + "/recipients", recipient.uid, fields),
+          updateMask: { fieldPaths: Object.keys(fields) }
+        });
+      }
+      if (writes.length) await phase4aCommit(writes, accessToken);
+      return durableCreatedCount;
+    }
+    async function refreshBroadcastRecipientReceipts(broadcastId, recipients, accessToken) {
+      const pending = (Array.isArray(recipients) ? recipients : []).filter((recipient) => recipient && recipient.expoTicketStatus === "accepted" && recipient.expoReceiptStatus === "pending" && typeof recipient.ticketId === "string" && recipient.ticketId.length <= 256).slice(0, 20);
+      if (!pending.length) return recipients;
+      let response;
+      try {
+        response = await fetch("https://exp.host/--/api/v2/push/getReceipts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({ ids: pending.map((recipient) => recipient.ticketId) })
+        });
+      } catch {
+        return recipients;
+      }
+      if (!response.ok) return recipients;
+      let result;
+      try { result = await response.json(); } catch { return recipients; }
+      const receipts = result && result.data || {};
+      const byUid = new Map(recipients.map((recipient) => [recipient.uid, recipient]));
+      const writes = [];
+      for (const recipient of pending) {
+        const receipt = receipts[recipient.ticketId];
+        if (!receipt) continue;
+        const stale = receipt.status !== "ok" && receipt.details && receipt.details.error === "DeviceNotRegistered";
+        const fields = receipt.status === "ok" ? { expoReceiptStatus: "complete", failureCode: "", updatedAt: new Date().toISOString() } : { expoReceiptStatus: stale ? "stale" : "failed", failureCode: String(receipt.details?.error || "ExpoReceiptError").slice(0, 80), updatedAt: new Date().toISOString() };
+        byUid.set(recipient.uid, { ...recipient, ...fields });
+        writes.push({ update: phase4aDoc("admin_broadcast_jobs/" + broadcastId + "/recipients", recipient.uid, fields), updateMask: { fieldPaths: Object.keys(fields) } });
+      }
+      if (writes.length) await phase4aCommit(writes, accessToken);
+      return recipients.map((recipient) => byUid.get(recipient.uid) || recipient);
+    }
+    function sanitizeBroadcastFailureReasons(reasons) {
+      const result = {};
+      for (const [rawCode, rawItem] of Object.entries(reasons && typeof reasons === "object" ? reasons : {})) {
+        const code = String(rawCode || "UnknownError").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80);
+        const message = String(rawItem?.message || "").replace(/(?:ExponentPushToken|ExpoPushToken)\[[^\]]+\]/g, "[redacted-token]").replace(/\b[a-f0-9]{64}\b/gi, "[redacted-hash]").slice(0, 240);
+        result[code] = { count: Math.max(0, Number(rawItem?.count) || 0), message };
+      }
+      return result;
+    }
+    function broadcastDetailsDto(record, id) {
+      const source = record || {};
+      return {
+        broadcastId: id,
+        createdAt: source.createdAt || null,
+        title: source.title || "",
+        message: source.message || "",
+        audience: source.audience || "",
+        status: source.status || "",
+        totalUsersMatched: Number(source.totalUsersMatched) || 0,
+        processedCount: Number(source.processedCount) || 0,
+        durableNotificationsCreated: Number(source.durableNotificationsCreated) || 0,
+        totalCandidateTokens: Number(source.totalCandidateTokens) || 0,
+        validTokensCount: Number(source.validTokensCount) || 0,
+        sentCount: Number(source.sentCount) || 0,
+        failedCount: Number(source.failedCount) || 0,
+        invalidTokensCount: Number(source.invalidTokensCount) || 0,
+        staleTokensCount: Number(source.staleTokensCount) || 0,
+        failureReasons: sanitizeBroadcastFailureReasons(source.failureReasons)
+      };
+    }
+    async function broadcastRecipientDto(recipient, accessToken) {
+      const uid = recipient && recipient.uid;
+      if (!phase4aSafeSegment(uid)) return null;
+      const [user, notification] = await Promise.all([
+        getFirestoreDoc("users", uid, accessToken),
+        recipient.durableNotificationCreated && phase4aSafeSegment(recipient.notificationId) ? getFirestoreDoc("user_notifications/" + uid + "/items", recipient.notificationId, accessToken) : Promise.resolve(null)
+      ]);
+      return {
+        uid,
+        displayName: typeof user?.displayName === "string" && user.displayName.trim() ? user.displayName.trim().slice(0, 160) : null,
+        role: ["customer", "provider", "driver"].includes(recipient.role) ? recipient.role : null,
+        durableNotificationCreated: recipient.durableNotificationCreated === true,
+        pushTokenState: ["missing", "invalid", "valid"].includes(recipient.pushTokenState) ? recipient.pushTokenState : "missing",
+        expoTicketStatus: ["not_attempted", "accepted", "failed"].includes(recipient.expoTicketStatus) ? recipient.expoTicketStatus : "not_attempted",
+        expoReceiptStatus: ["not_applicable", "pending", "complete", "failed", "stale"].includes(recipient.expoReceiptStatus) ? recipient.expoReceiptStatus : "not_applicable",
+        failureCode: typeof recipient.failureCode === "string" ? recipient.failureCode.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80) : "",
+        readAt: typeof notification?.readAt === "string" && Number.isFinite(new Date(notification.readAt).getTime()) ? notification.readAt : null
+      };
+    }
     async function createBroadcastJob(body, accessToken) {
       const now = new Date().toISOString();
       const id = broadcastJobId();
@@ -3499,6 +3636,7 @@
         processedUids: [],
         totalUsersMatched: 0,
         processedCount: 0,
+        durableNotificationsCreated: 0,
         sentCount: 0,
         failedCount: 0,
         totalCandidateTokens: 0,
@@ -3521,6 +3659,8 @@
         message: fields.message,
         audience: fields.audience,
         totalUsersMatched: 0,
+        processedCount: 0,
+        durableNotificationsCreated: 0,
         sentCount: 0,
         failedCount: 0,
         status: "pending",
@@ -3578,8 +3718,9 @@
       }), accessToken);
       const delivery = batch.length ? await sendAdminBroadcast(users, job.title, job.message, accessToken, outcomes) : {
         totalCandidateTokens: 0, validTokensCount: 0, sentCount: 0, acceptedCount: 0,
-        failedCount: 0, invalidTokensCount: 0, staleTokensCount: 0, failureReasons: {}
+        failedCount: 0, invalidTokensCount: 0, staleTokensCount: 0, failureReasons: {}, recipientStatuses: new Map()
       };
+      const durableCreatedCount = await persistBroadcastRecipientStatuses(job.broadcastId, batch, outcomes, delivery, accessToken);
       for (const recipient of batch) alreadyProcessed.add(recipient.uid);
       const processedCount = (Number(job.processedCount) || 0) + batch.length;
       const totalUsersMatched = (Number(job.totalUsersMatched) || 0) + batch.length;
@@ -3593,6 +3734,7 @@
         scanComplete,
         totalUsersMatched,
         processedCount,
+        durableNotificationsCreated: (Number(job.durableNotificationsCreated) || 0) + durableCreatedCount,
         sentCount: (Number(job.sentCount) || 0) + delivery.sentCount,
         failedCount: (Number(job.failedCount) || 0) + delivery.failedCount,
         totalCandidateTokens: (Number(job.totalCandidateTokens) || 0) + delivery.totalCandidateTokens,
@@ -3608,6 +3750,7 @@
       await updateFirestoreDocument("admin_broadcast_notifications", job.broadcastId, {
         totalUsersMatched: next.totalUsersMatched,
         processedCount: next.processedCount,
+        durableNotificationsCreated: next.durableNotificationsCreated,
         sentCount: next.sentCount,
         failedCount: next.failedCount,
         totalCandidateTokens: next.totalCandidateTokens,
@@ -4660,7 +4803,7 @@
     __name(htmlSecurityHeaders, "htmlSecurityHeaders");
     __name2(htmlSecurityHeaders, "htmlSecurityHeaders");
     function adminContentSecurityPolicy() {
-      return "base-uri 'self'; object-src 'none'; frame-ancestors 'none'";
+      return "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com";
     }
     __name(adminContentSecurityPolicy, "adminContentSecurityPolicy");
     __name2(adminContentSecurityPolicy, "adminContentSecurityPolicy");
@@ -5120,10 +5263,14 @@ ${notes ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>' + (isAr
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Tabbakheen Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--primary:#e8722a;--primary-dark:#c85a18;--bg:#f6f7fb;--sidebar:#111c30;--sidebar-hover:#1d2c47;--card:#fff;--text:#13213a;--text2:#5f6f86;--text3:#8b98aa;--border:#dfe5ee;--success:#16875f;--warning:#c67a12;--error:#c83f49;--info:#3268b2;--orange:#e8722a;--navy:#111c30;--surface:#f9fafc;--radius:14px;--shadow:0 8px 24px rgba(17,28,48,.06)}
-body{font-family:Tahoma,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
+html,body,button,input,select,textarea,table{font-family:"IBM Plex Sans Arabic","Noto Sans Arabic","Segoe UI",Tahoma,sans-serif}
+body{background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
 #login-view{display:flex;align-items:center;justify-content:center;min-height:100vh;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%)}
 .login-card{background:var(--card);border-radius:16px;padding:40px;width:380px;max-width:90vw;box-shadow:0 25px 50px rgba(0,0,0,0.25)}
 .login-logo{text-align:center;margin-bottom:24px}
@@ -5210,31 +5357,6 @@ tr:hover td{background:#f8fafc}
 .toggle input{width:18px;height:18px;accent-color:var(--primary)}
 .settings-section{background:var(--card);border-radius:var(--radius);padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
 .settings-section h3{font-size:16px;font-weight:600;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
-.provider-discovery-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:16px}
-.provider-discovery-copy{max-width:820px}.provider-discovery-copy p{font-size:13px;color:var(--text2);line-height:1.75;margin-top:6px}
-.provider-discovery-badge{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;background:#ecfdf5;color:#047857;font-size:12px;font-weight:700;white-space:nowrap}
-.provider-discovery-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}
-.provider-stat{padding:15px;border:1px solid var(--border);border-radius:12px;background:#fff;cursor:pointer;transition:.15s;text-align:start}
-.provider-stat:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(15,23,42,.06)}
-.provider-stat.selected{outline:2px solid var(--primary);outline-offset:-2px}
-.provider-stat .provider-stat-label{font-size:12px;color:var(--text2);line-height:1.45}
-.provider-stat .provider-stat-value{font-size:28px;font-weight:800;margin-top:6px;line-height:1}
-.provider-stat.success{background:#f0fdf4;border-color:#bbf7d0}.provider-stat.success .provider-stat-value{color:#15803d}
-.provider-stat.warning{background:#fffbeb;border-color:#fde68a}.provider-stat.warning .provider-stat-value{color:#b45309}
-.provider-stat.info{background:#eff6ff;border-color:#bfdbfe}.provider-stat.info .provider-stat-value{color:#1d4ed8}
-.provider-stat.danger{background:#fef2f2;border-color:#fecaca}.provider-stat.danger .provider-stat-value{color:#b91c1c}
-.provider-stat.muted{background:#f8fafc}
-.provider-discovery-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0 10px}
-.provider-reminder-result{display:none;padding:10px 12px;border-radius:8px;font-size:12px;margin-top:8px}
-.provider-reminder-result.show{display:block}.provider-reminder-result.success{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}.provider-reminder-result.error{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}.provider-reminder-result.loading{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
-.provider-discovery-modal{position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(15,23,42,.58);backdrop-filter:blur(4px)}
-.provider-discovery-modal-card{width:min(460px,100%);background:var(--card);border:1px solid rgba(255,255,255,.24);border-radius:20px;padding:24px;box-shadow:0 24px 64px rgba(15,23,42,.3);animation:providerModalIn .18s ease-out}
-.provider-discovery-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.provider-discovery-modal-title{margin:0;font-size:19px;font-weight:800;color:var(--text)}.provider-discovery-modal-close{width:32px;height:32px;border:0;border-radius:10px;background:#f1f5f9;color:var(--text2);font-size:22px;line-height:1;cursor:pointer}.provider-discovery-modal-close:hover{background:#e2e8f0;color:var(--text)}
-.provider-discovery-modal-message{margin:14px 0 0;color:var(--text2);font-size:14px;line-height:1.8}.provider-discovery-modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}.provider-discovery-modal.confirm .provider-discovery-modal-card{border-top:4px solid var(--primary)}.provider-discovery-modal.success .provider-discovery-modal-card{border-top:4px solid var(--success)}.provider-discovery-modal.error .provider-discovery-modal-card{border-top:4px solid var(--error)}
-@keyframes providerModalIn{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
-.provider-radius-box{margin-top:18px;padding:16px;border:1px solid var(--border);border-radius:12px;background:#f8fafc}
-.provider-radius-note{font-size:12px;color:#9a6700;line-height:1.65;margin-top:8px}.provider-discovery-updated{font-size:11px;color:var(--text3);margin-top:8px}
-.provider-list{margin-top:18px;border:1px solid var(--border);border-radius:12px;overflow:hidden}.provider-list-head{padding:12px 14px;background:#f8fafc;display:flex;justify-content:space-between;gap:10px;align-items:center}.provider-list-body{overflow:auto}
 .banner-preview{width:100%;max-width:400px;aspect-ratio:16/7;object-fit:cover;border-radius:8px;border:1px solid var(--border);margin-bottom:12px;background:#f1f5f9}
 .upload-row{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
 .file-input{font-size:13px}
@@ -5288,8 +5410,6 @@ html[dir="rtl"] .drill-close{float:left}
   .stats-grid{grid-template-columns:repeat(2,1fr);gap:10px}
   .filters{flex-direction:column;gap:8px}.filters select,.filters input{width:100%}
   .grid-2{grid-template-columns:1fr}
-  .provider-discovery-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .provider-discovery-actions .btn{flex:1;min-width:180px}
   .detail-grid{grid-template-columns:1fr;gap:10px}
   .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}
   .table-wrap table{min-width:640px}
@@ -5306,9 +5426,6 @@ html[dir="rtl"] .drill-close{float:left}
 }
 @media(max-width:480px){
   .stats-grid{grid-template-columns:1fr;gap:8px}
-  .provider-discovery-grid{grid-template-columns:1fr}
-  .provider-discovery-actions{flex-direction:column;align-items:stretch}
-  .provider-discovery-actions .btn{width:100%;min-width:0}
   .main{padding:10px;padding-top:66px}
   .stat-card .value{font-size:20px}
   .stat-card{padding:14px}
@@ -5442,6 +5559,15 @@ function esc(s){return escapeHtml(s);}
 var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",verification:"\u0627\u0644\u062A\u0648\u062B\u064A\u0642",crVerifications:"\u062A\u0648\u062B\u064A\u0642 \u0627\u0644\u0633\u062C\u0644 \u0627\u0644\u062A\u062C\u0627\u0631\u064A",freelanceRequests:"\u0637\u0644\u0628\u0627\u062A \u0634\u0647\u0627\u062F\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u062D\u0631",certNumber:"\u0631\u0642\u0645 \u0627\u0644\u0634\u0647\u0627\u062F\u0629",submittedAt:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u062A\u0642\u062F\u064A\u0645",reviewStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",approve:"\u0627\u0639\u062A\u0645\u0627\u062F",reject:"\u0631\u0641\u0636",pendingReview:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",verifiedStatus:"\u0645\u0648\u062B\u0651\u0642",unverifiedStatus:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",notVerified:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",viewDocument:"\u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0648\u062B\u064A\u0642\u0629",viewImage:"\u0639\u0631\u0636 \u0627\u0644\u0635\u0648\u0631\u0629",rejectReason:"\u0633\u0628\u0628 \u0627\u0644\u0631\u0641\u0636 (\u062F\u0627\u062E\u0644\u064A)",verificationApproved:"\u062A\u0645 \u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062A\u0648\u062B\u064A\u0642",verificationRejected:"\u062A\u0645 \u0631\u0641\u0636 \u0627\u0644\u062A\u0648\u062B\u064A\u0642",notifyCrVerification:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0648\u062B\u064A\u0642 \u0633\u062C\u0644 \u062A\u062C\u0627\u0631\u064A \u062C\u062F\u064A\u062F",notifyFreelanceRequest:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u0637\u0644\u0628 \u0634\u0647\u0627\u062F\u0629 \u0639\u0645\u0644 \u062D\u0631 \u062C\u062F\u064A\u062F",noVerificationData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u0648\u062B\u064A\u0642",source:"\u0627\u0644\u0645\u0635\u062F\u0631",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",notifications:"\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastTitle:"\u0639\u0646\u0648\u0627\u0646 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastMessage:"\u0646\u0635 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastAudience:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u0633\u062A\u0647\u062F\u0641",audienceCustomers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",audienceProviders:"\u0645\u0642\u062F\u0645\u0648 \u0627\u0644\u062E\u062F\u0645\u0629",audienceDrivers:"\u0645\u0646\u0627\u062F\u064A\u0628 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",audienceAll:"\u0627\u0644\u0643\u0644",broadcastSend:"\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastHistory:"\u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastConfirm:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastConfirmMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u062C\u0645\u064A\u0639 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0645\u062D\u062F\u062F\u064A\u0646.",broadcastResult:"\u0646\u062A\u064A\u062C\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastMatched:"\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0645\u0637\u0627\u0628\u0642\u0648\u0646",broadcastTokens:"\u0631\u0645\u0648\u0632 \u0635\u0627\u0644\u062D\u0629",broadcastSentCount:"\u062A\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastFailed:"\u0641\u0634\u0644 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",noBroadcastHistory:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0633\u062C\u0644 \u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastAudienceLabel:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631",deleteNotif:"\u062D\u0630\u0641",resendNotif:"\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResend:"\u062A\u0639\u062F\u064A\u0644 \u0648\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResendSend:"\u0625\u0631\u0633\u0627\u0644 \u0646\u0633\u062E\u0629 \u0645\u0639\u062F\u0644\u0629",confirmDelete:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u062D\u0630\u0641",confirmDeleteMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u062D\u0630\u0641 \u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0641\u0642\u0637 \u062F\u0648\u0646 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0631\u0633\u0644\u0629.",confirmResend:"\u062A\u0623\u0643\u064A\u062F \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",confirmResendMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u062D\u062F\u062F.",notifDeleted:"\u062A\u0645 \u062D\u0630\u0641 \u0627\u0644\u0633\u062C\u0644",deleteFailed:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0630\u0641",resendSuccess:"\u062A\u0645\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",resendFailed:"\u0641\u0634\u0644\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",providerSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0632\u0648\u062F \u0627\u0644\u062E\u062F\u0645\u0629",driverSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0633\u0627\u0626\u0642",subActive:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0641\u0639\u0651\u0644",subPrice:"\u0633\u0639\u0631 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 (SAR)",subPeriod:"\u0641\u062A\u0631\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",periodWeekly:"\u0623\u0633\u0628\u0648\u0639\u064A",periodMonthly:"\u0634\u0647\u0631\u064A",periodQuarterly:"\u0631\u0628\u0639 \u0633\u0646\u0648\u064A",periodYearly:"\u0633\u0646\u0648\u064A",freeTrialEnabledLabel:"\u0627\u0644\u062A\u062C\u0631\u0628\u0629 \u0627\u0644\u0645\u062C\u0627\u0646\u064A\u0629 \u0645\u0641\u0639\u0651\u0644\u0629",freeTrialTextArLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0639\u0631\u0628\u064A)",freeTrialTextEnLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0625\u0646\u062C\u0644\u064A\u0632\u064A)"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",verification:"Verification",crVerifications:"CR Verification",freelanceRequests:"Freelance Certificate Requests",certNumber:"Certificate #",submittedAt:"Submitted At",reviewStatus:"Review Status",approve:"Approve",reject:"Reject",pendingReview:"Pending Review",verifiedStatus:"Verified",unverifiedStatus:"Unverified",notVerified:"Not Verified",viewDocument:"Verify Document",viewImage:"View Image",rejectReason:"Reject reason (internal)",verificationApproved:"Verification approved",verificationRejected:"Verification rejected",notifyCrVerification:"Notify on new CR verification",notifyFreelanceRequest:"Notify on new freelance request",noVerificationData:"No verification data",source:"Source",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices",notifications:"Notifications",broadcastTitle:"Notification Title",broadcastMessage:"Message",broadcastAudience:"Target Audience",audienceCustomers:"Customers",audienceProviders:"Providers",audienceDrivers:"Drivers",audienceAll:"All",broadcastSend:"Send Notification",broadcastHistory:"Notification History",broadcastConfirm:"Confirm Send",broadcastConfirmMsg:"Are you sure? This notification will be sent to all targeted users.",broadcastResult:"Send Result",broadcastMatched:"Users Matched",broadcastTokens:"Valid Tokens",broadcastSentCount:"Sent",broadcastFailed:"Failed",noBroadcastHistory:"No notification history",broadcastAudienceLabel:"Audience",deleteNotif:"Delete",resendNotif:"Resend",editResend:"Edit & Resend",editResendSend:"Send Edited Copy",confirmDelete:"Confirm Delete",confirmDeleteMsg:"Are you sure? Only the history record will be deleted. Sent notifications are not recalled.",confirmResend:"Confirm Resend",confirmResendMsg:"Are you sure? This notification will be resent to the targeted audience.",notifDeleted:"Record deleted",deleteFailed:"Delete failed",resendSuccess:"Resend successful",resendFailed:"Resend failed",providerSubSettings:"Provider Subscription Settings",driverSubSettings:"Driver Subscription Settings",subActive:"Subscription Active",subPrice:"Subscription Price (SAR)",subPeriod:"Subscription Period",periodWeekly:"Weekly",periodMonthly:"Monthly",periodQuarterly:"Quarterly",periodYearly:"Yearly",freeTrialEnabledLabel:"Free Trial Enabled",freeTrialTextArLabel:"Free Trial Text (Arabic)",freeTrialTextEnLabel:"Free Trial Text (English)"}};
 var lang=localStorage.getItem("tbk_admin_lang")||"ar";
 function t(k){return(T[lang]&&T[lang][k])||T.en[k]||k;}
+function formatAdminDate(value,includeTime){
+  if(!value)return "-";
+  var date=new Date(value);
+  if(isNaN(date.getTime()))return esc(String(value));
+  var locale=lang==="ar"?"ar-SA-u-ca-gregory":"en-US-u-ca-gregory";
+  var options={calendar:"gregory",year:"numeric",month:"short",day:"numeric"};
+  if(includeTime){options.hour="2-digit";options.minute="2-digit";}
+  return new Intl.DateTimeFormat(locale,options).format(date);
+}
 function setLang(l){lang=l;localStorage.setItem("tbk_admin_lang",l);var d=l==="ar"?"rtl":"ltr";document.documentElement.dir=d;document.documentElement.lang=l;updateStaticLabels();renderPage();}
 function updateStaticLabels(){
   document.getElementById("login-subtitle").textContent=t("adminDashboard");
@@ -5685,7 +5811,7 @@ function complaintTypeLabel(type){
 function complaintDate(value){
   if(!value)return "-";
   var d=new Date(value);
-  return isNaN(d.getTime())?esc(String(value)):esc(d.toLocaleString(lang==="ar"?"ar-SA":"en-US"));
+  return formatAdminDate(value,true);
 }
 function complaintPerson(item,role){
   var p=item&&item[role]||{};
@@ -5783,7 +5909,7 @@ async function renderVerification(c){
   var crRows=items.map(function(it){
     var v=it.verification||{};
     var d=v.submittedAt||it.verifiedAt;
-    var ds=d?new Date(d).toLocaleDateString():"-";
+    var ds=d?formatAdminDate(d,false):"-";
     return '<tr><td>'+esc(it.displayName||t("noName"))+'<div style="font-size:12px;color:var(--text2)">'+esc(it.email||"")+'</div></td>'+
       '<td>'+esc(v.crNumber||"-")+'</td>'+
       '<td>'+verifBadge(it.verificationStatus)+'</td>'+
@@ -5793,7 +5919,7 @@ async function renderVerification(c){
   var fl=items.filter(function(it){return it.verification&&it.verification.freelanceCertificate;});
   var flRows=fl.map(function(it){
     var fc=it.verification.freelanceCertificate||{};
-    var sub=fc.submittedAt?new Date(fc.submittedAt).toLocaleDateString():"-";
+    var sub=fc.submittedAt?formatAdminDate(fc.submittedAt,false):"-";
     var img=fc.fileUrl||"";
     var rs=fc.reviewStatus||"pending";
     var imgBtn=img?'<a class="btn btn-sm btn-secondary" href="'+esc(img)+'" target="_blank" rel="noopener">'+t("viewImage")+'</a> ':"";
@@ -6231,7 +6357,7 @@ async function renderInvoices(c){
   if(!allInvoices.length){c.innerHTML+='<div class="empty">'+t("noInvoices")+'</div>';return;}
   c.innerHTML+='<div class="table-wrap"><table><thead><tr><th>'+t("invoiceNumber")+'</th><th>'+t("name")+'</th><th>'+t("amount")+'</th><th>'+t("date")+'</th><th>'+t("status")+'</th><th>'+t("actions")+'</th></tr></thead><tbody>'+
   allInvoices.map(function(inv){
-    var dt=inv.createdAt?new Date(inv.createdAt).toLocaleDateString():"N/A";
+    var dt=inv.createdAt?formatAdminDate(inv.createdAt,false):"N/A";
     return "<tr>"+
       "<td><strong>"+esc(inv.invoiceNumber||inv._id)+"</strong></td>"+
       "<td>"+esc(inv.userName||"")+"</td>"+
@@ -6268,20 +6394,11 @@ async function renderSettings(c){
   var bannerUrl=appSettings.bannerImageUrl||"";
   var bannerEnabled=appSettings.bannerEnabled!==false;
   var requirePhoneAtSignup=appSettings.requirePhoneAtSignup!==false;
-  var providerDiscoveryRadiusKm=[10,25,50,100].indexOf(appSettings.providerDiscoveryRadiusKm)>=0?appSettings.providerDiscoveryRadiusKm:"";
   c.innerHTML='<h1 class="page-title">'+t("appSettings")+'</h1>'+
     '<div class="settings-section"><h3>'+(lang==="ar"?"أمان الحساب":"Account security")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-requirePhoneAtSignup" onchange="updatePhoneSignupRequirementHint()"'+(requirePhoneAtSignup?" checked":"")+'> '+(lang==="ar"?"إلزام رقم الجوال عند إنشاء الحساب":"Require phone number at signup")+' <span id="s-requirePhoneAtSignup-status">'+(requirePhoneAtSignup?"ON":"OFF")+'</span></label><p id="s-requirePhoneAtSignup-hint" style="font-size:12px;color:var(--text2);margin-top:8px">'+(requirePhoneAtSignup?(lang==="ar"?"عند التفعيل، يجب على المستخدم الجديد إدخال رقم الجوال عند إنشاء الحساب.":"When enabled, new users must enter a phone number when creating an account."):(lang==="ar"?"يمكن للمستخدم الجديد إنشاء حساب بدون رقم جوال.":"When disabled, new users may create an account without a phone number."))+'</p></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" disabled> '+(lang==="ar"?"تسجيل الدخول برقم الجوال":"Phone number login")+' <span>OFF</span></label><p style="font-size:12px;color:var(--warning);margin-top:8px">'+(lang==="ar"?"غير مفعل حالياً":"Currently disabled")+'</p></div>'+
     '</div>'+
-    '<div class="settings-section"><div class="provider-discovery-head"><div class="provider-discovery-copy"><h3 style="margin-bottom:0">'+(lang==="ar"?"مواقع مقدمي الخدمة والخريطة":"Provider discovery & map")+'</h3><p>'+(lang==="ar"?"اضغط على أي بطاقة لعرض الحسابات التابعة لها. يمكن لكل مقدم خدمة نشط تحديد موقع الاكتشاف العام بدون اشتراط اشتراك أو تجربة سارية. لا تعرض هذه الصفحة إحداثيات خاصة أو عناوين المنازل.":"Click any card to view matching accounts. Any active provider can set a public discovery location without requiring an active trial or store subscription. No private coordinates or home addresses are shown.")+'</p></div><span class="provider-discovery-badge">'+(lang==="ar"?"خصوصية محمية":"Privacy protected")+'</span></div>'+
-    '<div id="provider-discovery-stats" class="provider-discovery-grid"><div class="provider-stat muted"><div class="provider-stat-label">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div></div>'+
-    '<div class="provider-discovery-actions"><button type="button" class="btn btn-secondary" onclick="loadProviderDiscoveryStats()">'+(lang==="ar"?"تحديث الإحصاءات":"Refresh statistics")+'</button><button type="button" class="btn btn-primary" id="provider-location-reminder-btn" onclick="sendProviderLocationReminder()" disabled>'+(lang==="ar"?"إرسال تنبيه لمن لم يحدد الموقع":"Notify providers missing location")+'</button></div>'+
-    '<div id="provider-location-reminder-result" class="provider-reminder-result" aria-live="polite"></div><div id="provider-discovery-updated" class="provider-discovery-updated"></div>'+
-    '<div id="provider-discovery-list" class="provider-list" style="display:none"><div class="provider-list-head"><strong id="provider-discovery-list-title"></strong><button type="button" class="btn btn-sm btn-secondary" onclick="closeProviderDiscoveryList()">'+(lang==="ar"?"إغلاق":"Close")+'</button></div><div id="provider-discovery-list-body" class="provider-list-body"></div></div>'+
-    '<div class="provider-list" style="margin-top:18px"><div class="provider-list-head"><strong>'+(lang==="ar"?"سجل تنبيهات الموقع":"Location reminder history")+'</strong><button type="button" class="btn btn-sm btn-secondary" onclick="loadProviderReminderHistory()">'+(lang==="ar"?"تحديث السجل":"Refresh history")+'</button></div><div id="provider-reminder-history-body" class="provider-list-body"><div class="loading">'+(lang==="ar"?"جاري تحميل السجل...":"Loading history...")+'</div></div></div>'+
-    '<div id="provider-discovery-modal" class="provider-discovery-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="provider-discovery-modal-title"><div class="provider-discovery-modal-card"><div class="provider-discovery-modal-head"><h3 id="provider-discovery-modal-title" class="provider-discovery-modal-title"></h3><button type="button" class="provider-discovery-modal-close" onclick="closeProviderDiscoveryModal()" aria-label="'+(lang==="ar"?"إغلاق":"Close")+'">×</button></div><p id="provider-discovery-modal-message" class="provider-discovery-modal-message"></p><div class="provider-discovery-modal-actions"><button type="button" id="provider-discovery-modal-cancel" class="btn btn-secondary" onclick="closeProviderDiscoveryModal()">'+(lang==="ar"?"إلغاء":"Cancel")+'</button><button type="button" id="provider-discovery-modal-confirm" class="btn btn-primary">'+(lang==="ar"?"حسنًا":"OK")+'</button></div></div></div>'+
-    '<div class="provider-radius-box"><div class="form-group"><label>'+(lang==="ar"?"نطاق «القريب منك» للنسخة القادمة":"Nearby radius for next app release")+'</label><select id="s-providerDiscoveryRadiusKm"><option value=""'+(providerDiscoveryRadiusKm===""?" selected":"")+'>'+(lang==="ar"?"مفتوح — بدون حد":"Unlimited — no radius limit")+'</option><option value="10"'+(providerDiscoveryRadiusKm===10?" selected":"")+'>10 km</option><option value="25"'+(providerDiscoveryRadiusKm===25?" selected":"")+'>25 km</option><option value="50"'+(providerDiscoveryRadiusKm===50?" selected":"")+'>50 km</option><option value="100"'+(providerDiscoveryRadiusKm===100?" selected":"")+'>100 km</option></select></div><div class="provider-radius-note">'+(lang==="ar"?"الإعداد الحالي «مفتوح» يعني بدون حد مسافة. التطبيق المنشور حالياً لا يستخدم هذا الخيار بعد، والخريطة تعرض كل من نشر موقع اكتشاف عام عند عمل Zoom Out.":"Unlimited means no distance cap. The currently published app does not consume this setting yet; zooming out shows every provider who published a public discovery location.")+'</div></div></div>'+
     '<div class="settings-section"><h3>'+t("language")+'</h3>'+
     '<div class="lang-switch"><button class="'+(lang==="ar"?"active":"")+'" onclick="setLang(\\'ar\\')">'+t("arabic")+'</button><button class="'+(lang==="en"?"active":"")+'" onclick="setLang(\\'en\\')">'+t("english")+'</button></div>'+
     '</div>'+
@@ -6330,89 +6447,7 @@ async function renderSettings(c){
     '<button class="btn btn-sm btn-warning" onclick="changePassword()">'+t("changePasswordBtn")+'</button>'+
     '</div>'+
     '<button class="btn btn-primary" onclick="saveSettings()">'+t("saveSettings")+'</button>';
-  setTimeout(function(){updatePricingPreview();loadProviderDiscoveryStats();loadProviderReminderHistory();},50);
-}
-
-var providerDiscoveryCurrentFilter="",providerDiscoveryModalAction=null;
-function closeProviderDiscoveryModal(){var modal=document.getElementById("provider-discovery-modal");if(modal)modal.style.display="none";providerDiscoveryModalAction=null;}
-function showProviderDiscoveryModal(options){
-  var modal=document.getElementById("provider-discovery-modal"),title=document.getElementById("provider-discovery-modal-title"),message=document.getElementById("provider-discovery-modal-message"),cancel=document.getElementById("provider-discovery-modal-cancel"),confirmButton=document.getElementById("provider-discovery-modal-confirm");
-  if(!modal||!title||!message||!cancel||!confirmButton)return;
-  var confirmMode=options&&options.mode==="confirm";
-  modal.className="provider-discovery-modal "+(confirmMode?"confirm":(options&&options.type)||"info");
-  title.textContent=options.title||"";message.textContent=options.message||"";
-  cancel.style.display=confirmMode?"inline-flex":"none";cancel.textContent=options.cancelText||(lang==="ar"?"إلغاء":"Cancel");
-  confirmButton.textContent=options.confirmText||(lang==="ar"?"حسنًا":"OK");
-  confirmButton.className="btn "+((options&&options.type)==="error"?"btn-warning":"btn-primary");
-  providerDiscoveryModalAction=confirmMode&&typeof options.onConfirm==="function"?options.onConfirm:null;
-  confirmButton.onclick=function(){var action=providerDiscoveryModalAction;closeProviderDiscoveryModal();if(action)action();};
-  modal.style.display="flex";confirmButton.focus();
-}
-async function loadProviderDiscoveryStats(){
-  var el=document.getElementById("provider-discovery-stats"),btn=document.getElementById("provider-location-reminder-btn"),updated=document.getElementById("provider-discovery-updated");
-  if(!el)return;
-  if(btn)btn.disabled=true;
-  el.innerHTML='<div class="provider-stat muted"><div class="provider-stat-label">'+(lang==="ar"?"جاري تحميل الإحصاءات...":"Loading statistics...")+'</div></div>';
-  var data=await api("/provider-discovery/stats");
-  if(!data||!data.success){el.innerHTML='<div class="provider-stat danger"><div class="provider-stat-label">'+(lang==="ar"?"تعذر تحميل إحصاءات المواقع":"Unable to load location statistics")+'</div></div>';return;}
-  function stat(label,value,kind,filter){return '<button type="button" class="provider-stat '+kind+'" data-filter="'+filter+'" onclick="openProviderDiscoveryList(this.dataset.filter)"><div class="provider-stat-label">'+label+'</div><div class="provider-stat-value">'+Number(value||0)+'</div></button>';}
-  el.innerHTML=
-    stat(lang==="ar"?"إجمالي مقدمي الخدمة":"Total providers",data.totalProviders,"muted","all")+
-    stat(lang==="ar"?"ظاهرون على الخريطة":"Visible on map",data.publicLocationEnabled,"success","visible")+
-    stat(lang==="ar"?"بدون موقع عام":"Without public location",data.withoutPublicLocation,"warning","missing")+
-    stat(lang==="ar"?"موقع عام غير صالح":"Invalid public location",data.invalidPublicLocation,"danger","invalid")+
-    stat(lang==="ar"?"عندهم موقع خاص فقط":"Private location only",data.privateLocationOnly,"info","private_only")+
-    stat(lang==="ar"?"يمكنهم تحديد الموقع الآن":"Can set location now",data.publishableWithoutLocation,"muted","missing");
-  if(btn){var n=Number(data.publishableWithoutLocation||0);btn.disabled=n<1;btn.textContent=n>0?(lang==="ar"?"إرسال تنبيه إلى "+n+" مقدم خدمة":"Notify "+n+" providers"):(lang==="ar"?"لا يوجد حساب يحتاج تنبيه":"No provider needs a reminder");}
-  if(updated){var now=new Date();updated.textContent=(lang==="ar"?"آخر تحديث: ":"Last updated: ")+now.toLocaleTimeString(lang==="ar"?"ar-SA":"en-US",{hour:"2-digit",minute:"2-digit"});}
-}
-function providerReminderDate(value){
-  if(!value)return lang==="ar"?"لم يرسل سابقاً":"Never sent";
-  var d=new Date(value);
-  return isNaN(d.getTime())?esc(String(value)):esc(d.toLocaleString(lang==="ar"?"ar-SA":"en-US"));
-}
-var providerReminderHistoryCache=[];
-async function loadProviderReminderHistory(){
-  var body=document.getElementById("provider-reminder-history-body");
-  if(!body)return;
-  body.innerHTML='<div class="loading">'+(lang==="ar"?"جاري تحميل السجل...":"Loading history...")+'</div>';
-  var data=await api("/provider-discovery/reminder-history?limit=50");
-  if(!data||!data.success){body.innerHTML='<div class="empty">'+(lang==="ar"?"تعذر تحميل سجل التنبيهات":"Unable to load reminder history")+'</div>';return;}
-  providerReminderHistoryCache=data.history||[];
-  if(!providerReminderHistoryCache.length){body.innerHTML='<div class="empty">'+(lang==="ar"?"لا توجد تنبيهات مسجلة حتى الآن":"No reminder history yet")+'</div>';return;}
-  body.innerHTML='<div class="table-wrap" style="box-shadow:none;border-radius:0"><table><thead><tr><th>'+(lang==="ar"?"التاريخ":"Date")+'</th><th>'+(lang==="ar"?"النوع":"Type")+'</th><th>'+(lang==="ar"?"المستهدفون":"Targeted")+'</th><th>'+(lang==="ar"?"مقبول للإرسال":"Accepted")+'</th><th>'+(lang==="ar"?"فشل":"Failed")+'</th><th>'+(lang==="ar"?"التفاصيل":"Details")+'</th></tr></thead><tbody>'+providerReminderHistoryCache.map(function(item,index){var hasRecipients=item.recipients&&item.recipients.length;return '<tr><td>'+providerReminderDate(item.createdAt)+'</td><td>'+(item.scope==="single"?(lang==="ar"?"فردي":"Single"):(lang==="ar"?"جماعي":"Bulk"))+'</td><td>'+Number(item.targeted||0)+'</td><td>'+Number(item.sentCount||0)+'</td><td>'+Number(item.failedCount||0)+'</td><td>'+(hasRecipients?'<button class="btn btn-sm btn-secondary" data-index="'+index+'" onclick="showProviderReminderHistoryDetails(Number(this.dataset.index))">'+(lang==="ar"?"عرض الأسماء":"View recipients")+'</button>':'<span style="font-size:11px;color:var(--text3)">'+(lang==="ar"?"سجل قديم — الأسماء غير محفوظة":"Legacy record — recipients not stored")+'</span>')+'</td></tr>';}).join("")+'</tbody></table></div>';
-}
-function showProviderReminderHistoryDetails(index){
-  var item=providerReminderHistoryCache[index];if(!item)return;
-  var recipients=item.recipients||[];
-  var lines=recipients.map(function(r){return (r.displayName||r.email||r.uid)+(r.email&&r.displayName?" — "+r.email:"");}).join("\\n");
-  showProviderDiscoveryModal({type:"info",title:lang==="ar"?"المستلمون المستهدفون":"Targeted recipients",message:lines|| (lang==="ar"?"لا توجد أسماء محفوظة لهذا السجل.":"No recipient names stored for this record.")});
-}
-
-async function openProviderDiscoveryList(filter){
-  providerDiscoveryCurrentFilter=filter||"missing";
-  var wrap=document.getElementById("provider-discovery-list"),body=document.getElementById("provider-discovery-list-body"),title=document.getElementById("provider-discovery-list-title");
-  if(!wrap||!body)return;wrap.style.display="block";body.innerHTML='<div class="loading">'+t("loading")+'</div>';
-  document.querySelectorAll(".provider-stat").forEach(function(x){x.classList.toggle("selected",x.dataset.filter===providerDiscoveryCurrentFilter);});
-  var labels={all:lang==="ar"?"كل مقدمي الخدمة":"All providers",visible:lang==="ar"?"الظاهرون على الخريطة":"Visible on map",missing:lang==="ar"?"لم يحددوا موقعاً عاماً":"Missing public location",invalid:lang==="ar"?"موقع عام غير صالح":"Invalid public location",private_only:lang==="ar"?"لديهم موقع خاص فقط":"Private location only"};
-  if(title)title.textContent=labels[providerDiscoveryCurrentFilter]||labels.missing;
-  var data=await api("/provider-discovery/list?filter="+encodeURIComponent(providerDiscoveryCurrentFilter));
-  if(!data||!data.success){body.innerHTML='<div class="empty">'+(lang==="ar"?"تعذر تحميل القائمة":"Unable to load list")+'</div>';return;}
-  if(!data.providers||!data.providers.length){body.innerHTML='<div class="empty">'+t("noData")+'</div>';return;}
-  body.innerHTML='<div class="table-wrap" style="box-shadow:none;border-radius:0"><table><thead><tr><th>'+(lang==="ar"?"الاسم":"Name")+'</th><th>'+(lang==="ar"?"التواصل":"Contact")+'</th><th>'+(lang==="ar"?"الحساب":"Account")+'</th><th>'+(lang==="ar"?"الموقع":"Location")+'</th><th>'+(lang==="ar"?"آخر تنبيه":"Last reminder")+'</th><th>'+(lang==="ar"?"إجراء":"Action")+'</th></tr></thead><tbody>'+data.providers.map(function(p){var status=p.publicLocationEnabled?(lang==="ar"?"ظاهر":"Visible"):(p.canPublishLocation?(lang==="ar"?"يستطيع التفعيل":"Can publish"):(lang==="ar"?"الحساب موقوف":"Account blocked"));return '<tr><td><strong>'+esc(p.displayName||"-")+'</strong><div style="font-size:11px;color:var(--text3)">'+esc(p.email||"")+'</div></td><td>'+esc(p.phone||"-")+'</td><td><span class="badge '+(p.canPublishLocation?"badge-green":"badge-gray")+'">'+esc(p.accountStatus||"active")+'</span><div style="font-size:11px;color:var(--text3);margin-top:4px">'+esc(p.subscriptionStatus||"")+'</div></td><td>'+esc(p.publicCity||status)+(p.hasPrivateLocation&&!p.publicLocationEnabled?'<div style="font-size:11px;color:var(--info)">'+(lang==="ar"?"يوجد موقع خاص محفوظ":"Private location exists")+'</div>':"")+'</td><td>'+providerReminderDate(p.lastReminderAt)+'</td><td>'+(!p.publicLocationEnabled&&p.canPublishLocation?'<button class="btn btn-sm btn-primary" data-uid="'+esc(p.uid)+'" onclick="sendProviderLocationReminder(this.dataset.uid)">'+(lang==="ar"?"تنبيه":"Notify")+'</button>':"-")+'</td></tr>';}).join("")+'</tbody></table></div>';
-}
-function closeProviderDiscoveryList(){var wrap=document.getElementById("provider-discovery-list");if(wrap)wrap.style.display="none";providerDiscoveryCurrentFilter="";document.querySelectorAll(".provider-stat").forEach(function(x){x.classList.remove("selected");});}
-async function sendProviderLocationReminder(uid){
-  showProviderDiscoveryModal({mode:"confirm",title:lang==="ar"?"تأكيد الإرسال":"Confirm send",message:uid?(lang==="ar"?"سيتم إرسال تنبيه إلى مقدم الخدمة لتحديد موقع الاكتشاف العام. هل تريد المتابعة؟":"A reminder will be sent to this provider to set a public discovery location. Continue?"):(lang==="ar"?"سيتم إرسال تنبيه إلى مقدمي الخدمة الذين لم يحددوا موقع الاكتشاف العام. هل تريد المتابعة؟":"A reminder will be sent to providers who have not set a public discovery location. Continue?"),confirmText:lang==="ar"?"إرسال":"Send",cancelText:lang==="ar"?"إلغاء":"Cancel",onConfirm:function(){performProviderLocationReminder(uid);}});
-}
-async function performProviderLocationReminder(uid){
-  var btn=document.getElementById("provider-location-reminder-btn"),result=document.getElementById("provider-location-reminder-result");
-  if(!uid&&btn&&btn.disabled)return;
-  if(btn&&!uid)btn.disabled=true;
-  if(result){result.className="provider-reminder-result show loading";result.textContent=lang==="ar"?"جاري إرسال التنبيه...":"Sending reminder...";}
-  try{var payload={confirm:true};if(uid)payload.uid=uid;var data=await api("/provider-discovery/remind-missing-location",{method:"POST",body:JSON.stringify(payload)});if(!data||!data.success)throw new Error(data&&data.error||"Failed");var sent=Number(data.sentCount||0),targeted=Number(data.targeted||0),failed=Number(data.failedCount||0);if(result){result.className="provider-reminder-result show "+(failed>0&&sent===0?"error":"success");result.textContent=(lang==="ar"?"المستهدفون: "+targeted+" — تم الإرسال: "+sent+(failed?" — تعذر: "+failed:""):"Targeted: "+targeted+" — Sent: "+sent+(failed?" — Failed: "+failed:""));}showProviderDiscoveryModal({type:failed>0&&sent===0?"error":"success",title:failed>0&&sent===0?(lang==="ar"?"تعذر الإرسال":"Unable to send"):(lang==="ar"?"تم الإرسال":"Sent"),message:failed>0&&sent===0?(lang==="ar"?"تعذر إرسال التنبيه. حاول مرة أخرى.":"Unable to send the reminder. Please try again."):(lang==="ar"?"تم إرسال التنبيه بنجاح.":"The reminder was sent successfully.")});}
-  catch(e){if(result){result.className="provider-reminder-result show error";result.textContent=lang==="ar"?"تعذر إرسال التنبيه.":"Unable to send reminder.";}showProviderDiscoveryModal({type:"error",title:lang==="ar"?"تعذر الإرسال":"Unable to send",message:lang==="ar"?"تعذر إرسال التنبيه. حاول مرة أخرى.":"Unable to send the reminder. Please try again."});}
-  finally{await loadProviderDiscoveryStats();await loadProviderReminderHistory();if(providerDiscoveryCurrentFilter)await openProviderDiscoveryList(providerDiscoveryCurrentFilter);}
+  setTimeout(function(){updatePricingPreview();},50);
 }
 
 function updatePhoneSignupRequirementHint(){
@@ -6482,7 +6517,6 @@ async function saveSettings(){
       maxFee:Math.max(0,numberValue("s-maxFee",50))
     },
     defaultLanguage:lang,
-    providerDiscoveryRadiusKm:(function(){var el=document.getElementById("s-providerDiscoveryRadiusKm");if(!el||!el.value)return null;var n=parseInt(el.value,10);return [10,25,50,100].indexOf(n)>=0?n:null;})(),
     requirePhoneAtSignup:document.getElementById("s-requirePhoneAtSignup")?document.getElementById("s-requirePhoneAtSignup").checked:true,
     notifyOnNewUser:document.getElementById("s-notifyNewUser")?document.getElementById("s-notifyNewUser").checked:false,
     notifyOnNewProvider:document.getElementById("s-notifyNewProvider")?document.getElementById("s-notifyNewProvider").checked:false,
@@ -6545,6 +6579,10 @@ var _bcSourceId=null;
 var _bcSending=false;
 var _bcHistoryData={};
 var _bcActionId=null;
+var _bcDetailsId=null;
+var _bcDetailsTokens=[""];
+var _bcDetailsPageIndex=0;
+var _bcDetailsNextToken=null;
 async function renderNotifications(c){
   var data=await api("/broadcast-notifications/history");
   var history=(data&&data.history)||[];
@@ -6558,7 +6596,7 @@ async function renderNotifications(c){
   _bcHistoryData={};
   history.forEach(function(h){if(h&&h._id)_bcHistoryData[h._id]=h;});
   var histRows=history.map(function(h){
-    var d=h.createdAt?new Date(h.createdAt).toLocaleString():"-";
+    var d=formatAdminDate(h.createdAt,true);
     var audMap={customer:t("audienceCustomers"),provider:t("audienceProviders"),driver:t("audienceDrivers"),all:t("audienceAll")};
     var hid=h._id||"";
     var reasons=h.failureReasons&&typeof h.failureReasons==="object"?Object.keys(h.failureReasons).map(function(code){var item=h.failureReasons[code]||{};return esc(code)+" ("+esc(String(item.count||0))+")"+(item.message?": "+esc(item.message):"");}).join("<br>"):"-";
@@ -6573,6 +6611,7 @@ async function renderNotifications(c){
       '<td style="text-align:center;color:var(--error)">'+esc(String((h.invalidTokensCount||0)+(h.staleTokensCount||0)))+'</td>'+
       '<td style="font-size:11px;max-width:260px">'+reasons+'</td>'+
       '<td style="white-space:nowrap">'+
+        '<button data-id="'+hid+'" class="btn btn-primary" style="padding:4px 8px;font-size:11px;margin:2px" onclick="openBroadcastDetails(this.dataset.id)">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button>'+
         '<button data-id="'+hid+'" class="btn btn-secondary" style="padding:4px 8px;font-size:11px;margin:2px" onclick="deleteNotification(this.dataset.id)">'+t("deleteNotif")+'</button>'+
         '<button data-id="'+hid+'" class="btn btn-secondary" style="padding:4px 8px;font-size:11px;margin:2px" onclick="resendNotification(this.dataset.id)">'+t("resendNotif")+'</button>'+
         '<button data-id="'+hid+'" class="btn btn-orange" style="padding:4px 8px;font-size:11px;margin:2px" onclick="editAndResend(this.dataset.id)">'+t("editResend")+'</button>'+
@@ -6613,6 +6652,61 @@ async function renderNotifications(c){
     '</table></div>'+
     '</div>';
 }
+function broadcastStatusLabel(value){
+  var labels={pending:lang==="ar"?"قيد الانتظار":"Pending",processing:lang==="ar"?"قيد المعالجة":"Processing",completed:lang==="ar"?"مكتمل":"Completed",accepted:lang==="ar"?"قُبل من خدمة Push":"Accepted by Push service",failed:lang==="ar"?"فشل الإرسال":"Send failed",not_attempted:lang==="ar"?"لم تتم المحاولة":"Not attempted",not_applicable:"-",complete:lang==="ar"?"اكتمل إيصال Push":"Push receipt complete",stale:lang==="ar"?"رمز قديم/ملغى":"Stale token",pending_receipt:lang==="ar"?"بانتظار إيصال Push":"Waiting for Push receipt",missing:lang==="ar"?"لا يوجد Push token":"No Push token",invalid:lang==="ar"?"Push token غير صالح":"Invalid Push token",valid:lang==="ar"?"Push token صالح":"Valid Push token"};
+  return labels[value]||value||"-";
+}
+function openBroadcastDetails(id){
+  if(!id)return;
+  _bcDetailsId=id;_bcDetailsTokens=[""];_bcDetailsPageIndex=0;_bcDetailsNextToken=null;
+  openModal('<div id="bc-details-body"><div class="loading">'+(lang==="ar"?"جاري تحميل تفاصيل البث...":"Loading broadcast details...")+'</div></div>');
+  loadBroadcastDetailsPage();
+}
+async function loadBroadcastDetailsPage(){
+  var body=document.getElementById("bc-details-body");
+  if(!body||!_bcDetailsId)return;
+  body.innerHTML='<div class="loading">'+(lang==="ar"?"جاري تحميل تفاصيل البث...":"Loading broadcast details...")+'</div>';
+  try{
+    var token=_bcDetailsTokens[_bcDetailsPageIndex]||"";
+    var data=await api("/broadcast-notifications/"+encodeURIComponent(_bcDetailsId)+"/details?pageSize=10"+(token?"&pageToken="+encodeURIComponent(token):""));
+    if(!data||!data.success)throw new Error(data&&data.error||t("connectionError"));
+    _bcDetailsNextToken=data.nextPageToken||null;
+    renderBroadcastDetails(data);
+  }catch(e){
+    if(body)body.innerHTML='<div class="empty" style="color:var(--error)">'+esc(e.message|| (lang==="ar"?"تعذر تحميل التفاصيل":"Unable to load details"))+'</div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("close")+'</button></div>';
+  }
+}
+function renderBroadcastDetails(data){
+  var body=document.getElementById("bc-details-body");if(!body)return;
+  var b=data.broadcast||{},recipients=data.recipients||[];
+  var audMap={customer:t("audienceCustomers"),provider:t("audienceProviders"),driver:t("audienceDrivers"),all:t("audienceAll")};
+  var reasons=formatFailureReasons(b.failureReasons)||(lang==="ar"?"لا توجد أسباب فشل مسجلة":"No failure reasons recorded");
+  var rows=recipients.map(function(r){
+    var role=audMap[r.role]||r.role||"-";
+    var durable=r.durableNotificationCreated?(lang==="ar"?"تم إنشاء التنبيه داخل التطبيق":"In-app notification created"):(lang==="ar"?"لم يُنشأ":"Not created");
+    var ticket=r.expoTicketStatus==="accepted"?(lang==="ar"?"قُبل من خدمة Push":"Accepted by Push service"):(r.expoTicketStatus==="failed"?(lang==="ar"?"فشل الإرسال":"Send failed"):(lang==="ar"?"لم تتم المحاولة":"Not attempted"));
+    var receipt=r.expoReceiptStatus==="complete"?(lang==="ar"?"اكتمل إيصال Push":"Push receipt complete"):(r.expoReceiptStatus==="failed"?(lang==="ar"?"فشل إيصال Push":"Push receipt failed"):(r.expoReceiptStatus==="stale"?(lang==="ar"?"رمز قديم/ملغى":"Stale token"):(r.expoReceiptStatus==="pending"?(lang==="ar"?"بانتظار إيصال Push":"Waiting for Push receipt"):"-")));
+    var read=r.readAt?(lang==="ar"?"تمت قراءته داخل التطبيق: ":"Read in app: ")+formatAdminDate(r.readAt,true):"-";
+    return '<tr><td><strong>'+esc(r.displayName|| (lang==="ar"?"حساب غير متاح":"Unavailable account"))+'</strong><div style="font-size:10px;color:var(--text3)">'+esc(r.uid||"")+'</div></td><td>'+esc(role)+'</td><td>'+esc(durable)+'</td><td>'+esc(broadcastStatusLabel(r.pushTokenState))+'</td><td>'+esc(ticket)+'</td><td>'+esc(receipt)+'</td><td>'+esc(read)+'</td><td>'+esc(r.failureCode||"-")+'</td></tr>';
+  }).join("");
+  var stats=[
+    [lang==="ar"?"معرّف البث":"Broadcast ID",b.broadcastId||_bcDetailsId],
+    [lang==="ar"?"تاريخ الإنشاء":"Created",formatAdminDate(b.createdAt,true)],
+    [lang==="ar"?"الجمهور":"Audience",audMap[b.audience]||b.audience||"-"],
+    [lang==="ar"?"الحالة":"Status",broadcastStatusLabel(b.status)],
+    [lang==="ar"?"إجمالي المطابقين":"Total matched",b.totalUsersMatched||0],
+    [lang==="ar"?"تمت معالجتهم":"Processed",b.processedCount||0],
+    [lang==="ar"?"تنبيهات داخل التطبيق":"Durable notifications created",b.durableNotificationsCreated||0],
+    [lang==="ar"?"Push tokens مرشحة":"Candidate Push tokens",b.totalCandidateTokens||0],
+    [lang==="ar"?"Push tokens صالحة":"Valid Push tokens",b.validTokensCount||0],
+    [lang==="ar"?"قُبل من خدمة Push":"Accepted by Push service",b.sentCount||0],
+    [lang==="ar"?"فشل الإرسال":"Failed",b.failedCount||0],
+    [lang==="ar"?"رموز غير صالحة/قديمة":"Invalid/stale tokens",Number(b.invalidTokensCount||0)+Number(b.staleTokensCount||0)]
+  ].map(function(item){return '<div style="padding:10px;border:1px solid var(--border);border-radius:8px"><div style="font-size:11px;color:var(--text2)">'+esc(item[0])+'</div><strong style="word-break:break-word">'+esc(String(item[1]))+'</strong></div>';}).join("");
+  body.innerHTML='<h3 style="margin-bottom:12px">'+(lang==="ar"?"تفاصيل البث":"Broadcast details")+'</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-bottom:14px">'+stats+'</div><div style="padding:12px;background:var(--surface);border-radius:8px;margin-bottom:10px"><strong>'+esc(b.title||"-")+'</strong><p style="white-space:pre-wrap;margin-top:6px;color:var(--text2)">'+esc(b.message||"")+'</p></div><div style="font-size:12px;margin-bottom:14px"><strong>'+(lang==="ar"?"أسباب الفشل":"Failure reasons")+':</strong><br>'+reasons+'</div><h4 style="margin:12px 0">'+(lang==="ar"?"المستلمون":"Recipients")+'</h4>'+(rows?'<div class="table-wrap"><table><thead><tr><th>'+(lang==="ar"?"المستخدم":"User")+'</th><th>'+t("role")+'</th><th>'+(lang==="ar"?"داخل التطبيق":"In-app")+'</th><th>Push token</th><th>Push ticket</th><th>Push receipt</th><th>'+(lang==="ar"?"حالة القراءة داخل التطبيق":"In-app read status")+'</th><th>'+(lang==="ar"?"سبب الفشل":"Failure reason")+'</th></tr></thead><tbody>'+rows+'</tbody></table></div>':'<div class="empty">'+(lang==="ar"?"لا توجد حالات مستلمين محفوظة لهذا البث.":"No recipient statuses are stored for this broadcast.")+'</div>')+'<div class="modal-actions"><button class="btn btn-secondary" onclick="previousBroadcastDetailsPage()"'+(_bcDetailsPageIndex===0?' disabled':'')+'>'+(lang==="ar"?"السابق":"Previous")+'</button><span style="align-self:center;font-size:12px">'+(lang==="ar"?"صفحة ":"Page ")+(_bcDetailsPageIndex+1)+'</span><button class="btn btn-secondary" onclick="nextBroadcastDetailsPage()"'+(!_bcDetailsNextToken?' disabled':'')+'>'+(lang==="ar"?"التالي":"Next")+'</button><button class="btn btn-primary" onclick="closeModal()">'+t("close")+'</button></div>';
+}
+function nextBroadcastDetailsPage(){if(!_bcDetailsNextToken)return;_bcDetailsPageIndex++;_bcDetailsTokens[_bcDetailsPageIndex]=_bcDetailsNextToken;loadBroadcastDetailsPage();}
+function previousBroadcastDetailsPage(){if(_bcDetailsPageIndex<1)return;_bcDetailsPageIndex--;loadBroadcastDetailsPage();}
 async function diagnosePushHealth(){
   var el=document.getElementById("push-health-result"),btn=document.getElementById("push-health-btn");
   if(el){el.style.display="block";el.style.background="#eff6ff";el.style.color="var(--info)";el.textContent="جاري الفحص…";}
@@ -8675,7 +8769,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               if (histResp.ok) {
                 const histData = await histResp.json();
                 if (histData.documents) {
-                  history = histData.documents.map((doc) => parseFirestoreDoc(doc)).filter(Boolean);
+                  history = histData.documents.map((doc) => parseFirestoreDoc(doc)).filter(Boolean).map((record) => ({ ...broadcastDetailsDto(record, record._id), _id: record._id, hasMore: record.hasMore === true }));
                   history.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
                 }
               } else {
@@ -8721,10 +8815,30 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const job = await getFirestoreDoc("admin_broadcast_jobs", body.broadcastId, accessToken);
               if (!job) return jsonResponse({ error: "Broadcast job not found" }, 404);
               const result = await processBroadcastJob(job, accessToken);
-              return jsonResponse({ success: true, broadcastId: result.broadcastId, status: result.status, hasMore: Boolean(result.hasMore), totalUsersMatched: result.totalUsersMatched || 0, processedCount: result.processedCount || 0, totalCandidateTokens: result.totalCandidateTokens || 0, validTokensCount: result.validTokensCount || 0, sentCount: result.sentCount || 0, failedCount: result.failedCount || 0, invalidTokensCount: result.invalidTokensCount || 0, staleTokensCount: result.staleTokensCount || 0, failureReasons: result.failureReasons || {} });
+              return jsonResponse({ success: true, broadcastId: result.broadcastId, status: result.status, hasMore: Boolean(result.hasMore), totalUsersMatched: result.totalUsersMatched || 0, processedCount: result.processedCount || 0, durableNotificationsCreated: result.durableNotificationsCreated || 0, totalCandidateTokens: result.totalCandidateTokens || 0, validTokensCount: result.validTokensCount || 0, sentCount: result.sentCount || 0, failedCount: result.failedCount || 0, invalidTokensCount: result.invalidTokensCount || 0, staleTokensCount: result.staleTokensCount || 0, failureReasons: result.failureReasons || {} });
             } catch (e) {
               console.error("[Admin] Broadcast process error:", e);
               return jsonResponse({ error: e.message || "Failed to process broadcast", retryable: true }, 500);
+            }
+          }
+          const bcDetailsMatch = path.match(/^\/admin\/api\/broadcast-notifications\/([^\/]+)\/details$/);
+          if (bcDetailsMatch && request.method === "GET") {
+            try {
+              const broadcastId = bcDetailsMatch[1];
+              if (!phase4aSafeSegment(broadcastId)) return jsonResponse({ error: "Invalid broadcast id" }, 400);
+              const requestedPageSize = Number(url.searchParams.get("pageSize"));
+              const pageSize = Math.max(1, Math.min(20, Number.isInteger(requestedPageSize) ? requestedPageSize : 10));
+              const pageToken = url.searchParams.get("pageToken") || null;
+              if (pageToken && pageToken.length > 2048) return jsonResponse({ error: "Invalid page token" }, 400);
+              const record = await getFirestoreDoc("admin_broadcast_notifications", broadcastId, accessToken);
+              if (!record) return jsonResponse({ error: "Broadcast not found" }, 404);
+              const page = await listFirestoreDocumentsPage("admin_broadcast_jobs/" + broadcastId + "/recipients", pageSize, pageToken, accessToken);
+              const refreshed = await refreshBroadcastRecipientReceipts(broadcastId, page.documents, accessToken);
+              const recipients = (await Promise.all(refreshed.map((recipient) => broadcastRecipientDto(recipient, accessToken)))).filter(Boolean);
+              return jsonResponse({ success: true, broadcast: broadcastDetailsDto(record, broadcastId), recipients, pageSize, nextPageToken: page.nextPageToken });
+            } catch (e) {
+              console.error("[Admin] Broadcast details unavailable");
+              return jsonResponse({ error: "Broadcast details unavailable" }, 500);
             }
           }
           const bcDeleteMatch = path.match(/^\/admin\/api\/broadcast-notifications\/([^\/]+)$/);
