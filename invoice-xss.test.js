@@ -152,7 +152,11 @@ for (const headers of [invoiceHeaders, adminHeaders]) {
   assert.strictEqual(headers["Referrer-Policy"], "strict-origin-when-cross-origin");
   assert.strictEqual(headers["X-Frame-Options"], "DENY");
 }
-assert.strictEqual(adminHeaders["Content-Security-Policy"], "base-uri 'self'; object-src 'none'; frame-ancestors 'none'");
+assert.strictEqual(
+  adminHeaders["Content-Security-Policy"],
+  "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com",
+  "Admin CSP retains its restrictions and narrowly permits the IBM Plex webfont sources",
+);
 const hostileLanguageHtml = generateInvoiceHTML(validInvoice, `"><script>alert("lang")</script>`, "language-nonce");
 assert(hostileLanguageHtml.includes('<html dir="ltr" lang="en">'), "invoice language output is allowlisted");
 assert.strictEqual((hostileLanguageHtml.match(/<script\b/g) || []).length, 1, "a hostile language parameter cannot add a script");

@@ -24,8 +24,13 @@ assert(!source.slice(sendStart, sendEnd).includes('navigate("notifications");'),
 // auth overhead, three recipients with three notification reads, one commit
 // plus one bounded CAS retry, two token lookups, one Expo request, and two job
 // history updates.
-const worstCase = 1 + 1 + 1 + 1 + (3 * (3 * 2 + 2 + 2)) + 2;
+const worstCase = 1 + 1 + 1 + 1 + (3 * (3 * 2 + 2 + 2)) + 2 + 1;
 assert(worstCase < 50, `worst-case subrequests ${worstCase} leaves headroom`);
 assert(worstCase <= 40, "budget remains conservative even with one retry headroom");
+assert(source.includes('admin_broadcast_jobs/" + broadcastId + "/recipients'), "recipient status is stored in a bounded per-broadcast subcollection");
+assert(source.includes('Math.min(20'), "recipient detail endpoint caps page size at 20");
+assert(source.includes('pageSize=10'), "Admin recipient details request 10 recipients per page");
+const detailsWorstCase = 1 + 1 + 1 + 1 + 1 + 1 + (10 * 2);
+assert(detailsWorstCase < 50, `recipient details worst-case ${detailsWorstCase} stays under the subrequest ceiling`);
 
 console.log(`broadcast resumable structural tests: PASS (worst-case ${worstCase} subrequests)`);
