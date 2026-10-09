@@ -731,6 +731,205 @@
       else if (publicSnapshot) writes.push({ delete: "projects/tabbakheen-99883/databases/(default)/documents/public_profiles/" + uid, currentDocument: { updateTime: publicSnapshot.updateTime } });
       return { ok: await phase4aCommit(writes, accessToken), entitlement };
     }
+    const DRIVER_RUNTIME_LOCATION_COLLECTION = "driver_runtime_locations";
+    const DRIVER_LOCATION_FRESH_MS = 10 * 60 * 1e3;
+    const DRIVER_LOCATION_MAX_ACCURACY_M = 200;
+    const DRIVER_LOCATION_COALESCE_MS = 15 * 1e3;
+    const DRIVER_LOCATION_MEANINGFUL_MOVEMENT_M = 25;
+    const DRIVER_DISTANCE_DEFAULT_KM = 20;
+    const DRIVER_DISTANCE_MIN_KM = 1;
+    const DRIVER_DISTANCE_MAX_KM = 2e3;
+    const DRIVER_REJECTION_HISTORY_LIMIT = 25;
+    const CUSTOMER_DELIVERY_PREFERENCES_COLLECTION = "customer_delivery_preferences";
+    const DELIVERY_QUOTES_COLLECTION = "delivery_quotes";
+    const DELIVERY_QUOTE_LIFETIME_MS = 10 * 60 * 1e3;
+    const DELIVERY_MATCH_JOBS_COLLECTION = "delivery_match_jobs";
+    const ORDER_DELIVERY_PRIVATE_COLLECTION = "order_delivery_private";
+    const DELIVERY_MATCH_SCAN_PAGE_SIZE = 1;
+    const DELIVERY_MATCH_NOTIFICATION_BATCH_SIZE = 1;
+    const ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS = ["customerLat", "customerLng", "dropoffLat", "dropoffLng", "dropoffAddress", "addressLine", "deliveryNotes", "customerPhone", "customerPhoneNumber", "phone"];
+    const TARGETED_NOTIFICATION_SUBREQUEST_BUDGET = Object.freeze({
+      accessToken: 1,
+      deletionLaneQueries: 4,
+      outboxLaneQueries: 4,
+      claimEvent: 5,
+      orderRead: 1,
+      tokenReads: 2,
+      durableNotificationTwoAttempts: 8,
+      leaseRenewal: 2,
+      expoThreeAttempts: 3,
+      resultMergeThreeAttempts: 6
+    });
+    const TARGETED_RECEIPT_SUBREQUEST_BUDGET = Object.freeze({
+      accessToken: 1,
+      deletionLaneQueries: 4,
+      outboxLaneQueries: 4,
+      receiptClaim: 2,
+      expoReceipt: 1,
+      uidBoundedTokenCleanup: 3,
+      resultMergeThreeAttempts: 6
+    });
+    function targetedNotificationWorstCaseSubrequests() {
+      return Object.values(TARGETED_NOTIFICATION_SUBREQUEST_BUDGET).reduce((total, count) => total + count, 0);
+    }
+    function targetedReceiptWorstCaseSubrequests() {
+      return Object.values(TARGETED_RECEIPT_SUBREQUEST_BUDGET).reduce((total, count) => total + count, 0);
+    }
+    function validCoordinatePair(lat, lng) {
+      return Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180 && !(lat === 0 && lng === 0);
+    }
+    function validSaudiCoordinatePair(lat, lng) {
+      // Keep the V2 operating envelope aligned with the existing provider
+      // public-location contract. It intentionally covers the full Kingdom
+      // rather than a single launch city.
+      return validCoordinatePair(lat, lng) && lat >= 12 && lat <= 34 && lng >= 34 && lng <= 61;
+    }
+    function haversineDistanceKm(startLat, startLng, endLat, endLng) {
+      if (![startLat, startLng, endLat, endLng].every(Number.isFinite)) return NaN;
+      const radians = (value) => value * Math.PI / 180;
+      const dLat = radians(endLat - startLat);
+      const dLng = radians(endLng - startLng);
+      const a = Math.sin(dLat / 2) ** 2 + Math.cos(radians(startLat)) * Math.cos(radians(endLat)) * Math.sin(dLng / 2) ** 2;
+      return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+    function roundDistanceKm(value) {
+      return Math.round(value * 10) / 10;
+    }
+    function validateDriverRuntimeLocationInput(body) {
+      if (!phase4aKeysOnly(body, ["lat", "lng", "accuracyM"])) return { ok: false, code: "INVALID_REQUEST" };
+      if (!validSaudiCoordinatePair(body.lat, body.lng)) return { ok: false, code: "DRIVER_LOCATION_INVALID" };
+      if (!Number.isFinite(body.accuracyM) || body.accuracyM <= 0 || body.accuracyM > DRIVER_LOCATION_MAX_ACCURACY_M) return { ok: false, code: "DRIVER_LOCATION_INACCURATE" };
+      return { ok: true, value: { lat: body.lat, lng: body.lng, accuracyM: Math.round(body.accuracyM * 10) / 10 } };
+    }
+    function driverRuntimeLocationStatus(location, now = Date.now()) {
+      const nowMs = now instanceof Date ? now.getTime() : Number(now);
+      if (!location || !validSaudiCoordinatePair(location.lat, location.lng)) return { fresh: false, code: "DRIVER_LOCATION_REQUIRED" };
+      if (!Number.isFinite(location.accuracyM) || location.accuracyM <= 0 || location.accuracyM > DRIVER_LOCATION_MAX_ACCURACY_M) return { fresh: false, code: "DRIVER_LOCATION_INACCURATE" };
+      const updatedAtMs = new Date(location.updatedAt || 0).getTime();
+      const expiresAtMs = new Date(location.expiresAt || 0).getTime();
+      if (!Number.isFinite(nowMs) || !Number.isFinite(updatedAtMs) || !Number.isFinite(expiresAtMs) || updatedAtMs > nowMs + 60 * 1e3 || nowMs - updatedAtMs > DRIVER_LOCATION_FRESH_MS || expiresAtMs <= nowMs) return { fresh: false, code: "DRIVER_LOCATION_STALE" };
+      return { fresh: true, code: null, updatedAt: new Date(updatedAtMs).toISOString(), freshUntil: new Date(expiresAtMs).toISOString() };
+    }
+    function shouldCoalesceDriverLocationUpdate(previous, next, now = Date.now()) {
+      if (!previous || !next) return false;
+      const updatedAtMs = new Date(previous.updatedAt || 0).getTime();
+      const nowMs = now instanceof Date ? now.getTime() : Number(now);
+      if (!Number.isFinite(updatedAtMs) || !Number.isFinite(nowMs) || nowMs - updatedAtMs < 0 || nowMs - updatedAtMs >= DRIVER_LOCATION_COALESCE_MS) return false;
+      const movementM = haversineDistanceKm(previous.lat, previous.lng, next.lat, next.lng) * 1e3;
+      const materiallyBetterAccuracy = Number.isFinite(previous.accuracyM) && next.accuracyM + 5 < previous.accuracyM;
+      return Number.isFinite(movementM) && movementM < DRIVER_LOCATION_MEANINGFUL_MOVEMENT_M && !materiallyBetterAccuracy;
+    }
+    function normalizeDriverDistancePreference(value) {
+      if (value === null) return null;
+      if (typeof value !== "number" || !Number.isFinite(value) || value < DRIVER_DISTANCE_MIN_KM || value > DRIVER_DISTANCE_MAX_KM) return void 0;
+      return Math.round(value * 10) / 10;
+    }
+    function driverDistancePreferences(user) {
+      const hasPickup = Object.prototype.hasOwnProperty.call(user || {}, "maxPickupDistanceKm");
+      const hasDelivery = Object.prototype.hasOwnProperty.call(user || {}, "maxDeliveryDistanceKm");
+      const legacyPickup = normalizeDriverDistancePreference(user?.maxDistanceKm);
+      // A malformed legacy value is treated as absent. Explicit new fields,
+      // including null, always take precedence and must validate strictly.
+      const pickupSource = hasPickup ? user.maxPickupDistanceKm : typeof legacyPickup === "number" ? legacyPickup : DRIVER_DISTANCE_DEFAULT_KM;
+      const deliverySource = hasDelivery ? user.maxDeliveryDistanceKm : DRIVER_DISTANCE_DEFAULT_KM;
+      const maxPickupDistanceKm = normalizeDriverDistancePreference(pickupSource);
+      const maxDeliveryDistanceKm = normalizeDriverDistancePreference(deliverySource);
+      if (maxPickupDistanceKm === void 0 || maxDeliveryDistanceKm === void 0) return { ok: false, maxPickupDistanceKm: null, maxDeliveryDistanceKm: null };
+      return { ok: true, maxPickupDistanceKm, maxDeliveryDistanceKm };
+    }
+    // Kept as test/backward-compatibility aliases for the approved V1 work.
+    // The legacy value is pickup-only and never supplies the delivery limit.
+    function normalizeDriverMaxDistanceKm(value) {
+      return normalizeDriverDistancePreference(value);
+    }
+    function driverMaxDistanceKm(user) {
+      const preferences = driverDistancePreferences(user);
+      return preferences.ok ? preferences.maxPickupDistanceKm : void 0;
+    }
+    function appendRejectedDriverUid(order, uid, maximum = DRIVER_REJECTION_HISTORY_LIMIT) {
+      const existing = Array.isArray(order?.rejectedDriverUids) ? order.rejectedDriverUids.filter((item) => phase4aSafeSegment(item)) : [];
+      const unique = [...new Set(existing)].filter((item) => item !== uid);
+      unique.push(uid);
+      return unique.slice(-maximum);
+    }
+    function orderRejectedByDriver(order, uid) {
+      return order?.lastRejectedDriverUid === uid || Array.isArray(order?.rejectedDriverUids) && order.rejectedDriverUids.includes(uid);
+    }
+    async function persistDriverRuntimeLocation(uid, input, accessToken, deletionFence, now = new Date()) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const snapshot = await getFirestoreSnapshot(DRIVER_RUNTIME_LOCATION_COLLECTION, uid, accessToken);
+        if (snapshot && shouldCoalesceDriverLocationUpdate(snapshot.data, input, now)) {
+          if (!await phase4aCommit([deletionFence], accessToken)) return { ok: false, conflict: true };
+          const status = driverRuntimeLocationStatus(snapshot.data, now);
+          if (status.fresh) return { ok: true, coalesced: true, updatedAt: status.updatedAt, freshUntil: status.freshUntil };
+        }
+        const updatedAt = new Date(now).toISOString();
+        const expiresAt = new Date(new Date(now).getTime() + DRIVER_LOCATION_FRESH_MS).toISOString();
+        const fields = { lat: input.lat, lng: input.lng, accuracyM: input.accuracyM, expiresAt, schemaVersion: 1 };
+        const write = {
+          update: phase4aDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, uid, fields),
+          updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
+          currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false }
+        };
+        if (await phase4aCommit([write, deletionFence], accessToken)) return { ok: true, coalesced: false, updatedAt, freshUntil: expiresAt };
+      }
+      return { ok: false, conflict: true };
+    }
+    async function updateDriverPreferences(uid, preferences, accessToken, deletionFence) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const snapshot = await getFirestoreSnapshot("users", uid, accessToken);
+        if (!snapshot || snapshot.data.role !== "driver") return { ok: false, code: "FORBIDDEN" };
+        const fields = {};
+        if (Object.prototype.hasOwnProperty.call(preferences, "maxPickupDistanceKm")) fields.maxPickupDistanceKm = preferences.maxPickupDistanceKm;
+        if (Object.prototype.hasOwnProperty.call(preferences, "maxDeliveryDistanceKm")) fields.maxDeliveryDistanceKm = preferences.maxDeliveryDistanceKm;
+        const effective = driverDistancePreferences({ ...snapshot.data, ...fields });
+        if (!effective.ok) return { ok: false, code: "DRIVER_PREFERENCES_INVALID" };
+        if (Object.keys(fields).every((key) => snapshot.data[key] === fields[key])) return await phase4aCommit([deletionFence], accessToken) ? { ok: true, idempotent: true, preferences: effective } : { ok: false, conflict: true };
+        const committed = await phase4aCommit([{
+          update: phase4aDoc("users", uid, fields),
+          updateMask: { fieldPaths: Object.keys(fields) },
+          currentDocument: { updateTime: snapshot.updateTime }
+        }, deletionFence], accessToken);
+        if (committed) return { ok: true, idempotent: false, preferences: effective };
+      }
+      return { ok: false, conflict: true };
+    }
+    function exactObjectKeys(value, expected) {
+      return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === expected.length && expected.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+    }
+    function boundedRequiredString(value, maximum) {
+      if (typeof value !== "string") return null;
+      const normalized = value.trim();
+      return normalized && normalized.length <= maximum ? normalized : null;
+    }
+    function validateCustomerDropoff(value, requireLabel = false) {
+      const expected = requireLabel ? ["lat", "lng", "addressLine", "city", "district", "label"] : ["lat", "lng", "addressLine", "city", "district"];
+      if (!exactObjectKeys(value, expected)) return { ok: false, code: value == null ? "CUSTOMER_DROPOFF_REQUIRED" : "CUSTOMER_DROPOFF_INVALID" };
+      if (!validSaudiCoordinatePair(value.lat, value.lng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
+      const addressLine = boundedRequiredString(value.addressLine, 300);
+      const city = boundedRequiredString(value.city, 120);
+      const district = boundedRequiredString(value.district, 120);
+      if (!addressLine || !city || !district) return { ok: false, code: "CUSTOMER_DROPOFF_INVALID" };
+      let label = "";
+      if (requireLabel) {
+        if (typeof value.label !== "string" || value.label.trim().length > 80) return { ok: false, code: "CUSTOMER_DROPOFF_INVALID" };
+        label = value.label.trim();
+      }
+      return { ok: true, value: { lat: value.lat, lng: value.lng, addressLine, city, district, ...(requireLabel ? { label } : {}) } };
+    }
+    function customerDeliveryPreferenceDto(value) {
+      if (!value) return null;
+      return {
+        lat: value.lat,
+        lng: value.lng,
+        addressLine: typeof value.addressLine === "string" ? value.addressLine : "",
+        city: typeof value.city === "string" ? value.city : "",
+        district: typeof value.district === "string" ? value.district : "",
+        label: typeof value.label === "string" ? value.label : "",
+        updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : "",
+        schemaVersion: Number.isInteger(value.schemaVersion) ? value.schemaVersion : 1
+      };
+    }
     async function registerPrivateDevice(uid, token, platform, accessToken) {
       const [deviceSnapshot, deletionSnapshot] = await Promise.all([
         getFirestoreSnapshot("private_devices", uid, accessToken),
@@ -899,11 +1098,15 @@
     __name(providerDiscoveryReminderTargets, "providerDiscoveryReminderTargets");
     __name2(providerDiscoveryReminderTargets, "providerDiscoveryReminderTargets");
     function canRequestOrderContact(order, uid, target, purpose) {
-      if (!order || purpose !== "contact" || !["provider", "driver"].includes(target)) return false;
+      if (!order || purpose !== "contact" || !["provider", "driver", "customer"].includes(target)) return false;
       // Contact is operational data, not a durable participant directory. It
       // becomes available only while an accepted order is actively fulfilled.
       if (!["accepted", "preparing", "ready_for_pickup", "searching_driver", "assigned_to_driver", "picked_up"].includes(order.status)) return false;
       if (target === "provider") return uid === order.customerUid && !!order.providerUid;
+      if (target === "customer") {
+        const activeAssignedState = ["driver_assigned", "picked_up", "arrived", "delivered_pending_confirmation"].includes(order.deliveryStatus);
+        return activeAssignedState && !!order.driverUid && uid === order.driverUid && !!order.customerUid;
+      }
       // Driver contact is not disclosed until an actual driver is assigned,
       // and only to the customer or provider serving this exact order.
       return !!order.driverUid && (uid === order.customerUid || uid === order.providerUid);
@@ -913,7 +1116,7 @@
     async function handleOrderContact(body, callerUid, accessToken) {
       const orderId = typeof body?.orderId === "string" ? body.orderId.trim() : "";
       const target = body?.target;
-      if (!orderId || !["provider", "driver"].includes(target) || body?.purpose !== "contact") {
+      if (!orderId || !["provider", "driver", "customer"].includes(target) || body?.purpose !== "contact") {
         return jsonResponse({ success: false, code: "invalid_request", error: "Invalid order contact request" }, 400);
       }
       const order = await getFirestoreDoc("orders", orderId, accessToken);
@@ -921,11 +1124,15 @@
       if (!canRequestOrderContact(order, callerUid, target, body.purpose)) {
         return jsonResponse({ success: false, code: "forbidden", error: "Order contact is not available" }, 403);
       }
-      const targetUid = target === "provider" ? order.providerUid : order.driverUid;
-      const person = await getFirestoreDoc("users", targetUid, accessToken);
+      const targetUid = target === "provider" ? order.providerUid : target === "driver" ? order.driverUid : order.customerUid;
+      const [person, callerDeletion, targetDeletion] = await Promise.all([
+        getFirestoreDoc("users", targetUid, accessToken),
+        getFirestoreSnapshot("account_deletion_requests", callerUid, accessToken),
+        getFirestoreSnapshot("account_deletion_requests", targetUid, accessToken)
+      ]);
       // Do not signal whether unrelated accounts exist and never return a
       // profile; absence of a phone is a valid minimum-data result.
-      if (person?.role !== target) return jsonResponse({ success: false, code: "not_available", error: "Order contact is not available" }, 409);
+      if (publicProfileDeletionActive(callerDeletion) || publicProfileDeletionActive(targetDeletion) || person?.role !== target) return jsonResponse({ success: false, code: "not_available", error: "Order contact is not available" }, 409);
       return jsonResponse({ success: true, phone: typeof person?.phone === "string" ? person.phone : "" });
     }
     __name(handleOrderContact, "handleOrderContact");
@@ -1073,7 +1280,7 @@
     __name(canProviderManagePublicLocation, "canProviderManagePublicLocation");
     __name2(canProviderManagePublicLocation, "canProviderManagePublicLocation");
     function isDeliveryNotificationEvent(event) {
-      return ["self_pickup_selected", "self_pickup_completed", "driver_delivery_requested", "driver_assigned", "driver_rejected", "picked_up", "arrived", "delivery_pending_confirmation", "delivered", "driver_assigned_by_provider"].includes(event);
+      return ["self_pickup_selected", "self_pickup_completed", "driver_delivery_requested", "driver_delivery_requested_v2", "driver_match_available_v2", "driver_assigned", "driver_rejected", "picked_up", "arrived", "delivery_pending_confirmation", "delivered", "driver_assigned_by_provider"].includes(event);
     }
     __name(isDeliveryNotificationEvent, "isDeliveryNotificationEvent");
     __name2(isDeliveryNotificationEvent, "isDeliveryNotificationEvent");
@@ -1091,7 +1298,7 @@
     async function getEventRecipientUids(event, order, accessToken, storedEvent) {
       let values = [];
       if (["order_accepted", "order_rejected", "order_preparing", "order_ready", "picked_up", "arrived", "delivery_pending_confirmation", "self_pickup_completed"].includes(event)) values.push(order.customerUid);
-      if (["customer_cancelled", "order_cancelled", "self_pickup_selected", "driver_delivery_requested", "driver_assigned", "driver_rejected", "delivered"].includes(event)) values.push(order.providerUid);
+      if (["customer_cancelled", "order_cancelled", "self_pickup_selected", "driver_delivery_requested", "driver_delivery_requested_v2", "driver_assigned", "driver_rejected", "delivered"].includes(event)) values.push(order.providerUid);
       if (["order_cancelled", "driver_assigned", "driver_rejected", "delivered"].includes(event)) values.push(order.customerUid);
       if (event === "order_created") values.push(order.providerUid);
       // Chat notifications are bound to the participant snapshot committed
@@ -1111,12 +1318,13 @@
         const drivers = await queryFirestoreLimited("users", "isAvailable", "EQUAL", true, 200, accessToken);
         values.push(...selectEligibleNotificationDrivers(drivers).map((driver) => driver._id));
       }
+      if (event === "driver_match_available_v2" && Array.isArray(storedEvent?.recipientUids)) values.push(...storedEvent.recipientUids.filter(phase4aSafeSegment));
       return [...new Set(values.filter((value) => typeof value === "string" && value))];
     }
     __name(getEventRecipientUids, "getEventRecipientUids");
     __name2(getEventRecipientUids, "getEventRecipientUids");
-    async function claimNotificationEvent(orderId, transition, stateVersion, accessToken) {
-      const eventId = notificationEventId(orderId, transition, stateVersion);
+    async function claimNotificationEvent(orderId, transition, stateVersion, accessToken, storedEventId) {
+      const eventId = phase4aSafeSegment(storedEventId) ? storedEventId : notificationEventId(orderId, transition, stateVersion);
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) return null;
       const priorEvent = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
@@ -1208,9 +1416,9 @@
     }
     __name(mergeRecipientDeliveryResults, "mergeRecipientDeliveryResults");
     __name2(mergeRecipientDeliveryResults, "mergeRecipientDeliveryResults");
-    async function sendTransitionNotification(event, orderId, accessToken, stateVersion) {
+    async function sendTransitionNotification(event, orderId, accessToken, stateVersion, storedEventId) {
       try {
-        const claim = stateVersion !== void 0 ? await claimNotificationEvent(orderId, event, stateVersion, accessToken) : null;
+        const claim = stateVersion !== void 0 ? await claimNotificationEvent(orderId, event, stateVersion, accessToken, storedEventId) : null;
         if (stateVersion !== void 0 && !claim) return;
         const recipients = claim?.data?.recipients || [];
         const retryableUids = claim?.recipientUids || recipients.filter((recipient) => recipient.status === "pending" || recipient.status === "failed").map((recipient) => recipient.uid);
@@ -1271,6 +1479,7 @@
         fields = {
           deliveryMethod: "self_pickup",
           deliveryStatus: "self_pickup_selected",
+          status: "ready_for_pickup",
           driverUid: null,
           deliveryQuoteId: null,
           deliveryPricingVersion: null,
@@ -1367,6 +1576,7 @@
             driverUid: null,
             deliveryStatus: "ready_for_driver",
             lastRejectedDriverUid: uid,
+            rejectedDriverUids: appendRejectedDriverUid(order, uid),
             driverRejectedAt: now,
             driverRejectionCount: (Number(order.driverRejectionCount) || 0) + 1,
             driverAssignedAt: null,
@@ -1417,6 +1627,7 @@
     }
     __name(handleDeliveryTransition, "handleDeliveryTransition");
     __name2(handleDeliveryTransition, "handleDeliveryTransition");
+    const PRIVATE_DELIVERY_TERMINAL_EVENTS = ["customer_cancelled", "order_cancelled", "order_rejected", "self_pickup_selected", "self_pickup_completed", "delivered"];
     async function commitOrderAndOutbox(orderId, fields, serverTimestampFields, updateTime, event, stateVersion, accessToken) {
       const document = FIRESTORE_BASE + "/orders/" + orderId;
       const firestoreFields = {};
@@ -1440,7 +1651,7 @@
         }, {
           update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
           currentDocument: { exists: false }
-        }] })
+        }, ...(PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event) ? [{ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : [])] })
       });
       if (response.ok) return { ok: true };
       const text = await response.text();
@@ -2487,11 +2698,12 @@
     }
     __name(consumePhoneLoginRateLimit, "consumePhoneLoginRateLimit");
     __name2(consumePhoneLoginRateLimit, "consumePhoneLoginRateLimit");
-    async function batchGetUsers(uids, accessToken) {
+    async function batchGetDocuments(collectionId, ids, accessToken) {
+      if (!Array.isArray(ids) || !ids.length) return [];
       const response = await fetch(FIRESTORE_BASE + ":batchGet", {
         method: "POST",
         headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ documents: uids.map((uid) => "projects/tabbakheen-99883/databases/(default)/documents/users/" + uid) })
+        body: JSON.stringify({ documents: ids.map((id) => "projects/tabbakheen-99883/databases/(default)/documents/" + collectionId + "/" + id) })
       });
       if (!response.ok) throw new Error("Firestore batch-get failed: " + response.status);
       const text = await response.text();
@@ -2503,6 +2715,9 @@
         entries = text.split("\n").map((line) => line.trim().replace(/^,\s*|\s*,$/g, "")).filter((line) => line && line !== "[" && line !== "]").map((line) => JSON.parse(line));
       }
       return entries.filter((entry) => entry.found).map((entry) => parseFirestoreDoc(entry.found));
+    }
+    async function batchGetUsers(uids, accessToken) {
+      return batchGetDocuments("users", uids, accessToken);
     }
     async function queryFirestoreLimited(collectionId, fieldPath, op, value, limit, accessToken) {
       const firestoreValue = typeof value === "string" ? { stringValue: value } : typeof value === "boolean" ? { booleanValue: value } : { integerValue: String(value) };
@@ -2550,6 +2765,221 @@
       if (order && typeof order.pickupAddress === "string" && order.pickupAddress) dto.pickupAddress = order.pickupAddress;
       if (order && Number.isFinite(order.providerLat) && Number.isFinite(order.providerLng)) dto.pickupLocation = { lat: order.providerLat, lng: order.providerLng };
       return dto;
+    }
+    function orderDeliveryDistanceKm(order) {
+      if (typeof order?.deliveryDistanceKm === "number" && Number.isFinite(order.deliveryDistanceKm) && order.deliveryDistanceKm >= 0 && order.deliveryDistanceKm <= 20015) return roundDistanceKm(order.deliveryDistanceKm);
+      if (validSaudiCoordinatePair(order?.providerLat, order?.providerLng) && validSaudiCoordinatePair(order?.customerLat, order?.customerLng)) {
+        const calculated = haversineDistanceKm(order.providerLat, order.providerLng, order.customerLat, order.customerLng);
+        return Number.isFinite(calculated) ? roundDistanceKm(calculated) : null;
+      }
+      return null;
+    }
+    function driverAvailableDeliveryDtoV2(order, driverToPickupDistanceKm, deliveryDistanceKm, providerDisplayName = "") {
+      const deliveryFee = typeof order?.deliveryFee === "number" && Number.isFinite(order.deliveryFee) && order.deliveryFee >= 0 ? order.deliveryFee : 0;
+      const dto = {
+        id: order && (order._id || order.id),
+        offerTitleSnapshot: order && typeof order.offerTitleSnapshot === "string" ? order.offerTitleSnapshot : "",
+        providerUid: order?.providerUid,
+        providerDisplayName: typeof providerDisplayName === "string" ? providerDisplayName : "",
+        dropoffCity: typeof order?.dropoffCity === "string" && order.dropoffCity ? order.dropoffCity : null,
+        dropoffDistrict: typeof order?.dropoffDistrict === "string" && order.dropoffDistrict ? order.dropoffDistrict : null,
+        driverToPickupDistanceKm,
+        deliveryDistanceKm,
+        totalEstimatedDistanceKm: roundDistanceKm(driverToPickupDistanceKm + deliveryDistanceKm),
+        deliveryFee,
+        driverGrossDeliveryEarnings: deliveryFee,
+        platformDeliveryCommission: 0,
+        deliveryPaymentMethod: typeof order?.deliveryPaymentMethod === "string" ? order.deliveryPaymentMethod : null,
+        distanceMethod: "haversine_estimate",
+        createdAt: order?.createdAt,
+        deliveryMethod: order?.deliveryMethod,
+        deliveryStatus: order?.deliveryStatus,
+        status: order?.status
+      };
+      if (typeof order?.orderNumber === "string" && order.orderNumber.length <= 80) dto.orderNumber = order.orderNumber;
+      if (typeof order?.pickupAddress === "string" && order.pickupAddress) dto.pickupAddress = order.pickupAddress;
+      if (validSaudiCoordinatePair(order?.providerLat, order?.providerLng)) dto.pickupLocation = { lat: order.providerLat, lng: order.providerLng };
+      return dto;
+    }
+    function driverOrderMatchV2(order, driverUid, runtimeLocation, preferences) {
+      if (!order || !preferences?.ok || order.driverUid || order.deliveryStatus !== "ready_for_driver" || !isFulfillmentEligible(order) || !isDriverDeliveryMethod(order.deliveryMethod) || orderRejectedByDriver(order, driverUid) || !validSaudiCoordinatePair(order.providerLat, order.providerLng)) return null;
+      const driverToPickup = haversineDistanceKm(runtimeLocation.lat, runtimeLocation.lng, order.providerLat, order.providerLng);
+      const deliveryDistanceKm = orderDeliveryDistanceKm(order);
+      if (!Number.isFinite(driverToPickup) || !Number.isFinite(deliveryDistanceKm)) return null;
+      if (preferences.maxPickupDistanceKm !== null && driverToPickup > preferences.maxPickupDistanceKm) return null;
+      if (preferences.maxDeliveryDistanceKm !== null && deliveryDistanceKm > preferences.maxDeliveryDistanceKm) return null;
+      return { driverToPickupDistanceKm: roundDistanceKm(driverToPickup), deliveryDistanceKm: roundDistanceKm(deliveryDistanceKm) };
+    }
+    function matchAvailableDeliveriesV2(orders, driverUid, runtimeLocation, preferences, resultLimit, providerNames = /* @__PURE__ */ new Map()) {
+      if (!Array.isArray(orders) || !phase4aSafeSegment(driverUid) || !validSaudiCoordinatePair(runtimeLocation?.lat, runtimeLocation?.lng) || !preferences?.ok) return [];
+      const matches = [];
+      for (const order of orders) {
+        const distance = driverOrderMatchV2(order, driverUid, runtimeLocation, preferences);
+        if (!distance) continue;
+        matches.push({ order, ...distance });
+      }
+      matches.sort((a, b) => a.driverToPickupDistanceKm - b.driverToPickupDistanceKm || String(a.order.createdAt || "").localeCompare(String(b.order.createdAt || "")) || String(a.order._id || a.order.id || "").localeCompare(String(b.order._id || b.order.id || "")));
+      return matches.slice(0, resultLimit).map(({ order, driverToPickupDistanceKm, deliveryDistanceKm }) => driverAvailableDeliveryDtoV2(order, driverToPickupDistanceKm, deliveryDistanceKm, providerNames.get(order.providerUid) || ""));
+    }
+    const DELIVERY_PRICING_DEFAULTS = { currency: "SAR", baseFee: 5, perKmInsideCity: 2, perKmOutsideCity: 2, minFee: 5, maxFee: 50 };
+    function normalizeDeliveryPricing(value) {
+      const source = value?.deliveryPricing && typeof value.deliveryPricing === "object" ? value.deliveryPricing : value && typeof value === "object" ? value : {};
+      const finite = (candidate, fallback, maximum) => typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 && candidate <= maximum ? candidate : fallback;
+      const minFee = finite(source.minFee, DELIVERY_PRICING_DEFAULTS.minFee, 1e5);
+      const configuredMax = finite(source.maxFee, DELIVERY_PRICING_DEFAULTS.maxFee, 1e5);
+      return {
+        currency: typeof source.currency === "string" && /^[A-Z]{3}$/.test(source.currency) ? source.currency : DELIVERY_PRICING_DEFAULTS.currency,
+        baseFee: finite(source.baseFee, DELIVERY_PRICING_DEFAULTS.baseFee, 1e4),
+        perKmInsideCity: finite(source.perKmInsideCity, DELIVERY_PRICING_DEFAULTS.perKmInsideCity, 1e4),
+        perKmOutsideCity: finite(source.perKmOutsideCity, DELIVERY_PRICING_DEFAULTS.perKmOutsideCity, 1e4),
+        minFee,
+        maxFee: Math.max(minFee, configuredMax)
+      };
+    }
+    function deliveryPricingVersion(value) {
+      const pricing = normalizeDeliveryPricing(value);
+      const serialized = JSON.stringify([pricing.currency, pricing.baseFee, pricing.perKmInsideCity, pricing.perKmOutsideCity, pricing.minFee, pricing.maxFee]);
+      let hash = 2166136261;
+      for (let index = 0; index < serialized.length; index++) {
+        hash ^= serialized.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      return "delivery-v2-" + (hash >>> 0).toString(16).padStart(8, "0");
+    }
+    function calculateDeliveryPricing(order, value) {
+      if (!validCoordinatePair(order?.providerLat, order?.providerLng)) return { ok: false, code: "PROVIDER_COORDINATES_REQUIRED" };
+      if (!validCoordinatePair(order?.customerLat, order?.customerLng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
+      const pricing = normalizeDeliveryPricing(value);
+      const distance = haversineDistanceKm(order.providerLat, order.providerLng, order.customerLat, order.customerLng);
+      if (!Number.isFinite(distance)) return { ok: false, code: "DELIVERY_COORDINATES_INVALID" };
+      const deliveryDistanceKm = roundDistanceKm(distance);
+      let deliveryFee = Math.round(pricing.baseFee + deliveryDistanceKm * pricing.perKmInsideCity);
+      deliveryFee = Math.max(pricing.minFee, deliveryFee);
+      deliveryFee = Math.min(pricing.maxFee, deliveryFee);
+      return { ok: true, deliveryDistanceKm, deliveryFee, currency: pricing.currency, pricingVersion: deliveryPricingVersion(pricing), pricing };
+    }
+    async function loadDeliveryPricing(accessToken) {
+      try {
+        return normalizeDeliveryPricing(await getFirestoreDoc("app_settings", "main", accessToken));
+      } catch (error) {
+        console.log("[Worker] Could not load delivery pricing, using defaults:", error && error.message ? error.message : error);
+        return normalizeDeliveryPricing(null);
+      }
+    }
+    async function saveCustomerDeliveryPreference(uid, preference, accessToken, deletionFence, existingSnapshot) {
+      const fields = { ...preference, schemaVersion: 1 };
+      return phase4aCommit([{
+        update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, fields),
+        updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
+        currentDocument: existingSnapshot ? { updateTime: existingSnapshot.updateTime } : { exists: false }
+      }, deletionFence], accessToken);
+    }
+    function deliveryFinalizationV2IsIdempotent(order, quoteId, deliveryPaymentMethod) {
+      return !!order && order.deliveryQuoteId === quoteId && order.deliveryPaymentMethod === deliveryPaymentMethod && isDriverDeliveryMethod(order.deliveryMethod) && ["ready_for_driver", "driver_assigned", "picked_up", "arrived", "delivered_pending_confirmation", "delivered"].includes(order.deliveryStatus);
+    }
+    function deliveryFinalizationV2Response(order, idempotent = false) {
+      return {
+        success: true,
+        ...(idempotent ? { idempotent: true } : {}),
+        deliveryFee: typeof order.deliveryFee === "number" ? order.deliveryFee : 0,
+        totalAmount: typeof order.totalAmount === "number" ? order.totalAmount : 0,
+        deliveryDistanceKm: typeof order.deliveryDistanceKm === "number" ? order.deliveryDistanceKm : 0,
+        deliveryQuoteId: order.deliveryQuoteId,
+        pricingVersion: order.deliveryPricingVersion,
+        deliveryPaymentMethod: order.deliveryPaymentMethod,
+        platformDeliveryCommission: 0,
+        driverGrossDeliveryEarnings: typeof order.driverGrossDeliveryEarnings === "number" ? order.driverGrossDeliveryEarnings : order.deliveryFee
+      };
+    }
+    const ORDER_DELIVERY_DETAILS_CUSTOMER_STATES = ["ready_for_driver", "driver_assigned", "picked_up", "arrived", "delivered_pending_confirmation"];
+    const ORDER_DELIVERY_DETAILS_DRIVER_STATES = ["driver_assigned", "picked_up", "arrived", "delivered_pending_confirmation"];
+    function orderDeliveryDetailsAuthorization(order, uid, role) {
+      if (!order || !phase4aSafeSegment(uid) || !isDriverDeliveryMethod(order.deliveryMethod) || ["cancelled", "delivered", "rejected"].includes(order.status)) return { allowed: false, code: "TRANSITION_NOT_ALLOWED" };
+      if (role === "customer") return order.customerUid === uid && ORDER_DELIVERY_DETAILS_CUSTOMER_STATES.includes(order.deliveryStatus) ? { allowed: true } : { allowed: false, code: "FORBIDDEN" };
+      if (role === "driver") return order.driverUid === uid && ORDER_DELIVERY_DETAILS_DRIVER_STATES.includes(order.deliveryStatus) ? { allowed: true } : { allowed: false, code: "FORBIDDEN" };
+      return { allowed: false, code: "FORBIDDEN" };
+    }
+    function orderDeliveryPrivateDto(value) {
+      if (!value || !validSaudiCoordinatePair(value.lat, value.lng)) return null;
+      const addressLine = boundedRequiredString(value.addressLine, 300);
+      const city = boundedRequiredString(value.city, 120);
+      const district = boundedRequiredString(value.district, 120);
+      if (!addressLine || !city || !district) return null;
+      return { success: true, addressLine, city, district, lat: value.lat, lng: value.lng, deliveryNotes: typeof value.deliveryNotes === "string" ? value.deliveryNotes.slice(0, 500) : "" };
+    }
+    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, stateVersion, accessToken, deletionFence) {
+      const event = "driver_delivery_requested_v2";
+      const eventId = notificationEventId(orderId, event, stateVersion);
+      const jobId = "dm_" + orderId + "_" + stateVersion;
+      const now = new Date().toISOString();
+      const orderFields = {};
+      for (const [key, value] of Object.entries(fields)) orderFields[key] = toFirestoreValue(value);
+      const privateFields = {};
+      for (const [key, value] of Object.entries({
+        orderId,
+        customerUid: privateDestination.customerUid,
+        providerUid: privateDestination.providerUid,
+        lat: privateDestination.lat,
+        lng: privateDestination.lng,
+        addressLine: privateDestination.addressLine,
+        city: privateDestination.city,
+        district: privateDestination.district,
+        deliveryNotes: privateDestination.deliveryNotes,
+        createdAt: typeof privateSnapshot?.data?.createdAt === "string" ? privateSnapshot.data.createdAt : now,
+        updatedAt: now,
+        schemaVersion: 1
+      })) privateFields[key] = toFirestoreValue(value);
+      const quoteFields = { status: toFirestoreValue("used"), usedAt: toFirestoreValue(now) };
+      const eventFields = {
+        orderId: toFirestoreValue(orderId),
+        transition: toFirestoreValue(event),
+        stateVersion: toFirestoreValue(stateVersion),
+        status: toFirestoreValue("pending"),
+        createdAt: toFirestoreValue(now)
+      };
+      const jobFields = {
+        orderId: toFirestoreValue(orderId),
+        stateVersion: toFirestoreValue(stateVersion),
+        status: toFirestoreValue("pending"),
+        cursor: toFirestoreValue(null),
+        scannedCount: toFirestoreValue(0),
+        matchedCount: toFirestoreValue(0),
+        notifiedCount: toFirestoreValue(0),
+        pageSequence: toFirestoreValue(0),
+        createdAt: toFirestoreValue(now),
+        updatedAt: toFirestoreValue(now),
+        schemaVersion: toFirestoreValue(1)
+      };
+      const response = await fetch(FIRESTORE_BASE + ":commit", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ writes: [{
+          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + orderId, fields: orderFields },
+          // Masking absent private paths deletes any legacy destination/contact
+          // values that may already exist on the readable order.
+          updateMask: { fieldPaths: [...new Set([...Object.keys(fields), ...ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS])] },
+          currentDocument: { updateTime: orderSnapshot.updateTime }
+        }, {
+          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId, fields: privateFields },
+          currentDocument: privateSnapshot ? { updateTime: privateSnapshot.updateTime } : { exists: false }
+        }, {
+          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + quoteId, fields: quoteFields },
+          updateMask: { fieldPaths: ["status", "usedAt"] },
+          currentDocument: { updateTime: quoteSnapshot.updateTime }
+        }, {
+          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
+          currentDocument: { exists: false }
+        }, {
+          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_MATCH_JOBS_COLLECTION + "/" + jobId, fields: jobFields },
+          currentDocument: { exists: false }
+        }, deletionFence] })
+      });
+      if (response.ok) return { ok: true, event, jobId };
+      const text = await response.text();
+      let status = "";
+      try { status = JSON.parse(text).error?.status || ""; } catch {}
+      if ([409, 412].includes(response.status) || ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(status)) return { ok: false, conflict: true };
+      throw new Error("Firestore delivery V2 finalization failed: " + response.status);
     }
     function parseAppleSubscriptionStatusPayload(payload) {
       if (!payload || typeof payload !== "object") return null;
@@ -3971,6 +4401,8 @@
         self_pickup_selected: ["استلام ذاتي", "سيستلم العميل الطلب \"" + label + "\" بنفسه.", "Self pickup selected", "The customer will collect order " + label + "."],
         self_pickup_completed: ["تم تسليم الطلب", "تم تسليم الطلب \"" + label + "\" بنجاح.", "Order completed", "Order " + label + " was completed."],
         driver_delivery_requested: ["طلب توصيل", "طُلب توصيل الطلب \"" + label + "\" بواسطة مندوب.", "Delivery requested", "Delivery was requested for order " + label + "."],
+        driver_delivery_requested_v2: ["طلب توصيل", "طُلب توصيل الطلب \"" + label + "\" بواسطة مندوب.", "Delivery requested", "Delivery was requested for order " + label + "."],
+        driver_match_available_v2: ["طلب توصيل قريب منك", "يوجد طلب جاهز للاستلام ضمن نطاقك. افتح طباخين لعرض المسافة والأجر.", "Delivery request near you", "A pickup-ready order is within your range. Open Tabbakheen to view the distance and earnings."],
         driver_assigned: ["تم تعيين مندوب", "تم تعيين مندوب للطلب \"" + label + "\".", "Driver assigned", "A driver was assigned to order " + label + "."],
         driver_rejected: ["جاري البحث عن مندوب", "اعتذر المندوب عن الطلب \"" + label + "\" ويجري البحث عن بديل.", "Finding another driver", "A new driver is being found for order " + label + "."],
         picked_up: ["استلم المندوب الطلب", "الطلب \"" + label + "\" في الطريق.", "Order picked up", "Order " + label + " is on the way."],
@@ -3983,9 +4415,10 @@
       }[event];
       if (!values) return null;
       const driverDiscovery = event === "driver_delivery_requested" && recipientRole === "driver";
+      const targetedDriverDiscovery = event === "driver_match_available_v2" && recipientRole === "driver";
       return {
         recipientUid,
-        type: event.startsWith("order_chat_") ? "order_chat_message" : driverDiscovery ? "new_delivery_available" : event === "picked_up" ? "order_picked_up" : event === "arrived" ? "driver_arrived" : event === "delivered" ? "order_delivered" : event === "self_pickup_completed" ? "order_completed" : event,
+        type: event.startsWith("order_chat_") ? "order_chat_message" : driverDiscovery || targetedDriverDiscovery ? "new_delivery_available" : event === "picked_up" ? "order_picked_up" : event === "arrived" ? "driver_arrived" : event === "delivered" ? "order_delivered" : event === "self_pickup_completed" ? "order_completed" : event,
         category: event.startsWith("order_chat_") ? "message" : isDeliveryNotificationEvent(event) ? "delivery" : "order",
         title: driverDiscovery ? "توصيلة جديدة متاحة" : values[0],
         body: driverDiscovery ? "توصيلة جديدة متاحة للطلب \"" + label + "\"." : values[1],
@@ -4003,6 +4436,7 @@
       }
       const orderLabel = order.offerTitleSnapshot || order.orderNumber || orderId;
       const messages = [];
+      const preloadedTokens = /* @__PURE__ */ new Map();
       switch (event) {
         case "order_accepted": {
           if (order.customerUid) {
@@ -4068,6 +4502,33 @@
               to: token,
               title: "\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u{1F680}",
               body: '\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u0644\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
+              data: { type: "new_delivery_available", orderId, role: "driver" },
+              sound: "default"
+            });
+          }
+          break;
+        }
+        case "driver_delivery_requested_v2": {
+          if (order.providerUid) {
+            const providerToken = await getUserPushToken(order.providerUid, accessToken);
+            if (providerToken) messages.push({
+              to: providerToken,
+              title: "توصيل بمندوب 🚗",
+              body: 'العميل طلب توصيل الطلب "' + orderLabel + '" بواسطة مندوب',
+              data: { type: "driver_delivery_requested", orderId, role: "provider" },
+              sound: "default"
+            });
+          }
+          break;
+        }
+        case "driver_match_available_v2": {
+          for (const recipientUid of Array.isArray(recipientUids) ? recipientUids : []) {
+            const token = await getUserPushToken(recipientUid, accessToken);
+            preloadedTokens.set(recipientUid, token);
+            if (token) messages.push({
+              to: token,
+              title: "طلب توصيل قريب منك",
+              body: "يوجد طلب جاهز للاستلام ضمن نطاقك. افتح طباخين لعرض المسافة والأجر.",
               data: { type: "new_delivery_available", orderId, role: "driver" },
               sound: "default"
             });
@@ -4350,17 +4811,29 @@
         // The inbox is authoritative and durable. Persist every intended
         // recipient before attempting the best-effort Expo transport.
         const badgeByUid = /* @__PURE__ */ new Map();
-        for (const uid of recipientUids) {
+        const notificationInput = /* @__PURE__ */ __name((uid) => {
           const role = uid === order.customerUid ? "customer" : uid === order.providerUid ? "provider" : uid === order.driverUid ? "driver" : event === "driver_delivery_requested" ? "driver" : leaseContext?.data?.recipientRole;
           const content = orderNotificationContent(event, { ...order, _id: orderId }, uid, role);
-          if (content) {
-            const outcome = await persistUserNotification({ ...content, eventKey: (leaseContext?.eventId || notificationEventId(orderId, event, leaseContext?.data?.stateVersion || "legacy")) + ":" + uid }, accessToken);
+          return content ? { ...content, eventKey: (leaseContext?.eventId || notificationEventId(orderId, event, leaseContext?.data?.stateVersion || "legacy")) + ":" + uid } : null;
+        }, "notificationInput");
+        if (event === "driver_match_available_v2") {
+          const users = recipientUids.map((uid) => ({ _id: uid, role: "driver" }));
+          const outcomes = await persistBroadcastNotificationBatch(users, (user) => notificationInput(user._id), accessToken);
+          for (const uid of recipientUids) {
+            const outcome = outcomes.get(uid);
+            if (Number.isInteger(outcome?.summary?.totalUnread)) badgeByUid.set(uid, Math.max(0, outcome.summary.totalUnread));
+          }
+        } else {
+          for (const uid of recipientUids) {
+            const input = notificationInput(uid);
+            if (!input) continue;
+            const outcome = await persistUserNotification(input, accessToken);
             if (Number.isInteger(outcome.summary?.totalUnread)) badgeByUid.set(uid, Math.max(0, outcome.summary.totalUnread));
           }
         }
         const tokenOwners = /* @__PURE__ */ new Map();
         for (const uid of recipientUids) {
-          const token = await getUserPushToken(uid, accessToken);
+          const token = preloadedTokens.has(uid) ? preloadedTokens.get(uid) : await getUserPushToken(uid, accessToken);
           if (token) tokenOwners.set(token, uid);
           else skippedRecipientUids.push(uid);
         }
@@ -4383,7 +4856,10 @@
           messages.splice(0, messages.length, ...messages.filter((message) => fenced.has(message._recipientUid)));
           outboxUpdateTime = renewed.updateTime;
         }
-        pushResult = await sendExpoPush(messages, accessToken);
+        // Targeted matching has a strict subrequest budget. Receipt processing
+        // performs UID-bound stale-token cleanup later; avoid the unbounded
+        // token-owner queries used by the general push path here.
+        pushResult = await sendExpoPush(messages, event === "driver_match_available_v2" ? null : accessToken);
         console.log("[Push] Notification aggregate:", event, JSON.stringify({ acceptedCount: pushResult.acceptedCount, failedCount: pushResult.failedCount, staleTokensCount: pushResult.staleTokensCount }));
       }
       return { success: true, notificationsSent: messages.length, pushResult, skippedRecipientUids, outboxUpdateTime };
@@ -7137,6 +7613,24 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       }
       return { deletedCount: ids.length, complete: ids.length < 50 && !page.nextPageToken };
     }
+    async function deleteDeliveryQuotesForCustomerBatch(uid, accessToken) {
+      const quotes = await queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "customerUid", "EQUAL", uid, 50, accessToken);
+      const ids = quotes.map((quote) => quote?._id).filter(phase4aSafeSegment);
+      if (ids.length) {
+        const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/";
+        if (!await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken)) throw new Error("Delivery quote cleanup changed; retry");
+      }
+      return { deletedCount: ids.length, complete: ids.length < 50 };
+    }
+    async function deleteOrderDeliveryPrivateForCustomerBatch(uid, accessToken) {
+      const records = await queryFirestoreLimited(ORDER_DELIVERY_PRIVATE_COLLECTION, "customerUid", "EQUAL", uid, 50, accessToken);
+      const ids = records.map((record) => record?._id).filter(phase4aSafeSegment);
+      if (ids.length) {
+        const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/";
+        if (!await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken)) throw new Error("Private delivery cleanup changed; retry");
+      }
+      return { deletedCount: ids.length, complete: ids.length < 50 };
+    }
     async function buildAccountDeletionManifest(uid, user, accessToken, env) {
       const verification = await getFirestoreDoc("verifications", uid, accessToken);
       const certificatePublicId = cloudinaryPublicIdFromVerification(verification);
@@ -7163,6 +7657,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         phoneIndexDeleted: !indexedPhoneMustBeRemoved,
         publicProfileDeleted: false,
         privateDeviceDeleted: false,
+        driverRuntimeLocationDeleted: false,
+        customerDeliveryPreferenceDeleted: false,
+        deliveryQuotesDeleted: user.role !== "customer",
+        orderDeliveryPrivateDeleted: user.role !== "customer",
         notificationItemsDeleted: false,
         notificationUnreadDeleted: false,
         notificationSummaryDeleted: false,
@@ -7205,6 +7703,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       // or a private push token behind.
       if (!Object.prototype.hasOwnProperty.call(manifest, "publicProfileDeleted")) manifest.publicProfileDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "privateDeviceDeleted")) manifest.privateDeviceDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "driverRuntimeLocationDeleted")) manifest.driverRuntimeLocationDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "customerDeliveryPreferenceDeleted")) manifest.customerDeliveryPreferenceDeleted = false;
+      if (!Object.prototype.hasOwnProperty.call(manifest, "deliveryQuotesDeleted")) manifest.deliveryQuotesDeleted = manifest.role !== "customer";
+      if (!Object.prototype.hasOwnProperty.call(manifest, "orderDeliveryPrivateDeleted")) manifest.orderDeliveryPrivateDeleted = manifest.role !== "customer";
       if (!Object.prototype.hasOwnProperty.call(manifest, "notificationItemsDeleted")) manifest.notificationItemsDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "notificationUnreadDeleted")) manifest.notificationUnreadDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "notificationSummaryDeleted")) manifest.notificationSummaryDeleted = false;
@@ -7272,6 +7774,42 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("private_device_delete_failed"); }
+      }
+      if (manifest.driverRuntimeLocationDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument(DRIVER_RUNTIME_LOCATION_COLLECTION, uid, accessToken);
+          manifest.driverRuntimeLocationDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("driver_runtime_location_delete_failed"); }
+      }
+      if (manifest.customerDeliveryPreferenceDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          await deleteFirestoreDocument(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, accessToken);
+          manifest.customerDeliveryPreferenceDeleted = true;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("customer_delivery_preference_delete_failed"); }
+      }
+      if (manifest.deliveryQuotesDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          const result = await deleteDeliveryQuotesForCustomerBatch(uid, accessToken);
+          manifest.deliveryQuotesDeleted = result.complete;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("delivery_quotes_delete_failed"); }
+      }
+      if (manifest.orderDeliveryPrivateDeleted !== true) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          const result = await deleteOrderDeliveryPrivateForCustomerBatch(uid, accessToken);
+          manifest.orderDeliveryPrivateDeleted = result.complete;
+          const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
+          if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        } catch { failures.push("order_delivery_private_delete_failed"); }
       }
       if (manifest.notificationItemsDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -7345,7 +7883,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("verification_delete_failed"); }
       }
-      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.notificationItemsDeleted === true && manifest.notificationUnreadDeleted === true && manifest.notificationSummaryDeleted === true && manifest.clientInstallationsDeleted === true && manifest.clientInstallationSummaryDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
+      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.driverRuntimeLocationDeleted === true && manifest.customerDeliveryPreferenceDeleted === true && manifest.deliveryQuotesDeleted === true && manifest.orderDeliveryPrivateDeleted === true && manifest.notificationItemsDeleted === true && manifest.notificationUnreadDeleted === true && manifest.notificationSummaryDeleted === true && manifest.clientInstallationsDeleted === true && manifest.clientInstallationSummaryDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
       const final = await writeDeletionState(uid, owner, {
         status: complete ? "completed" : "cleanup_pending",
         cleanupManifest: manifest,
@@ -7430,21 +7968,113 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(handleAccountDeletion, "handleAccountDeletion");
     __name2(handleAccountDeletion, "handleAccountDeletion");
-    async function resumeAccountDeletions(env) {
-      const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+    async function resumeAccountDeletionsWithAccessToken(env, suppliedAccessToken) {
+      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
       const records = [];
       for (const status of ["requested", "in_progress", "auth_deleted", "cleanup_pending"]) records.push(...await queryFirestore("account_deletion_requests", "status", "EQUAL", status, accessToken));
       for (const record of records.slice(0, 10)) {
         try { await processAccountDeletion(record.uid, env, accessToken, record); } catch {}
       }
+      return records.length > 0;
+    }
+    async function resumeAccountDeletions(env) {
+      return resumeAccountDeletionsWithAccessToken(env);
     }
     __name(resumeAccountDeletions, "resumeAccountDeletions");
     __name2(resumeAccountDeletions, "resumeAccountDeletions");
-    async function handleScheduledOutbox(env) {
+    function deliveryMatchJobOrderIsActive(order, job) {
+      return !!order && !order.driverUid && order.deliveryStatus === "ready_for_driver" && order.status === "searching_driver" && isDriverDeliveryMethod(order.deliveryMethod) && Number(order.deliveryStateVersion) === Number(job.stateVersion);
+    }
+    async function processDeliveryMatchJob(job, accessToken) {
+      if (!job?._id) return;
+      const snapshot = await getFirestoreSnapshot(DELIVERY_MATCH_JOBS_COLLECTION, job._id, accessToken);
+      if (!snapshot || snapshot.data.status !== "pending" || snapshot.data.leaseUntil && new Date(snapshot.data.leaseUntil).getTime() > Date.now()) return;
+      const owner = crypto.randomUUID();
+      const leaseUntil = new Date(Date.now() + 30 * 1e3).toISOString();
+      const claimed = await compareAndSetFirestoreDocument(DELIVERY_MATCH_JOBS_COLLECTION, job._id, { leaseOwner: owner, leaseUntil, updatedAt: new Date().toISOString() }, snapshot.updateTime, accessToken);
+      if (!claimed.ok) return;
+      const currentJob = { ...snapshot.data, leaseOwner: owner, leaseUntil };
+      const order = await getFirestoreDoc("orders", currentJob.orderId, accessToken);
+      if (!deliveryMatchJobOrderIsActive(order, currentJob)) {
+        await compareAndSetFirestoreDocument(DELIVERY_MATCH_JOBS_COLLECTION, job._id, { status: "stopped", stopReason: "order_not_available", leaseOwner: null, leaseUntil: null, updatedAt: new Date().toISOString() }, claimed.document.updateTime, accessToken);
+        return;
+      }
+      const page = await listFirestoreDocumentsPage("users", DELIVERY_MATCH_SCAN_PAGE_SIZE, currentJob.cursor, accessToken);
+      const candidates = selectEligibleNotificationDrivers(page.documents, DELIVERY_MATCH_NOTIFICATION_BATCH_SIZE).filter((driver) => phase4aSafeSegment(driver._id));
+      const candidateUids = candidates.map((driver) => driver._id);
+      const [locations, deletions] = await Promise.all([
+        batchGetDocuments(DRIVER_RUNTIME_LOCATION_COLLECTION, candidateUids, accessToken),
+        batchGetDocuments("account_deletion_requests", candidateUids, accessToken)
+      ]);
+      const locationsByUid = new Map(locations.map((location) => [location._id, location]));
+      const deletingUids = new Set(deletions.filter((deletion) => PUBLIC_PROFILE_DELETION_STATUSES.includes(deletion.status)).map((deletion) => deletion._id));
+      const matched = candidates.filter((driver) => {
+        if (deletingUids.has(driver._id)) return false;
+        const location = locationsByUid.get(driver._id);
+        if (!driverRuntimeLocationStatus(location).fresh) return false;
+        return !!driverOrderMatchV2(order, driver._id, location, driverDistancePreferences(driver));
+      });
+      // Re-read immediately before atomically advancing the cursor and creating
+      // per-driver outbox events. Assignment/cancellation invalidates the order
+      // precondition, so no stale match event can be queued.
+      const latestOrderSnapshot = await getFirestoreSnapshot("orders", currentJob.orderId, accessToken);
+      if (!deliveryMatchJobOrderIsActive(latestOrderSnapshot?.data, currentJob)) {
+        await compareAndSetFirestoreDocument(DELIVERY_MATCH_JOBS_COLLECTION, job._id, { status: "stopped", stopReason: "order_not_available", leaseOwner: null, leaseUntil: null, updatedAt: new Date().toISOString() }, claimed.document.updateTime, accessToken);
+        return;
+      }
+      const completed = !page.nextPageToken;
+      const now = new Date().toISOString();
+      const jobFields = {
+        status: completed ? "completed" : "pending",
+        cursor: page.nextPageToken || null,
+        scannedCount: (Number(currentJob.scannedCount) || 0) + page.documents.length,
+        matchedCount: (Number(currentJob.matchedCount) || 0) + matched.length,
+        notifiedCount: (Number(currentJob.notifiedCount) || 0) + matched.length,
+        pageSequence: (Number(currentJob.pageSequence) || 0) + 1,
+        leaseOwner: null,
+        leaseUntil: null,
+        updatedAt: now,
+        ...(completed ? { completedAt: now } : {})
+      };
+      const writes = [{
+        update: phase4aDoc(DELIVERY_MATCH_JOBS_COLLECTION, job._id, jobFields),
+        updateMask: { fieldPaths: Object.keys(jobFields) },
+        currentDocument: { updateTime: claimed.document.updateTime }
+      }, {
+        verify: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + currentJob.orderId,
+        currentDocument: { updateTime: latestOrderSnapshot.updateTime }
+      }];
+      if (matched.length) {
+        const transition = "driver_match_available_v2";
+        const pageNumber = Number(currentJob.pageSequence) || 0;
+        const eventId = notificationEventId(currentJob.orderId, transition, currentJob.stateVersion) + "_p" + pageNumber;
+        const eventFields = { orderId: currentJob.orderId, transition, stateVersion: currentJob.stateVersion, recipientUids: matched.map((driver) => driver._id), recipientRole: "driver", status: "pending", createdAt: now };
+        writes.push({ update: phase4aDoc("order_transition_events", eventId, eventFields), currentDocument: { exists: false } });
+      }
+      await phase4aCommit(writes, accessToken);
+    }
+    async function processDeliveryMatchJobs(env, suppliedAccessToken) {
+      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      const jobs = await queryFirestoreLimited(DELIVERY_MATCH_JOBS_COLLECTION, "status", "EQUAL", "pending", 3, accessToken);
+      const candidate = jobs.find((job) => !job.leaseUntil || new Date(job.leaseUntil).getTime() <= Date.now());
+      if (candidate) await processDeliveryMatchJob(candidate, accessToken);
+      return !!candidate;
+    }
+    async function cleanupDeliveryQuotes(env, suppliedAccessToken) {
+      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      const now = new Date().toISOString();
+      const [expired, used] = await Promise.all([
+        queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "expiresAt", "LESS_THAN_OR_EQUAL", now, 10, accessToken),
+        queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "status", "EQUAL", "used", 10, accessToken)
+      ]);
+      const ids = [...new Set([...expired, ...used].map((quote) => quote?._id).filter(phase4aSafeSegment))].slice(0, 20);
+      if (ids.length) await phase4aCommit(ids.map((id) => ({ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + id })), accessToken);
+    }
+    async function handleScheduledOutbox(env, suppliedAccessToken) {
       // Commercial entitlement reconciliation is intentionally event-driven
       // (entitlement reads and denied mutations). A minute-cron sweep would
       // require scanning users/offers or new index assumptions, so none is run.
-      const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
       const [pending, failed, sent, pendingOrders] = await Promise.all([
         queryFirestore("order_transition_events", "status", "EQUAL", "pending", accessToken),
         queryFirestore("order_transition_events", "status", "EQUAL", "failed", accessToken),
@@ -7454,13 +8084,20 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         // pending order every minute (~26k reads/day on its own).
         queryFirestoreAllEqual("orders", { status: "pending", transactionalNotificationVersion: 1 }, 25, accessToken)
       ]);
-      for (const eventDoc of [...pending, ...failed].slice(0, 25)) {
-        if (eventDoc.leaseUntil && new Date(eventDoc.leaseUntil).getTime() > Date.now()) continue;
-        await sendTransitionNotification(eventDoc.transition, eventDoc.orderId, accessToken, eventDoc.stateVersion);
-        await new Promise((resolve) => setTimeout(resolve, 50));
+      // One outbox work item per invocation gives targeted matching a hard
+      // subrequest ceiling. Admin broadcasts use a separate architecture.
+      const retryableEvent = [...pending, ...failed].find((eventDoc) => !eventDoc.leaseUntil || new Date(eventDoc.leaseUntil).getTime() <= Date.now());
+      if (retryableEvent) {
+        await sendTransitionNotification(retryableEvent.transition, retryableEvent.orderId, accessToken, retryableEvent.stateVersion, retryableEvent._id);
+        return true;
       }
-      for (const eventDoc of sent.slice(0, 25)) await pollOutboxReceipts(eventDoc, accessToken);
-      for (const order of pendingOrders.filter((item) => item.status === "pending" && item.transactionalNotificationVersion === 1).slice(0, 25)) {
+      if (sent.length) {
+        await pollOutboxReceipts(sent[0], accessToken);
+        return true;
+      }
+      const repairOrder = pendingOrders.find((item) => item.status === "pending" && item.transactionalNotificationVersion === 1);
+      if (repairOrder) {
+        const order = repairOrder;
         const version = notificationStateVersion(order, "order_created");
         await sendTransitionNotification("order_created", order._id, accessToken, version);
         const eventDoc = await getFirestoreDoc("order_transition_events", notificationEventId(order._id, "order_created", version), accessToken);
@@ -7470,10 +8107,27 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             await compareAndSetFirestoreDocument("orders", order._id, { transactionalNotificationVersion: 2, transactionalNotificationReconciledAt: new Date().toISOString() }, orderSnapshot.updateTime, accessToken);
           }
         }
+        return true;
       }
+      return pending.length > 0 || failed.length > 0 || sent.length > 0 || pendingOrders.length > 0;
     }
     __name(handleScheduledOutbox, "handleScheduledOutbox");
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
+    async function handleScheduledMaintenance(env) {
+      const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      // Never combine account-deletion work with outbox transport in the same
+      // invocation: deletion retries can be large and are not part of the
+      // targeted notification's fixed budget.
+      const deletionBusy = await resumeAccountDeletionsWithAccessToken(env, accessToken);
+      if (deletionBusy) return;
+      const outboxBusy = await handleScheduledOutbox(env, accessToken);
+      // Existing outbox and account-deletion work always has priority. On an
+      // idle minute, process one one-driver match page; cleanup uses the lane
+      // only when no match job is waiting. This keeps the modeled worst case
+      // below the 50-subrequest Free-plan ceiling without changing the cron.
+      if (outboxBusy) return;
+      if (!await processDeliveryMatchJobs(env, accessToken)) await cleanupDeliveryQuotes(env, accessToken);
+    }
     // Offline tests load the compiled Worker in Node with this explicit process
     // flag. Cloudflare Workers have no `process`, so no test surface exists in
     // production.
@@ -7507,6 +8161,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         phase4aCommit,
         publicProfileFromPrivateUser,
         classifyPublicProfileProjection,
+        canRequestOrderContact,
         handleOrderContact,
         handleOrderPaymentInstructions,
         handlePublicRatings,
@@ -7514,6 +8169,38 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         updatePublicLocationPreference,
         registerPrivateDevice,
         setDriverAvailabilityAndSync,
+        validCoordinatePair,
+        validSaudiCoordinatePair,
+        haversineDistanceKm,
+        roundDistanceKm,
+        validateDriverRuntimeLocationInput,
+        driverRuntimeLocationStatus,
+        shouldCoalesceDriverLocationUpdate,
+        normalizeDriverDistancePreference,
+        driverDistancePreferences,
+        normalizeDriverMaxDistanceKm,
+        driverMaxDistanceKm,
+        appendRejectedDriverUid,
+        orderRejectedByDriver,
+        driverAvailableDeliveryDto,
+        driverAvailableDeliveryDtoV2,
+        driverOrderMatchV2,
+        orderDeliveryDistanceKm,
+        matchAvailableDeliveriesV2,
+        normalizeDeliveryPricing,
+        deliveryPricingVersion,
+        calculateDeliveryPricing,
+        validateCustomerDropoff,
+        customerDeliveryPreferenceDto,
+        orderDeliveryDetailsAuthorization,
+        orderDeliveryPrivateDto,
+        targetedNotificationWorstCaseSubrequests,
+        targetedReceiptWorstCaseSubrequests,
+        deliveryFinalizationV2IsIdempotent,
+        deliveryFinalizationV2Response,
+        deliveryMatchJobOrderIsActive,
+        processDeliveryMatchJob,
+        cleanupDeliveryQuotes,
         publicRatingDto,
         handlePhase4aOrderCreate,
          handlePhase4aOfferCreate,
@@ -7564,7 +8251,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     addEventListener("scheduled", (event) => {
       const env = typeof globalThis !== "undefined" ? globalThis : {};
-       event.waitUntil(Promise.all([handleScheduledOutbox(env), resumeAccountDeletions(env)]));
+       event.waitUntil(handleScheduledMaintenance(env));
     });
     addEventListener("fetch", (event) => {
       event.respondWith(handleRequest(event.request, event));
@@ -7788,6 +8475,123 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const users = uids.length ? await batchGetUsers(uids, accessToken) : [];
         const eligibleUids = users.filter((user) => (user.role === "provider" || user.role === "driver") && evaluateSubscriptionEntitlement(user).eligible).map((user) => user._id);
         return jsonResponse({ success: true, eligibleUids });
+      }
+      if (path === "/customers/delivery-location" && request.method === "GET") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        if (auth.user.role !== "customer") return phase4aError("FORBIDDEN", "Customer account required", 403);
+        const preference = await getFirestoreDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, accessToken);
+        return jsonResponse({ success: true, location: customerDeliveryPreferenceDto(preference) });
+      }
+      if (path === "/customers/delivery-location" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        if (auth.user.role !== "customer") return phase4aError("FORBIDDEN", "Customer account required", 403);
+        let body; try { body = await request.json(); } catch { return phase4aError("CUSTOMER_DROPOFF_INVALID", "Invalid delivery location"); }
+        const validation = validateCustomerDropoff(body, true);
+        if (!validation.ok) return phase4aError(validation.code, "A valid Saudi delivery location with address, city and district is required", 422);
+        const existing = await getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, accessToken);
+        const updatedAt = new Date().toISOString();
+        const committed = await saveCustomerDeliveryPreference(auth.uid, validation.value, accessToken, auth.deletionFence, existing);
+        if (!committed) return phase4aError("STATE_CONFLICT", "Delivery location changed; retry", 409);
+        return jsonResponse({ success: true, location: customerDeliveryPreferenceDto({ ...validation.value, updatedAt, schemaVersion: 1 }) });
+      }
+      if (path === "/drivers/location" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        if (auth.user.role !== "driver") return phase4aError("FORBIDDEN", "Driver account required", 403);
+        const entitlement = evaluateSubscriptionEntitlement(auth.user);
+        if (!entitlement.eligible) {
+          await normalizeCommercialAccess(auth.uid, auth.user, entitlement, accessToken);
+          return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
+        }
+        let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid location"); }
+        const validation = validateDriverRuntimeLocationInput(body);
+        if (!validation.ok) return phase4aError(validation.code, validation.code === "DRIVER_LOCATION_INACCURATE" ? "Location accuracy is unusable" : "Invalid driver location");
+        const result = await persistDriverRuntimeLocation(auth.uid, validation.value, accessToken, auth.deletionFence);
+        if (!result.ok) return phase4aError("STATE_CONFLICT", "Driver location changed; retry", 409);
+        return jsonResponse({ success: true, updatedAt: result.updatedAt, freshUntil: result.freshUntil, fresh: true, coalesced: result.coalesced });
+      }
+      if (path === "/drivers/preferences" && request.method === "GET") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          if (auth.user.role !== "driver") return phase4aError("FORBIDDEN", "Driver account required", 403);
+          const preferences = driverDistancePreferences(auth.user);
+          if (!preferences.ok) return phase4aError("DRIVER_PREFERENCES_INVALID", "Driver distance preferences are invalid", 409);
+          return jsonResponse({ success: true, maxPickupDistanceKm: preferences.maxPickupDistanceKm, maxDeliveryDistanceKm: preferences.maxDeliveryDistanceKm });
+        } catch {
+          console.error("[DriverPreferences] Read failed");
+          return phase4aError("INTERNAL_ERROR", "Unable to read driver preferences", 500);
+        }
+      }
+      if (path === "/drivers/preferences" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        if (auth.user.role !== "driver") return phase4aError("FORBIDDEN", "Driver account required", 403);
+        let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid driver preferences"); }
+        const keys = body && typeof body === "object" && !Array.isArray(body) ? Object.keys(body) : [];
+        if (!keys.length || !phase4aKeysOnly(body, ["maxPickupDistanceKm", "maxDeliveryDistanceKm"])) return phase4aError("INVALID_REQUEST", "Only pickup and delivery distance preferences are accepted");
+        const preferences = {};
+        for (const key of keys) {
+          const normalized = normalizeDriverDistancePreference(body[key]);
+          if (normalized === void 0) return phase4aError("INVALID_MAX_DISTANCE", key + " must be null or from 1 to 2000");
+          preferences[key] = normalized;
+        }
+        const result = await updateDriverPreferences(auth.uid, preferences, accessToken, auth.deletionFence);
+        if (!result.ok) return phase4aError(result.code || "STATE_CONFLICT", result.code === "FORBIDDEN" ? "Driver account required" : result.code === "DRIVER_PREFERENCES_INVALID" ? "Driver distance preferences are invalid" : "Driver preferences changed; retry", result.code === "FORBIDDEN" ? 403 : 409);
+        const effective = result.preferences;
+        return jsonResponse({ success: true, maxPickupDistanceKm: effective.maxPickupDistanceKm, maxDeliveryDistanceKm: effective.maxDeliveryDistanceKm, idempotent: result.idempotent === true });
+      }
+      if (path === "/drivers/availability-v2" && request.method === "POST") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        if (auth.user.role !== "driver") return phase4aError("FORBIDDEN", "Driver account required", 403);
+        let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid availability"); }
+        if (!phase4aKeysOnly(body, ["isAvailable"]) || typeof body.isAvailable !== "boolean") return phase4aError("INVALID_REQUEST", "Only isAvailable is accepted");
+        if (body.isAvailable) {
+          const entitlement = evaluateSubscriptionEntitlement(auth.user);
+          if (!entitlement.eligible) {
+            await normalizeCommercialAccess(auth.uid, auth.user, entitlement, accessToken);
+            return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
+          }
+          const preferences = driverDistancePreferences(auth.user);
+          if (!preferences.ok) return phase4aError("DRIVER_PREFERENCES_INVALID", "Driver distance preferences are invalid", 409);
+          const runtimeLocation = await getFirestoreDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid, accessToken);
+          const locationStatus = driverRuntimeLocationStatus(runtimeLocation);
+          if (!locationStatus.fresh) return phase4aError(locationStatus.code, locationStatus.code === "DRIVER_LOCATION_STALE" ? "Driver location is stale" : locationStatus.code === "DRIVER_LOCATION_INACCURATE" ? "Driver location accuracy is unusable" : "Driver location is required", 409);
+        }
+        const updated = await setDriverAvailabilityAndSync(auth.uid, body.isAvailable, accessToken);
+        if (updated.code === "account_deletion_blocked") return phase4aError("ACCOUNT_DELETION_BLOCKED", "Account deletion is in progress", 409);
+        if (updated.code === "subscription_required") return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
+        if (!updated.ok) return phase4aError("STATE_CONFLICT", "Driver availability changed; refresh and try again", 409);
+        return jsonResponse({ success: true, isAvailable: body.isAvailable, entitlement: updated.entitlement || evaluateSubscriptionEntitlement(auth.user) });
+      }
+      if (path === "/deliveries/available-v2" && request.method === "GET") {
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+        if (auth.user.role !== "driver") return phase4aError("FORBIDDEN", "Driver account required", 403);
+        const entitlement = evaluateSubscriptionEntitlement(auth.user);
+        if (!entitlement.eligible) {
+          await normalizeCommercialAccess(auth.uid, auth.user, entitlement, accessToken);
+          return phase4aError("SUBSCRIPTION_REQUIRED", "Driver subscription required", 403);
+        }
+        if ([...url.searchParams.keys()].some((key) => key !== "limit")) return phase4aError("INVALID_REQUEST", "Only limit is accepted");
+        const requestedLimit = Number(url.searchParams.get("limit") || 25);
+        if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 50) return phase4aError("INVALID_REQUEST", "limit must be from 1 to 50");
+        const preferences = driverDistancePreferences(auth.user);
+        if (!preferences.ok) return phase4aError("DRIVER_PREFERENCES_INVALID", "Driver distance preferences are invalid", 409);
+        const runtimeLocation = await getFirestoreDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid, accessToken);
+        const locationStatus = driverRuntimeLocationStatus(runtimeLocation);
+        if (!locationStatus.fresh) return phase4aError(locationStatus.code, locationStatus.code === "DRIVER_LOCATION_STALE" ? "Driver location is stale" : locationStatus.code === "DRIVER_LOCATION_INACCURATE" ? "Driver location accuracy is unusable" : "Driver location is required", 409);
+        const candidateScanLimit = Math.min(200, Math.max(50, requestedLimit * 4));
+        if (auth.user.isAvailable !== true) return jsonResponse({ success: true, deliveries: [], candidateScanLimit, candidateScanTruncated: false });
+        const candidates = await queryFirestoreLimited("orders", "deliveryStatus", "EQUAL", "ready_for_driver", candidateScanLimit, accessToken);
+        const providerUids = [...new Set(candidates.map((order) => order?.providerUid).filter(phase4aSafeSegment))];
+        const publicProfiles = await batchGetDocuments("public_profiles", providerUids, accessToken);
+        const providerNames = new Map(publicProfiles.filter((profile) => profile?.role === "provider" && typeof profile.displayName === "string").map((profile) => [profile._id, profile.displayName.trim().slice(0, 120)]));
+        const deliveries = matchAvailableDeliveriesV2(candidates, auth.uid, runtimeLocation, preferences, requestedLimit, providerNames);
+        return jsonResponse({ success: true, deliveries, candidateScanLimit, candidateScanTruncated: candidates.length >= candidateScanLimit });
       }
       if (path === "/drivers/availability" && request.method === "POST") {
         let uid;
@@ -8891,6 +9695,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           callerUid = await verifyFirebaseIdToken(getTokenFromRequest(request));
         } catch (e) {
           console.log("[Auth] Rejected app request");
+          if (path === "/drivers/preferences" && request.method === "GET") return phase4aError("UNAUTHORIZED", "Unauthorized", 401);
           return Response.json({ success: false, error: "Unauthorized" }, { status: 401, headers: { "Access-Control-Allow-Origin": "*" } });
         }
       }
@@ -8899,8 +9704,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         // directly against Firestore; that boundary remains governed by deployed Rules.
         try {
           const deletion = await getFirestoreDoc("account_deletion_requests", callerUid, await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY));
-          if (deletion && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(deletion.status)) return jsonResponse({ success: false, error: "Account deletion in progress" }, 403);
+          if (deletion && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(deletion.status)) return path === "/drivers/preferences" && request.method === "GET" ? phase4aError("ACCOUNT_DELETION_BLOCKED", "Account deletion is in progress", 403) : jsonResponse({ success: false, error: "Account deletion in progress" }, 403);
         } catch {
+          if (path === "/drivers/preferences" && request.method === "GET") return phase4aError("INTERNAL_ERROR", "Authorization unavailable", 500);
           return jsonResponse({ success: false, error: "Authorization unavailable" }, 503);
         }
       }
@@ -9272,6 +10078,151 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           });
         }
       }
+      if (path === "/delivery-quote-v2" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          if (auth.user.role !== "customer") return phase4aError("FORBIDDEN", "Customer account required", 403);
+          let body; try { body = await request.json(); } catch { return phase4aError("CUSTOMER_DROPOFF_REQUIRED", "Customer dropoff is required"); }
+          if (!exactObjectKeys(body, ["orderId", "dropoff", "saveAsDefault"]) || !phase4aSafeSegment(body.orderId) || typeof body.saveAsDefault !== "boolean") return phase4aError("CUSTOMER_DROPOFF_REQUIRED", "Order and customer dropoff are required");
+          const dropoff = validateCustomerDropoff(body.dropoff, false);
+          if (!dropoff.ok) return phase4aError(dropoff.code, "A valid Saudi delivery location with address, city and district is required", 422);
+          const [orderSnapshot, preferenceSnapshot] = await Promise.all([
+            getFirestoreSnapshot("orders", body.orderId, accessToken),
+            body.saveAsDefault ? getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, accessToken) : Promise.resolve(null)
+          ]);
+          if (!orderSnapshot) return phase4aError("NOT_FOUND", "Order not found", 404);
+          const order = orderSnapshot.data;
+          if (order.customerUid !== auth.uid) return phase4aError("FORBIDDEN", "Forbidden", 403);
+          if (order.driverUid || order.status !== "ready_for_pickup") return phase4aError("TRANSITION_NOT_ALLOWED", "Delivery destination can no longer be changed", 409);
+          if (!validSaudiCoordinatePair(order.providerLat, order.providerLng)) return phase4aError("PROVIDER_COORDINATES_REQUIRED", "Provider pickup coordinates are required", 422);
+          const pricing = await loadDeliveryPricing(accessToken);
+          const calculated = calculateDeliveryPricing({ ...order, customerLat: dropoff.value.lat, customerLng: dropoff.value.lng }, pricing);
+          if (!calculated.ok) return phase4aError(calculated.code, "Valid provider and customer coordinates are required", 422);
+          const quoteId = "dq_" + Date.now().toString(36) + "_" + crypto.randomUUID().replace(/-/g, "");
+          const quotedAt = new Date().toISOString();
+          const expiresAt = new Date(Date.now() + DELIVERY_QUOTE_LIFETIME_MS).toISOString();
+          const quoteFields = {
+            quoteId,
+            orderId: body.orderId,
+            customerUid: auth.uid,
+            providerUid: order.providerUid,
+            dropoffLat: dropoff.value.lat,
+            dropoffLng: dropoff.value.lng,
+            addressLine: dropoff.value.addressLine,
+            city: dropoff.value.city,
+            district: dropoff.value.district,
+            deliveryDistanceKm: calculated.deliveryDistanceKm,
+            deliveryFee: calculated.deliveryFee,
+            pricingVersion: calculated.pricingVersion,
+            quotedAt,
+            expiresAt,
+            usedAt: null,
+            status: "active",
+            schemaVersion: 1
+          };
+          const writes = [{
+            update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, quoteFields),
+            currentDocument: { exists: false }
+          }, {
+            verify: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + body.orderId,
+            currentDocument: { updateTime: orderSnapshot.updateTime }
+          }, auth.deletionFence];
+          if (body.saveAsDefault) {
+            const preferenceFields = { ...dropoff.value, label: typeof preferenceSnapshot?.data?.label === "string" ? preferenceSnapshot.data.label.slice(0, 80) : "", schemaVersion: 1 };
+            writes.splice(1, 0, {
+              update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, preferenceFields),
+              updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
+              currentDocument: preferenceSnapshot ? { updateTime: preferenceSnapshot.updateTime } : { exists: false }
+            });
+          }
+          if (!await phase4aCommit(writes, accessToken)) return phase4aError("STATE_CONFLICT", "Order or saved location changed; request a new quote", 409);
+          return jsonResponse({ success: true, quoteId, deliveryDistanceKm: calculated.deliveryDistanceKm, deliveryFee: calculated.deliveryFee, pricingVersion: calculated.pricingVersion, quotedAt, expiresAt, currency: "SAR" });
+        } catch (error) {
+          console.error("[DeliveryQuoteV2] Failed:", error && error.message ? error.message : error);
+          return phase4aError("INTERNAL_ERROR", "Unable to create delivery quote", 500);
+        }
+      }
+      if (path === "/finalize-delivery-v2" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          if (auth.user.role !== "customer") return phase4aError("FORBIDDEN", "Customer account required", 403);
+          let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid finalization request"); }
+          if (!exactObjectKeys(body, ["orderId", "quoteId", "deliveryPaymentMethod"]) || !phase4aSafeSegment(body.orderId) || !phase4aSafeSegment(body.quoteId) || !["cod", "arrange_with_driver"].includes(body.deliveryPaymentMethod)) return phase4aError("INVALID_REQUEST", "Invalid order, quote or delivery payment method");
+          const [orderSnapshot, quoteSnapshot, privateSnapshot] = await Promise.all([
+            getFirestoreSnapshot("orders", body.orderId, accessToken),
+            getFirestoreSnapshot(DELIVERY_QUOTES_COLLECTION, body.quoteId, accessToken),
+            getFirestoreSnapshot(ORDER_DELIVERY_PRIVATE_COLLECTION, body.orderId, accessToken)
+          ]);
+          if (!orderSnapshot) return phase4aError("NOT_FOUND", "Order not found", 404);
+          const order = orderSnapshot.data;
+          if (order.customerUid !== auth.uid) return phase4aError("FORBIDDEN", "Forbidden", 403);
+          if (deliveryFinalizationV2IsIdempotent(order, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(order, true));
+          if (!quoteSnapshot || quoteSnapshot.data.customerUid !== auth.uid || quoteSnapshot.data.orderId !== body.orderId || quoteSnapshot.data.providerUid !== order.providerUid) return phase4aError("STALE_DELIVERY_QUOTE", "Quote does not belong to this order", 409);
+          const quote = quoteSnapshot.data;
+          if (quote.status === "used" || quote.usedAt) return phase4aError("DELIVERY_QUOTE_ALREADY_USED", "Delivery quote was already used", 409);
+          if (quote.status !== "active") return phase4aError("STALE_DELIVERY_QUOTE", "Delivery quote is no longer active", 409);
+          const expiresAtMs = new Date(quote.expiresAt || 0).getTime();
+          if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return phase4aError("DELIVERY_QUOTE_EXPIRED", "Delivery quote expired", 409);
+          if (order.driverUid || order.status !== "ready_for_pickup") return phase4aError("TRANSITION_NOT_ALLOWED", "Delivery can no longer be finalized", 409);
+          if (!validSaudiCoordinatePair(quote.dropoffLat, quote.dropoffLng) || !boundedRequiredString(quote.addressLine, 300) || !boundedRequiredString(quote.city, 120) || !boundedRequiredString(quote.district, 120) || !Number.isFinite(quote.deliveryDistanceKm) || quote.deliveryDistanceKm < 0 || !Number.isFinite(quote.deliveryFee) || quote.deliveryFee < 0 || typeof quote.pricingVersion !== "string") return phase4aError("STALE_DELIVERY_QUOTE", "Delivery quote snapshot is invalid", 409);
+          const now = new Date().toISOString();
+          const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
+          const subtotal = typeof order.priceSnapshot === "number" && Number.isFinite(order.priceSnapshot) ? order.priceSnapshot : 0;
+          const fields = {
+            deliveryMethod: "driver",
+            dropoffCity: quote.city,
+            dropoffDistrict: quote.district,
+            dropoffConfirmedAt: now,
+            deliveryDistanceKm: quote.deliveryDistanceKm,
+            deliveryFee: quote.deliveryFee,
+            totalAmount: subtotal + quote.deliveryFee,
+            deliveryQuoteId: body.quoteId,
+            deliveryPricingVersion: quote.pricingVersion,
+            deliveryPaymentMethod: body.deliveryPaymentMethod,
+            platformDeliveryCommission: 0,
+            driverGrossDeliveryEarnings: quote.deliveryFee,
+            driverUid: null,
+            deliveryStatus: "ready_for_driver",
+            status: "searching_driver",
+            deliveryStateVersion: nextVersion,
+            updatedAt: now
+          };
+          const privateDestination = { customerUid: auth.uid, providerUid: order.providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng, addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "" };
+          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, nextVersion, accessToken, auth.deletionFence);
+          if (!committed.ok) {
+            const latest = await getFirestoreDoc("orders", body.orderId, accessToken);
+            if (latest && deliveryFinalizationV2IsIdempotent(latest, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(latest, true));
+            return phase4aError("STALE_DELIVERY_QUOTE", "Order or quote changed; request a new quote", 409);
+          }
+          await sendTransitionNotification(committed.event, body.orderId, accessToken, nextVersion);
+          return jsonResponse(deliveryFinalizationV2Response({ ...order, ...fields }));
+        } catch (error) {
+          console.error("[FinalizeDeliveryV2] Failed:", error && error.message ? error.message : error);
+          return phase4aError("INTERNAL_ERROR", "Unable to finalize delivery", 500);
+        }
+      }
+      if (path === "/order-delivery-details" && request.method === "POST") {
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+          let body; try { body = await request.json(); } catch { return phase4aError("INVALID_REQUEST", "Invalid delivery details request"); }
+          if (!exactObjectKeys(body, ["orderId"]) || !phase4aSafeSegment(body.orderId)) return phase4aError("INVALID_REQUEST", "A valid orderId is required");
+          const orderSnapshot = await getFirestoreSnapshot("orders", body.orderId, accessToken);
+          if (!orderSnapshot) return phase4aError("NOT_FOUND", "Order not found", 404);
+          const authorization = orderDeliveryDetailsAuthorization(orderSnapshot.data, auth.uid, auth.user.role);
+          if (!authorization.allowed) return phase4aError(authorization.code, authorization.code === "TRANSITION_NOT_ALLOWED" ? "Delivery details are unavailable in this order state" : "Forbidden", authorization.code === "TRANSITION_NOT_ALLOWED" ? 409 : 403);
+          const privateSnapshot = await getFirestoreSnapshot(ORDER_DELIVERY_PRIVATE_COLLECTION, body.orderId, accessToken);
+          if (!privateSnapshot || privateSnapshot.data.orderId !== body.orderId || privateSnapshot.data.customerUid !== orderSnapshot.data.customerUid || privateSnapshot.data.providerUid !== orderSnapshot.data.providerUid) return phase4aError("PRIVATE_DELIVERY_DETAILS_UNAVAILABLE", "Delivery details are unavailable", 409);
+          const response = orderDeliveryPrivateDto(privateSnapshot.data);
+          if (!response) return phase4aError("PRIVATE_DELIVERY_DETAILS_UNAVAILABLE", "Delivery details are unavailable", 409);
+          return jsonResponse(response);
+        } catch (error) {
+          console.error("[OrderDeliveryDetails] Failed:", error && error.message ? error.message : error);
+          return phase4aError("INTERNAL_ERROR", "Unable to read delivery details", 500);
+        }
+      }
       if (path === "/finalize-delivery" && request.method === "POST") {
         try {
           let uid;
@@ -9281,7 +10232,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "unauthorized", error: "Unauthorized" }, 401);
           }
           const body = await request.json();
-          const { orderId, method } = body;
+          const { orderId, method, pricingVersion: requestedPricingVersion } = body;
+          if (requestedPricingVersion !== void 0 && (typeof requestedPricingVersion !== "string" || requestedPricingVersion.length > 80)) {
+            return jsonResponse({ success: false, code: "invalid_request", error: "Invalid pricingVersion" }, 400);
+          }
           if (!orderId || !method || !["self_pickup", "driver"].includes(method)) {
             return jsonResponse({ success: false, code: "invalid_request", error: "Missing or invalid orderId/method" }, 400);
           }
@@ -9298,7 +10252,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               deliveryFee: order.deliveryFee || 0,
               totalAmount: order.totalAmount || order.priceSnapshot || 0,
               deliveryDistanceKm: order.deliveryDistanceKm || 0,
-              deliveryQuoteId: order.deliveryQuoteId || void 0
+              deliveryQuoteId: order.deliveryQuoteId || void 0,
+              pricingVersion: order.deliveryPricingVersion || void 0
             });
           }
           if (order.driverUid || order.deliveryMethod || order.deliveryStatus || order.status !== "ready_for_pickup") {
@@ -9325,43 +10280,24 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             responseData = { deliveryFee: 0, totalAmount: fields.totalAmount, deliveryDistanceKm: 0 };
             notificationEvent = "self_pickup_selected";
           } else {
-            const providerLat = order.providerLat;
-            const providerLng = order.providerLng;
-            const customerLat = order.customerLat;
-            const customerLng = order.customerLng;
-            let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
-            try {
-              const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-              if (settings && settings.deliveryPricing) pricing = { ...pricing, ...settings.deliveryPricing };
-            } catch (error) {
-              console.log("[Worker] Could not load delivery pricing, using defaults:", error.message);
-            }
-            let distanceKm = 0;
-            let deliveryFee = pricing.baseFee || 5;
-            if (providerLat && providerLng && customerLat && customerLng) {
-              const R = 6371;
-              const dLat = (customerLat - providerLat) * Math.PI / 180;
-              const dLng = (customerLng - providerLng) * Math.PI / 180;
-              const a = Math.sin(dLat / 2) ** 2 + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
-              distanceKm = Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 10) / 10;
-              deliveryFee = Math.round((pricing.baseFee || 5) + distanceKm * (pricing.perKmInsideCity || 2));
-              if (pricing.minFee && deliveryFee < pricing.minFee) deliveryFee = pricing.minFee;
-              if (pricing.maxFee && deliveryFee > pricing.maxFee) deliveryFee = pricing.maxFee;
-            }
+            const pricing = await loadDeliveryPricing(accessToken);
+            const quote = calculateDeliveryPricing(order, pricing);
+            if (!quote.ok) return jsonResponse({ success: false, code: quote.code, error: "Valid provider and customer coordinates are required" }, 422);
+            if (requestedPricingVersion !== void 0 && requestedPricingVersion !== quote.pricingVersion) return jsonResponse({ success: false, code: "STALE_DELIVERY_QUOTE", error: "Delivery pricing changed; request a new quote", pricingVersion: quote.pricingVersion }, 409);
             const quoteId = "dq_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
             fields = {
               deliveryMethod: "driver",
               deliveryStatus: "ready_for_driver",
               driverUid: null,
-              deliveryFee,
-              totalAmount: (order.priceSnapshot || 0) + deliveryFee,
-              deliveryDistanceKm: distanceKm,
+              deliveryFee: quote.deliveryFee,
+              totalAmount: (order.priceSnapshot || 0) + quote.deliveryFee,
+              deliveryDistanceKm: quote.deliveryDistanceKm,
               deliveryQuoteId: quoteId,
-              deliveryPricingVersion: "v1",
+              deliveryPricingVersion: quote.pricingVersion,
               deliveryStateVersion: nextVersion,
               updatedAt: now
             };
-            responseData = { deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: distanceKm, deliveryQuoteId: quoteId };
+            responseData = { deliveryFee: quote.deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: quote.deliveryDistanceKm, deliveryQuoteId: quoteId, pricingVersion: quote.pricingVersion };
             notificationEvent = "driver_delivery_requested";
           }
           const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
@@ -9392,45 +10328,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           }
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
-          let pricing = { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
-          try {
-            const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-            if (settings && settings.deliveryPricing) {
-              pricing = { ...pricing, ...settings.deliveryPricing };
-            }
-          } catch (e) {
-            console.log("[Worker] Could not load pricing for quote:", e.message);
-          }
-          const providerLat = order.providerLat;
-          const providerLng = order.providerLng;
-          const customerLat = order.customerLat;
-          const customerLng = order.customerLng;
-          let distanceKm = 0;
-          let deliveryFee = pricing.baseFee || 5;
-          if (providerLat && providerLng && customerLat && customerLng) {
-            const R = 6371;
-            const dLat = (customerLat - providerLat) * Math.PI / 180;
-            const dLng = (customerLng - providerLng) * Math.PI / 180;
-            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(providerLat * Math.PI / 180) * Math.cos(customerLat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-            distanceKm = Math.round(R * c * 10) / 10;
-            const perKm = pricing.perKmInsideCity || 2;
-            deliveryFee = (pricing.baseFee || 5) + distanceKm * perKm;
-            deliveryFee = Math.round(deliveryFee);
-            if (pricing.minFee && deliveryFee < pricing.minFee) {
-              deliveryFee = pricing.minFee;
-            }
-            if (pricing.maxFee && deliveryFee > pricing.maxFee) {
-              deliveryFee = pricing.maxFee;
-            }
-          }
+          const pricing = await loadDeliveryPricing(accessToken);
+          const quote = calculateDeliveryPricing(order, pricing);
+          if (!quote.ok) return jsonResponse({ success: false, code: quote.code, error: "Valid provider and customer coordinates are required" }, 422);
           const priceSnapshot = order.priceSnapshot || 0;
           return Response.json({
             success: true,
-            deliveryFee,
-            totalAmount: priceSnapshot + deliveryFee,
-            deliveryDistanceKm: distanceKm,
-            subtotal: priceSnapshot
+            deliveryFee: quote.deliveryFee,
+            totalAmount: priceSnapshot + quote.deliveryFee,
+            deliveryDistanceKm: quote.deliveryDistanceKm,
+            subtotal: priceSnapshot,
+            pricingVersion: quote.pricingVersion,
+            quotedAt: new Date().toISOString()
           }, {
             headers: { "Access-Control-Allow-Origin": "*" }
           });
