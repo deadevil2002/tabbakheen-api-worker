@@ -132,6 +132,71 @@ test("22 zero pricing preserved", () => assert.equal(hooks.calculateDeliveryPric
 test("23 minimum clamp", () => assert.equal(hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat: 24.7001, customerLng: 46.7 }, { baseFee: 0, perKmInsideCity: 0, minFee: 7, maxFee: 99 }).deliveryFee, 7));
 test("24 maximum clamp", () => assert.equal(hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat: 25.6, customerLng: 46.7 }, { baseFee: 0, perKmInsideCity: 10, minFee: 0, maxFee: 25 }).deliveryFee, 25));
 test("25 pricing version deterministic", () => assert.equal(hooks.deliveryPricingVersion({ baseFee: 0, perKmInsideCity: 3 }), hooks.deliveryPricingVersion({ perKmInsideCity: 3, baseFee: 0 })));
+test("V2 fee cap policy defaults safely and activates only with exact opt-in", () => {
+  const longOrder = { providerLat: 24.7, providerLng: 46.7, customerLat: 25.464, customerLng: 46.7 };
+  const deliveryPricing = { currency: "SAR", baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
+  const calculate = (policy) => hooks.calculateDeliveryPricing(longOrder, { deliveryPricing, ...(policy === undefined ? {} : { deliveryPricingV2: policy }) });
+  assert.equal(calculate().deliveryFee, 50);
+  for (const policy of [null, {}, { feeCapMode: "UNCAPPED" }, { feeCapMode: "uncapped", extra: true }, { feeCapMode: 1 }]) {
+    assert.equal(calculate(policy).deliveryFee, 50);
+  }
+  const uncapped = calculate({ feeCapMode: "uncapped" });
+  assert.equal(uncapped.deliveryDistanceKm, 85);
+  assert.equal(uncapped.deliveryFee, 175);
+  assert.equal(uncapped.currency, "SAR");
+  assert.match(uncapped.pricingVersion, /^delivery-v2u-[a-f0-9]{8}$/);
+  assert.notEqual(uncapped.pricingVersion, calculate().pricingVersion);
+  assert.equal(calculate({ feeCapMode: "capped" }).pricingVersion, calculate().pricingVersion);
+  assert.equal(hooks.deliveryPricingVersion(uncapped.pricing), uncapped.pricingVersion);
+  const oldSerialized = JSON.stringify(["SAR", 5, 2, 2, 5, 50]);
+  let oldHash = 2166136261;
+  for (const character of oldSerialized) { oldHash ^= character.charCodeAt(0); oldHash = Math.imul(oldHash, 16777619); }
+  assert.equal(calculate().pricingVersion, "delivery-v2-" + (oldHash >>> 0).toString(16).padStart(8, "0"), "existing capped quote versions stay valid");
+});
+test("V2 uncapped short, boundary, long and minimum fees", () => {
+  const source = { deliveryPricing: { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped" } };
+  const quote = (customerLat, value = source) => hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat, customerLng: 46.7 }, value);
+  assert.equal(quote(24.709).deliveryFee, 7);
+  assert.equal(quote(24.902).deliveryFee, 50);
+  assert.equal(quote(25.464).deliveryFee, 175);
+  assert(quote(33).deliveryFee > 50);
+  const driverIndependent = hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat: 25.464, customerLng: 46.7, driverLat: 33, driverLng: 35 }, source);
+  assert.equal(driverIndependent.deliveryFee, 175, "driver-to-pickup distance must not price the customer");
+  assert.equal(quote(24.7001, { deliveryPricing: { baseFee: 0, perKmInsideCity: 0, minFee: 7, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped" } }).deliveryFee, 7);
+  assert.equal(quote(24.7001, { deliveryPricing: { baseFee: 0, perKmInsideCity: 0, minFee: 7.5, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped" } }).deliveryFee, 7.5);
+});
+test("invalid V2 pricing and non-Saudi coordinates are rejected", () => {
+  const order = { providerLat: 24.7, providerLng: 46.7, customerLat: 25.464, customerLng: 46.7 };
+  for (const value of [-1, "2", NaN, Infinity, -Infinity, 10001]) {
+    assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: { perKmInsideCity: value }, deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "DELIVERY_PRICING_INVALID");
+  }
+  assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: "invalid", deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "DELIVERY_PRICING_INVALID");
+  assert.equal(hooks.calculateDeliveryPricing({ ...order, customerLat: 50 }, { deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "CUSTOMER_COORDINATES_REQUIRED");
+  assert.equal(hooks.calculateDeliveryPricing({ ...order, providerLat: 0 }, { deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "PROVIDER_COORDINATES_REQUIRED");
+});
+test("V2 numeric and geographic boundaries have no commercial cap in explicit mode", () => {
+  const order = { providerLat: 24.7, providerLng: 46.7, customerLat: 24.7, customerLng: 46.7 };
+  const policy = { feeCapMode: "uncapped" };
+  for (const fee of [50, 51, 175, 500, 10000]) {
+    assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: { baseFee: fee, perKmInsideCity: 0, minFee: 0, maxFee: 50 }, deliveryPricingV2: policy }).deliveryFee, fee);
+  }
+  assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: { baseFee: 0, perKmInsideCity: 0, minFee: 100000, maxFee: 100000 }, deliveryPricingV2: policy }).deliveryFee, 100000);
+  const extreme = { providerLat: 12, providerLng: 34, customerLat: 34, customerLng: 61 };
+  const extremeConfig = { deliveryPricing: { baseFee: 10000, perKmInsideCity: 10000, minFee: 100000, maxFee: 100000 }, deliveryPricingV2: policy };
+  const maximum = hooks.calculateDeliveryPricing(extreme, extremeConfig);
+  assert.equal(maximum.deliveryDistanceKm, 3667.9);
+  assert.equal(maximum.deliveryFee, 36689000);
+  assert.equal(hooks.calculateDeliveryPricing({ ...extreme, customerLat: 34.000001 }, extremeConfig).code, "CUSTOMER_COORDINATES_REQUIRED");
+  assert.equal(hooks.calculateDeliveryPricing({ ...extreme, providerLng: 33.999999 }, extremeConfig).code, "PROVIDER_COORDINATES_REQUIRED");
+  assert.equal(hooks.calculateDeliveryPricing(extreme, { deliveryPricing: { ...extremeConfig.deliveryPricing, perKmInsideCity: 10000.000001 }, deliveryPricingV2: policy }).code, "DELIVERY_PRICING_INVALID");
+  assert.equal(hooks.calculateDeliveryPricing(extreme, { deliveryPricing: { ...extremeConfig.deliveryPricing, minFee: 100000.000001 }, deliveryPricingV2: policy }).code, "DELIVERY_PRICING_INVALID");
+  for (const invalid of [NaN, Infinity, -Infinity, -1, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(hooks.calculateDeliveryPricing(extreme, { deliveryPricing: { baseFee: invalid }, deliveryPricingV2: policy }).code, "DELIVERY_PRICING_INVALID");
+  }
+  assert.equal(hooks.orderDeliveryDistanceKm({ deliveryDistanceKm: 20015 }), 20015, "historical stored-distance validator accepts its own boundary");
+  assert.equal(hooks.orderDeliveryDistanceKm({ deliveryDistanceKm: 20015.1 }), null, "stored-distance validator rejects beyond 20015 km without coordinates");
+  assert(source.includes('return { integerValue: String(value) }'), "Firestore serializes integer fees as integerValue strings");
+});
 
 test("26 cod accepted", () => assert(finalizeV2Route.includes('["cod", "arrange_with_driver"].includes(body.deliveryPaymentMethod)')));
 test("27 arrange-with-driver accepted", () => assert(finalizeV2Route.includes('"arrange_with_driver"')));
@@ -164,7 +229,12 @@ test("finalization atomically writes order quote outbox and match job", () => {
   assert(finalizeCommit.includes("DELIVERY_MATCH_JOBS_COLLECTION"));
   assert(finalizeCommit.includes("currentDocument: { updateTime: orderSnapshot.updateTime }"));
   assert(finalizeCommit.includes("currentDocument: { updateTime: quoteSnapshot.updateTime }"));
-  assert(finalizeCommit.includes("}, deletionFence]"));
+  assert(finalizeCommit.includes("}, deletionFence, pricingFence]"));
+  assert(quoteV2Route.includes("pricing.fence"));
+  assert(finalizeV2Route.includes("confirmed.pricingVersion !== quote.pricingVersion"));
+  assert(finalizeV2Route.includes("confirmed.deliveryFee !== quote.deliveryFee"));
+  assert(finalizeV2Route.includes("confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm"));
+  assert(finalizeV2Route.includes("accessToken, auth.deletionFence, pricing.fence"));
 });
 test("pre-assignment order remains coarse-only", () => {
   for (const field of ["customerLat", "customerLng", "dropoffLat", "dropoffLng", "dropoffAddress", "addressLine", "deliveryNotes", "customerPhone", "phone"]) assert(!finalizeOrderFields.includes(field + ":"), field);

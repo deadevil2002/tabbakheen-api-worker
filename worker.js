@@ -2822,49 +2822,92 @@
       return matches.slice(0, resultLimit).map(({ order, driverToPickupDistanceKm, deliveryDistanceKm }) => driverAvailableDeliveryDtoV2(order, driverToPickupDistanceKm, deliveryDistanceKm, providerNames.get(order.providerUid) || ""));
     }
     const DELIVERY_PRICING_DEFAULTS = { currency: "SAR", baseFee: 5, perKmInsideCity: 2, perKmOutsideCity: 2, minFee: 5, maxFee: 50 };
+    // app_settings/main.deliveryPricingV2 = { feeCapMode: "uncapped" } is the
+    // only opt-in. Missing or malformed policy remains capped; the separate
+    // deliveryPricing.maxFee stays authoritative for deployed Legacy clients.
     function normalizeDeliveryPricing(value) {
-      const source = value?.deliveryPricing && typeof value.deliveryPricing === "object" ? value.deliveryPricing : value && typeof value === "object" ? value : {};
+      const source = value?.deliveryPricing && typeof value.deliveryPricing === "object" && !Array.isArray(value.deliveryPricing) ? value.deliveryPricing : value && typeof value === "object" && !Array.isArray(value) ? value : {};
       const finite = (candidate, fallback, maximum) => typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 && candidate <= maximum ? candidate : fallback;
       const minFee = finite(source.minFee, DELIVERY_PRICING_DEFAULTS.minFee, 1e5);
       const configuredMax = finite(source.maxFee, DELIVERY_PRICING_DEFAULTS.maxFee, 1e5);
+      const policy = value?.deliveryPricingV2;
+      const feeCapMode = exactObjectKeys(policy, ["feeCapMode"]) && policy.feeCapMode === "uncapped" ? "uncapped" : "capped";
       return {
         currency: typeof source.currency === "string" && /^[A-Z]{3}$/.test(source.currency) ? source.currency : DELIVERY_PRICING_DEFAULTS.currency,
         baseFee: finite(source.baseFee, DELIVERY_PRICING_DEFAULTS.baseFee, 1e4),
         perKmInsideCity: finite(source.perKmInsideCity, DELIVERY_PRICING_DEFAULTS.perKmInsideCity, 1e4),
         perKmOutsideCity: finite(source.perKmOutsideCity, DELIVERY_PRICING_DEFAULTS.perKmOutsideCity, 1e4),
         minFee,
-        maxFee: Math.max(minFee, configuredMax)
+        maxFee: Math.max(minFee, configuredMax),
+        deliveryPricingV2: { feeCapMode }
+      };
+    }
+    function validConfiguredDeliveryPricing(value) {
+      if (value && Object.prototype.hasOwnProperty.call(value, "deliveryPricing") && (!value.deliveryPricing || typeof value.deliveryPricing !== "object" || Array.isArray(value.deliveryPricing))) return false;
+      const source = value?.deliveryPricing && typeof value.deliveryPricing === "object" && !Array.isArray(value.deliveryPricing) ? value.deliveryPricing : value && typeof value === "object" && !Array.isArray(value) ? value : {};
+      for (const [key, maximum] of [["baseFee", 1e4], ["perKmInsideCity", 1e4], ["perKmOutsideCity", 1e4], ["minFee", 1e5], ["maxFee", 1e5]]) {
+        if (Object.prototype.hasOwnProperty.call(source, key) && (typeof source[key] !== "number" || !Number.isFinite(source[key]) || source[key] < 0 || source[key] > maximum)) return false;
+      }
+      return !Object.prototype.hasOwnProperty.call(source, "currency") || typeof source.currency === "string" && /^[A-Z]{3}$/.test(source.currency);
+    }
+    function adminDeliveryPricingPolicy(value) {
+      const pricing = normalizeDeliveryPricing(value);
+      const policy = value?.deliveryPricingV2;
+      const source = value?.deliveryPricing;
+      const hasStoredPricing = !!source && typeof source === "object" && !Array.isArray(source);
+      const rateKeys = ["currency", "baseFee", "perKmInsideCity", "minFee", "maxFee"];
+      return {
+        configurationValid: validConfiguredDeliveryPricing(value),
+        feeCapMode: pricing.deliveryPricingV2.feeCapMode,
+        commercialCapApplies: pricing.deliveryPricingV2.feeCapMode !== "uncapped",
+        policySource: pricing.deliveryPricingV2.feeCapMode === "uncapped" ? "explicit_uncapped" : policy === void 0 ? "default_capped" : "safe_fallback_capped",
+        rateSource: !hasStoredPricing ? "defaults" : rateKeys.every((key) => Object.prototype.hasOwnProperty.call(source, key)) ? "stored" : "stored_with_defaults",
+        currency: pricing.currency,
+        baseFee: pricing.baseFee,
+        perKmInsideCity: pricing.perKmInsideCity,
+        minFee: pricing.minFee,
+        commercialMaxFee: pricing.deliveryPricingV2.feeCapMode === "uncapped" ? null : pricing.maxFee
       };
     }
     function deliveryPricingVersion(value) {
       const pricing = normalizeDeliveryPricing(value);
-      const serialized = JSON.stringify([pricing.currency, pricing.baseFee, pricing.perKmInsideCity, pricing.perKmOutsideCity, pricing.minFee, pricing.maxFee]);
+      // Preserve the previous capped hash so already-issued V2 quotes retain
+      // their version. Uncapped policy has a distinct, explicit hash input.
+      const serialized = JSON.stringify([pricing.currency, pricing.baseFee, pricing.perKmInsideCity, pricing.perKmOutsideCity, pricing.minFee, pricing.maxFee, ...(pricing.deliveryPricingV2.feeCapMode === "uncapped" ? ["uncapped-v1"] : [])]);
       let hash = 2166136261;
       for (let index = 0; index < serialized.length; index++) {
         hash ^= serialized.charCodeAt(index);
         hash = Math.imul(hash, 16777619);
       }
-      return "delivery-v2-" + (hash >>> 0).toString(16).padStart(8, "0");
+      return (pricing.deliveryPricingV2.feeCapMode === "uncapped" ? "delivery-v2u-" : "delivery-v2-") + (hash >>> 0).toString(16).padStart(8, "0");
     }
     function calculateDeliveryPricing(order, value) {
-      if (!validCoordinatePair(order?.providerLat, order?.providerLng)) return { ok: false, code: "PROVIDER_COORDINATES_REQUIRED" };
-      if (!validCoordinatePair(order?.customerLat, order?.customerLng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
+      if (!validSaudiCoordinatePair(order?.providerLat, order?.providerLng)) return { ok: false, code: "PROVIDER_COORDINATES_REQUIRED" };
+      if (!validSaudiCoordinatePair(order?.customerLat, order?.customerLng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
+      if (!validConfiguredDeliveryPricing(value)) return { ok: false, code: "DELIVERY_PRICING_INVALID" };
       const pricing = normalizeDeliveryPricing(value);
       const distance = haversineDistanceKm(order.providerLat, order.providerLng, order.customerLat, order.customerLng);
       if (!Number.isFinite(distance)) return { ok: false, code: "DELIVERY_COORDINATES_INVALID" };
       const deliveryDistanceKm = roundDistanceKm(distance);
       let deliveryFee = Math.round(pricing.baseFee + deliveryDistanceKm * pricing.perKmInsideCity);
+      if (!Number.isSafeInteger(deliveryFee) || deliveryFee < 0) return { ok: false, code: "DELIVERY_PRICING_INVALID" };
       deliveryFee = Math.max(pricing.minFee, deliveryFee);
-      deliveryFee = Math.min(pricing.maxFee, deliveryFee);
+      if (pricing.deliveryPricingV2.feeCapMode !== "uncapped") deliveryFee = Math.min(pricing.maxFee, deliveryFee);
+      if (!Number.isFinite(deliveryFee) || deliveryFee < 0 || deliveryFee > Number.MAX_SAFE_INTEGER) return { ok: false, code: "DELIVERY_PRICING_INVALID" };
       return { ok: true, deliveryDistanceKm, deliveryFee, currency: pricing.currency, pricingVersion: deliveryPricingVersion(pricing), pricing };
     }
     async function loadDeliveryPricing(accessToken) {
-      try {
-        return normalizeDeliveryPricing(await getFirestoreDoc("app_settings", "main", accessToken));
-      } catch (error) {
-        console.log("[Worker] Could not load delivery pricing, using defaults:", error && error.message ? error.message : error);
-        return normalizeDeliveryPricing(null);
-      }
+      // A Firestore read error must not silently turn an uncapped quote into a
+      // capped default quote. Fence both issuance and finalization against a
+      // concurrent settings change in the same atomic Firestore commit.
+      const snapshot = await getFirestoreSnapshot("app_settings", "main", accessToken);
+      return {
+        value: snapshot?.data || null,
+        fence: {
+          verify: "projects/tabbakheen-99883/databases/(default)/documents/app_settings/main",
+          currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false }
+        }
+      };
     }
     // Legacy-only compatibility for deployed clients. Their quote/finalize routes accepted
     // missing coordinates with zero distance and base-only fee; keep this until the store
@@ -2939,7 +2982,7 @@
       if (!addressLine || !city || !district) return null;
       return { success: true, addressLine, city, district, lat: value.lat, lng: value.lng, deliveryNotes: typeof value.deliveryNotes === "string" ? value.deliveryNotes.slice(0, 500) : "" };
     }
-    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, stateVersion, accessToken, deletionFence) {
+    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, stateVersion, accessToken, deletionFence, pricingFence) {
       const event = "driver_delivery_requested_v2";
       const eventId = notificationEventId(orderId, event, stateVersion);
       const jobId = "dm_" + orderId + "_" + stateVersion;
@@ -3004,7 +3047,7 @@
         }, {
           update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_MATCH_JOBS_COLLECTION + "/" + jobId, fields: jobFields },
           currentDocument: { exists: false }
-        }, deletionFence] })
+        }, deletionFence, pricingFence] })
       });
       if (response.ok) return { ok: true, event, jobId };
       const text = await response.text();
@@ -6899,6 +6942,12 @@ async function renderSettings(c){
   var data=await api("/settings");
   if(!data)return;
   appSettings=data.settings||{};
+  var v2Policy=data.deliveryPricingPolicy||{};
+  var v2Valid=v2Policy.configurationValid===true;
+  var v2Uncapped=v2Valid&&v2Policy.feeCapMode==="uncapped";
+  var v2Source=v2Policy.policySource==="explicit_uncapped"?(lang==="ar"?"تفعيل صريح في الإعدادات المحفوظة":"Explicitly enabled in saved settings"):v2Policy.policySource==="default_capped"?(lang==="ar"?"الافتراضي الآمن: لا توجد سياسة V2":"Safe default: no V2 policy"):(lang==="ar"?"رجوع آمن للوضع المحدود: سياسة غير صالحة أو غير مدعومة":"Safe capped fallback: invalid or unsupported policy");
+  var v2RateSource=v2Policy.rateSource==="stored"?(lang==="ar"?"الإعدادات المحفوظة":"Saved settings"):v2Policy.rateSource==="stored_with_defaults"?(lang==="ar"?"الإعدادات المحفوظة مع قيم افتراضية للحقول الناقصة":"Saved settings with defaults for missing fields"):(lang==="ar"?"القيم الافتراضية":"Defaults");
+  var v2Amount=function(value){return v2Valid&&Number.isFinite(value)?esc(String(value))+" "+esc(v2Policy.currency||"SAR"):"—";};
   var bannerUrl=appSettings.bannerImageUrl||"";
   var bannerEnabled=appSettings.bannerEnabled!==false;
   var requirePhoneAtSignup=appSettings.requirePhoneAtSignup!==false;
@@ -6922,17 +6971,27 @@ async function renderSettings(c){
     '<div class="form-group"><label>'+t("supportEmail")+'</label><input id="s-supportEmail" value="'+esc(appSettings.supportEmail||"")+'"></div>'+
     '<div class="form-group"><label>'+t("supportWhatsapp")+'</label><input id="s-supportWhatsapp" value="'+esc(appSettings.supportWhatsapp||"")+'"></div>'+
     '</div>'+
-    '<div class="settings-section"><h3>'+t("deliveryPricing")+'</h3>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"تسعير التوصيل القديم (Legacy)":"Legacy delivery pricing")+'</h3>'+
     '<p style="font-size:13px;color:var(--text2);margin-bottom:16px">'+t("pricingFormula")+'</p>'+
     '<div class="grid-2">'+
     '<div class="form-group"><label>'+t("baseFee")+'</label><input type="number" min="0" step="0.5" id="s-baseFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.baseFee!=null?appSettings.deliveryPricing.baseFee:5)+'" oninput="updatePricingPreview()"></div>'+
     '<div class="form-group"><label>'+t("perKmCity")+'</label><input type="number" min="0" step="0.5" id="s-perKmCity" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.perKmInsideCity!=null?appSettings.deliveryPricing.perKmInsideCity:2)+'" oninput="updatePricingPreview()"></div>'+
     '<div class="form-group"><label>'+t("minFee")+'</label><input type="number" min="0" step="0.5" id="s-minFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.minFee!=null?appSettings.deliveryPricing.minFee:5)+'" oninput="updatePricingPreview()"></div>'+
-    '<div class="form-group"><label>'+t("maxFee")+'</label><input type="number" min="0" step="0.5" id="s-maxFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.maxFee!=null?appSettings.deliveryPricing.maxFee:50)+'" oninput="updatePricingPreview()"></div>'+
+    '<div class="form-group"><label>'+(lang==="ar"?"الحد الأقصى القديم / V2 المحدود":"Legacy / capped V2 maximum")+'</label><input type="number" min="0" step="0.5" id="s-maxFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.maxFee!=null?appSettings.deliveryPricing.maxFee:50)+'" oninput="updatePricingPreview()"></div>'+
     '</div>'+
     '<div id="pricing-validation" style="margin-top:8px"></div>'+
     '<div id="pricing-preview" style="margin-top:12px;padding:16px;background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:10px"></div>'+
     '</div>'+
+    '<div class="settings-section" aria-label="'+(lang==="ar"?"سياسة تسعير التوصيل V2":"Delivery V2 pricing policy")+'"><h3>'+(lang==="ar"?"التوصيل V2 — السياسة الفعلية المحفوظة":"Delivery V2 — saved effective policy")+'</h3>'+
+    '<p style="font-size:13px;color:var(--text2);margin-bottom:12px">'+(lang==="ar"?"للعرض فقط. لا يغيّر هذا القسم سياسة الإنتاج، والتعديلات أعلاه لا تظهر هنا حتى تُحفظ.":"Read only. This section does not activate a production policy; edits above appear here only after saving.")+'</p>'+
+    (v2Policy.configurationValid===false?'<p role="status" style="color:var(--error)">'+(lang==="ar"?"إعدادات التسعير غير صالحة؛ اقتباسات V2 غير متاحة حتى تُصحح.":"Pricing configuration is invalid; V2 quotes are unavailable until corrected.")+'</p>':'')+
+    '<div style="line-height:1.8;color:var(--text)"><div><strong>'+(lang==="ar"?"الوضع":"Mode")+':</strong> '+(!v2Valid?(lang==="ar"?"غير متاح — إعدادات غير صالحة":"Unavailable — invalid configuration"):v2Uncapped?(lang==="ar"?"غير محدود تجاريًا":"Commercially uncapped"):(lang==="ar"?"محدود":"Capped"))+'</div>'+
+    '<div><strong>'+(lang==="ar"?"الحد التجاري":"Commercial fee cap")+':</strong> '+(!v2Valid?"—":v2Uncapped?(lang==="ar"?"لا ينطبق":"Does not apply"):v2Amount(v2Policy.commercialMaxFee))+'</div>'+
+    '<div><strong>'+(lang==="ar"?"رسوم الأساس الفعلية":"Effective base fee")+':</strong> '+v2Amount(v2Policy.baseFee)+'</div>'+
+    '<div><strong>'+(lang==="ar"?"معدل الكيلومتر الفعلي":"Effective per-km rate")+':</strong> '+v2Amount(v2Policy.perKmInsideCity)+'</div>'+
+    '<div><strong>'+(lang==="ar"?"الحد الأدنى الفعلي":"Effective minimum fee")+':</strong> '+v2Amount(v2Policy.minFee)+'</div>'+
+    '<div><strong>'+(lang==="ar"?"مصدر السياسة":"Policy source")+':</strong> '+v2Source+'</div>'+
+    '<div><strong>'+(lang==="ar"?"مصدر المعدلات":"Rate source")+':</strong> '+v2RateSource+'</div></div></div>'+
     '<div class="settings-section"><h3>'+t("adminNotifications")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewUser"'+(appSettings.notifyOnNewUser?" checked":"")+'> '+t("notifyNewUser")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewProvider"'+(appSettings.notifyOnNewProvider?" checked":"")+'> '+t("notifyNewProvider")+'</label></div>'+
@@ -7018,6 +7077,7 @@ async function saveSettings(){
     supportEmail:document.getElementById("s-supportEmail")?document.getElementById("s-supportEmail").value:"",
     supportWhatsapp:document.getElementById("s-supportWhatsapp")?document.getElementById("s-supportWhatsapp").value:"",
     deliveryPricing:{
+      ...(appSettings.deliveryPricing&&typeof appSettings.deliveryPricing==="object"&&!Array.isArray(appSettings.deliveryPricing)?appSettings.deliveryPricing:{}),
       currency:"SAR",
       baseFee:Math.max(0,numberValue("s-baseFee",5)),
       perKmInsideCity:Math.max(0,numberValue("s-perKmCity",2)),
@@ -7035,7 +7095,7 @@ async function saveSettings(){
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
   var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});
-  if(data&&data.success)toast(t("settingsSaved"));
+  if(data&&data.success){toast(t("settingsSaved"));await renderSettings(document.getElementById("page-content"));}
   else toast(data&&data.error||t("failedSave"),"error");
 }
 
@@ -9325,7 +9385,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
               phonePasswordLoginEnabled: false
             };
-            return jsonResponse({ success: true, settings: adminSettings });
+            return jsonResponse({ success: true, settings: adminSettings, deliveryPricingPolicy: adminDeliveryPricingPolicy(settings) });
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
@@ -9334,6 +9394,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if ("providerDiscoveryRadiusKm" in body && body.providerDiscoveryRadiusKm !== null && ![10,25,50,100].includes(body.providerDiscoveryRadiusKm)) return jsonResponse({ error: "providerDiscoveryRadiusKm must be null, 10, 25, 50, or 100" }, 400);
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
             if ("clientVersionGate" in body) return jsonResponse({ error: "Unsupported settings field" }, 400);
+            if ("deliveryPricingV2" in body || "deliveryPricingPolicy" in body) return jsonResponse({ error: "Delivery V2 pricing policy is read-only in Admin" }, 400);
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -9372,6 +9433,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               return jsonResponse({ error: "No valid settings fields" }, 400);
             }
             const before = await getFirestoreDoc("app_settings", "main", accessToken) || {};
+            if ("deliveryPricing" in fields) {
+              if (!fields.deliveryPricing || typeof fields.deliveryPricing !== "object" || Array.isArray(fields.deliveryPricing)) return jsonResponse({ error: "Invalid delivery pricing" }, 400);
+              const priorPricing = before.deliveryPricing && typeof before.deliveryPricing === "object" && !Array.isArray(before.deliveryPricing) ? before.deliveryPricing : {};
+              fields.deliveryPricing = { ...priorPricing, ...fields.deliveryPricing };
+              if (!validConfiguredDeliveryPricing({ deliveryPricing: fields.deliveryPricing })) return jsonResponse({ error: "Invalid delivery pricing" }, 400);
+            }
             const audits = [], changedAt = new Date().toISOString();
             const oldPhone = before.requirePhoneAtSignup !== false;
             if ("requirePhoneAtSignup" in fields && oldPhone !== fields.requirePhoneAtSignup) {
@@ -10129,8 +10196,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (order.driverUid || order.status !== "ready_for_pickup") return phase4aError("TRANSITION_NOT_ALLOWED", "Delivery destination can no longer be changed", 409);
           if (!validSaudiCoordinatePair(order.providerLat, order.providerLng)) return phase4aError("PROVIDER_COORDINATES_REQUIRED", "Provider pickup coordinates are required", 422);
           const pricing = await loadDeliveryPricing(accessToken);
-          const calculated = calculateDeliveryPricing({ ...order, customerLat: dropoff.value.lat, customerLng: dropoff.value.lng }, pricing);
-          if (!calculated.ok) return phase4aError(calculated.code, "Valid provider and customer coordinates are required", 422);
+          const calculated = calculateDeliveryPricing({ ...order, customerLat: dropoff.value.lat, customerLng: dropoff.value.lng }, pricing.value);
+          if (!calculated.ok) return calculated.code === "DELIVERY_PRICING_INVALID" ? phase4aError(calculated.code, "Delivery pricing is temporarily unavailable", 503) : phase4aError(calculated.code, "Valid provider and customer coordinates are required", 422);
           const quoteId = "dq_" + Date.now().toString(36) + "_" + crypto.randomUUID().replace(/-/g, "");
           const quotedAt = new Date().toISOString();
           const expiresAt = new Date(Date.now() + DELIVERY_QUOTE_LIFETIME_MS).toISOString();
@@ -10159,7 +10226,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }, {
             verify: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + body.orderId,
             currentDocument: { updateTime: orderSnapshot.updateTime }
-          }, auth.deletionFence];
+          }, pricing.fence, auth.deletionFence];
           if (body.saveAsDefault) {
             const preferenceFields = { ...dropoff.value, label: typeof preferenceSnapshot?.data?.label === "string" ? preferenceSnapshot.data.label.slice(0, 80) : "", schemaVersion: 1 };
             writes.splice(1, 0, {
@@ -10199,9 +10266,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return phase4aError("DELIVERY_QUOTE_EXPIRED", "Delivery quote expired", 409);
           if (order.driverUid || order.status !== "ready_for_pickup") return phase4aError("TRANSITION_NOT_ALLOWED", "Delivery can no longer be finalized", 409);
           if (!validSaudiCoordinatePair(quote.dropoffLat, quote.dropoffLng) || !boundedRequiredString(quote.addressLine, 300) || !boundedRequiredString(quote.city, 120) || !boundedRequiredString(quote.district, 120) || !Number.isFinite(quote.deliveryDistanceKm) || quote.deliveryDistanceKm < 0 || !Number.isFinite(quote.deliveryFee) || quote.deliveryFee < 0 || typeof quote.pricingVersion !== "string") return phase4aError("STALE_DELIVERY_QUOTE", "Delivery quote snapshot is invalid", 409);
+          const pricing = await loadDeliveryPricing(accessToken);
+          const confirmed = calculateDeliveryPricing({ ...order, customerLat: quote.dropoffLat, customerLng: quote.dropoffLng }, pricing.value);
+          if (!confirmed.ok || confirmed.pricingVersion !== quote.pricingVersion || confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm || confirmed.deliveryFee !== quote.deliveryFee) return phase4aError("STALE_DELIVERY_QUOTE", "Delivery pricing changed; request a new quote", 409);
           const now = new Date().toISOString();
           const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
-          const subtotal = typeof order.priceSnapshot === "number" && Number.isFinite(order.priceSnapshot) ? order.priceSnapshot : 0;
+          const subtotal = order.priceSnapshot;
+          if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return phase4aError("ORDER_PRICE_INVALID", "Order subtotal cannot be combined safely with delivery fee", 409);
           const fields = {
             deliveryMethod: "driver",
             dropoffCity: quote.city,
@@ -10222,7 +10293,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             updatedAt: now
           };
           const privateDestination = { customerUid: auth.uid, providerUid: order.providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng, addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "" };
-          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, nextVersion, accessToken, auth.deletionFence);
+          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, nextVersion, accessToken, auth.deletionFence, pricing.fence);
           if (!committed.ok) {
             const latest = await getFirestoreDoc("orders", body.orderId, accessToken);
             if (latest && deliveryFinalizationV2IsIdempotent(latest, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(latest, true));
