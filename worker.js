@@ -1562,6 +1562,9 @@
           if (!isDriverDeliveryMethod(order.deliveryMethod) || order.deliveryStatus !== "ready_for_driver" || order.driverUid || !isFulfillmentEligible(order)) {
             return jsonResponse({ success: false, code: "already_assigned", error: "Delivery is no longer available" }, 409);
           }
+          const participants = await newActiveWorkDeletionFences([order.customerUid, order.providerUid, uid], accessToken);
+          if (participants.blocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
+          deletionFences = participants.fences;
           fields = { driverUid: uid, deliveryStatus: "driver_assigned", driverAssignedAt: now, deliveryStateVersion: nextVersion, updatedAt: now };
           notificationEvent = "driver_assigned";
         } else if (action === "reject") {
@@ -2089,8 +2092,8 @@
       if (hasUid && hasId && offer.providerUid !== offer.providerId) return null;
       return hasUid ? offer.providerUid : offer.providerId;
     }
-    // Read-only marker fence for new business writes. This candidate does not
-    // create markers or change the legacy account-deletion lifecycle.
+    // Read-only marker fence for new business writes. Account deletion creates
+    // the marker only at its durable irreversible boundary.
     const ACCOUNT_DELETION_IRREVERSIBLE_MARKERS = "account_deletion_irreversible_markers";
     function phase4aDeletionFence(uid, snapshot) {
       return { verify: "projects/tabbakheen-99883/databases/(default)/documents/account_deletion_requests/" + uid, currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
@@ -7931,7 +7934,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         response = await fetch("https://identitytoolkit.googleapis.com/v1/projects/tabbakheen-99883/accounts:delete", {
           method: "POST",
           headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
-          body: JSON.stringify({ localId: uid })
+          body: JSON.stringify({ localId: uid }),
+          signal: AbortSignal.timeout(8e3)
         });
       } catch {
         return { outcome: "uncertain" };
@@ -7974,16 +7978,41 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(orderIsActive, "orderIsActive");
     __name2(orderIsActive, "orderIsActive");
-    async function accountDeletionActiveOrders(uid, role, accessToken) {
-      const matches = [];
-      const roleField = { customer: "customerUid", provider: "providerUid", driver: "driverUid" }[role];
-      if (!roleField) return matches;
-      const orders = await queryFirestore("orders", roleField, "EQUAL", uid, accessToken);
-      for (const order of orders) if (orderIsActive(order)) matches.push(order);
-      return matches;
+    const ACCOUNT_DELETION_PAGE_SIZE = 10;
+    const ACCOUNT_DELETION_ORDER_FIELDS = ["customerUid", "providerUid", "driverUid"];
+    async function accountDeletionOrderPage(uid, roleField, cursor, accessToken) {
+      if (!ACCOUNT_DELETION_ORDER_FIELDS.includes(roleField)) throw new Error("Invalid deletion participant field");
+      const prefix = phase4aDoc("orders", "", {}).name;
+      if (cursor !== null && (typeof cursor !== "string" || !cursor.startsWith(prefix) || cursor.length > 2048)) throw new Error("Invalid deletion cursor");
+      const query = {
+        from: [{ collectionId: "orders" }],
+        where: { fieldFilter: { field: { fieldPath: roleField }, op: "EQUAL", value: { stringValue: uid } } },
+        orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
+        select: { fields: [{ fieldPath: "status" }, { fieldPath: "deliveryStatus" }] },
+        limit: ACCOUNT_DELETION_PAGE_SIZE
+      };
+      if (cursor) query.startAt = { values: [{ referenceValue: cursor }], before: false };
+      const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + ":runQuery", {
+        method: "POST", headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ structuredQuery: query })
+      }, 8e3);
+      if (!response.ok || !Array.isArray(body) || !body.length || body.length > ACCOUNT_DELETION_PAGE_SIZE + 1 ||
+          body.some((entry) => !entry || !entry.document && typeof entry.readTime !== "string")) throw new Error("Deletion order page failed");
+      const documents = body.filter((entry) => entry.document).map((entry) => entry.document);
+      if (documents.length > ACCOUNT_DELETION_PAGE_SIZE ||
+          documents.some((doc) => typeof doc.name !== "string" || !doc.name.startsWith(prefix)))
+        throw new Error("Deletion order page malformed");
+      let previous = cursor;
+      for (const document of documents) {
+        if (previous && document.name <= previous) throw new Error("Deletion order page did not advance");
+        previous = document.name;
+      }
+      return { orders: documents.map(parseFirestoreDoc),
+        cursor: documents.length ? documents[documents.length - 1].name : cursor,
+        complete: documents.length < ACCOUNT_DELETION_PAGE_SIZE };
     }
-    __name(accountDeletionActiveOrders, "accountDeletionActiveOrders");
-    __name2(accountDeletionActiveOrders, "accountDeletionActiveOrders");
+    __name(accountDeletionOrderPage, "accountDeletionOrderPage");
+    __name2(accountDeletionOrderPage, "accountDeletionOrderPage");
     const ACCOUNT_DELETION_LEASE_MS = 12e4;
     function deletionTransitionAllowed(current, next) {
       if (current === "completed") return next === "completed";
@@ -7993,6 +8022,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(deletionTransitionAllowed, "deletionTransitionAllowed");
     __name2(deletionTransitionAllowed, "deletionTransitionAllowed");
+    function commitAccountDeletionState(uid, fields, updateTime, accessToken) {
+      return phase4aCommit([{
+        update: phase4aDoc("account_deletion_requests", uid, fields),
+        updateMask: { fieldPaths: Object.keys(fields) },
+        currentDocument: { updateTime }
+      }], accessToken);
+    }
     async function claimAccountDeletion(uid, accessToken) {
       const owner = crypto.randomUUID();
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -8002,12 +8038,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (snapshot.data.status === "completed") return { claimed: false, state: snapshot.data };
         if (snapshot.data.executionLeaseOwner && new Date(snapshot.data.executionLeaseUntil || 0).getTime() > now) return { claimed: false, state: snapshot.data };
         const executionLeaseUntil = new Date(now + ACCOUNT_DELETION_LEASE_MS).toISOString();
-        const claimed = await compareAndSetFirestoreDocument("account_deletion_requests", uid, {
+        const claimed = await commitAccountDeletionState(uid, {
           executionLeaseOwner: owner,
           executionLeaseUntil,
           updatedAt: new Date(now).toISOString()
         }, snapshot.updateTime, accessToken);
-        if (claimed.ok) return { claimed: true, owner, state: { ...snapshot.data, executionLeaseOwner: owner, executionLeaseUntil } };
+        if (claimed) return { claimed: true, owner, state: { ...snapshot.data, executionLeaseOwner: owner, executionLeaseUntil } };
       }
       const latest = await getFirestoreDoc("account_deletion_requests", uid, accessToken);
       return { claimed: false, state: latest };
@@ -8028,8 +8064,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           executionLeaseUntil: releaseLease ? null : new Date(now + ACCOUNT_DELETION_LEASE_MS).toISOString(),
           updatedAt: new Date(now).toISOString()
         };
-        const written = await compareAndSetFirestoreDocument("account_deletion_requests", uid, nextFields, snapshot.updateTime, accessToken);
-        if (written.ok) return { ...snapshot.data, ...nextFields };
+        const written = await commitAccountDeletionState(uid, nextFields, snapshot.updateTime, accessToken);
+        if (written) return { ...snapshot.data, ...nextFields };
       }
       return null;
     }
@@ -8048,55 +8084,49 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name(cleanupLimitationsFrom, "cleanupLimitationsFrom");
     __name2(cleanupLimitationsFrom, "cleanupLimitationsFrom");
     async function deleteNotificationSubcollectionBatch(uid, rootCollection, accessToken) {
-      const page = await listFirestorePage(rootCollection + "/" + uid + "/items", 50, null, accessToken);
+      const page = await listFirestorePage(rootCollection + "/" + uid + "/items", 5, null, accessToken);
       const ids = page.items.map((item) => item._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + rootCollection + "/" + uid + "/items/";
         const committed = await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken);
         if (!committed) throw new Error("Notification cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 && !page.nextPageToken };
+      return { deletedCount: ids.length, complete: ids.length < 5 && !page.nextPageToken };
     }
     async function deleteClientInstallationBatch(uid, accessToken) {
-      const page = await listFirestorePage("client_installations/" + uid + "/devices", 50, null, accessToken);
+      const page = await listFirestorePage("client_installations/" + uid + "/devices", 5, null, accessToken);
       const ids = page.items.map((item) => item._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/client_installations/" + uid + "/devices/";
         const committed = await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken);
         if (!committed) throw new Error("Installation cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 && !page.nextPageToken };
+      return { deletedCount: ids.length, complete: ids.length < 5 && !page.nextPageToken };
     }
     async function deleteDeliveryQuotesForCustomerBatch(uid, accessToken) {
-      const quotes = await queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "customerUid", "EQUAL", uid, 50, accessToken);
+      const quotes = await queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "customerUid", "EQUAL", uid, 5, accessToken);
       const ids = quotes.map((quote) => quote?._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/";
         if (!await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken)) throw new Error("Delivery quote cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 };
+      return { deletedCount: ids.length, complete: ids.length < 5 };
     }
     async function deleteOrderDeliveryPrivateForCustomerBatch(uid, accessToken) {
-      const records = await queryFirestoreLimited(ORDER_DELIVERY_PRIVATE_COLLECTION, "customerUid", "EQUAL", uid, 50, accessToken);
+      const records = await queryFirestoreLimited(ORDER_DELIVERY_PRIVATE_COLLECTION, "customerUid", "EQUAL", uid, 5, accessToken);
       const ids = records.map((record) => record?._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/";
         if (!await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken)) throw new Error("Private delivery cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 };
+      return { deletedCount: ids.length, complete: ids.length < 5 };
     }
     async function buildAccountDeletionManifest(uid, user, accessToken, env) {
       const verification = await getFirestoreDoc("verifications", uid, accessToken);
       const certificatePublicId = cloudinaryPublicIdFromVerification(verification);
-      const offers = user.role === "provider" ? await queryFirestore("offers", "providerId", "EQUAL", uid, accessToken) : [];
-      if (user.role === "provider") {
-        const legacyOffers = await queryFirestore("offers", "providerUid", "EQUAL", uid, accessToken);
-        for (const offer of legacyOffers) if (!offers.some((item) => item._id === offer._id)) offers.push(offer);
-      }
       const cleanupLimitations = cleanupLimitationsFrom(user, "profile");
       const verificationLimitations = cleanupLimitationsFrom(verification, "verification");
       cleanupLimitations.push(...(certificatePublicId ? verificationLimitations.filter((item) => !item.startsWith("verification.freelanceCertificate.fileUrl_has_no_public_id")) : verificationLimitations));
-      cleanupLimitations.push(...offers.flatMap((offer) => cleanupLimitationsFrom(offer, "offer")));
       if (!certificatePublicId && verification?.freelanceCertificate?.fileUrl) cleanupLimitations.push("certificate_url_has_no_public_id");
       const profilePhone = normalizeSaudiMobilePhone(user.phone);
       const indexedPhoneMustBeRemoved = profilePhone && user.phoneIndexStatus === "indexed";
@@ -8105,7 +8135,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         role: user.role,
         certificatePublicId,
         certificateDeleted: !certificatePublicId,
-        remainingOfferIds: [...new Set(offers.map((offer) => offer?._id).filter(Boolean))],
+        // Old manifests retain their bounded remainingOfferIds cursor. New
+        // manifests drain each provider alias from a small first page until
+        // empty; an empty array alone never certifies offer cleanup.
+        remainingOfferIds: [],
+        offerSweepField: user.role === "provider" ? "providerId" : "done",
+        offerSweepComplete: user.role !== "provider",
         // Hash only: no phone is copied into the account-deletion record.
         phoneIndexKey,
         phoneIndexDeleted: !indexedPhoneMustBeRemoved,
@@ -8123,11 +8158,35 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         clientInstallationSummaryDeleted: false,
         userDeleted: false,
         verificationDeleted: false,
-        cleanupLimitations: [...new Set(cleanupLimitations)]
+        cleanupLimitations: [...new Set(cleanupLimitations)].slice(0, 32),
+        cleanupLimitationsOverflow: cleanupLimitations.length > 32
       };
     }
     __name(buildAccountDeletionManifest, "buildAccountDeletionManifest");
     __name2(buildAccountDeletionManifest, "buildAccountDeletionManifest");
+    async function accountDeletionOfferPage(uid, field, accessToken) {
+      if (!["providerId", "providerUid"].includes(field)) throw new Error("Invalid offer cleanup field");
+      const query = { from: [{ collectionId: "offers" }],
+        where: { fieldFilter: { field: { fieldPath: field }, op: "EQUAL", value: { stringValue: uid } } },
+        orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }], limit: 3 };
+      const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + ":runQuery", {
+        method: "POST", headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ structuredQuery: query })
+      }, 8e3);
+      if (!response.ok || !Array.isArray(body) || body.length > 4) throw new Error("Offer cleanup page failed");
+      const prefix = phase4aDoc("offers", "", {}).name;
+      const offers = body.filter((entry) => entry.document).map((entry) => entry.document);
+      if (offers.length > 3 || offers.some((doc) => !doc.name?.startsWith(prefix) || !doc.updateTime)) throw new Error("Offer cleanup page malformed");
+      return offers.map((doc) => ({ name: doc.name, updateTime: doc.updateTime, data: parseFirestoreDoc(doc) }));
+    }
+    async function yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken) {
+      return await writeDeletionState(uid, owner, {
+        status: "cleanup_pending", cleanupManifest: manifest,
+        cleanupFailures: [...new Set(failures)],
+        failureCode: failures.length ? "cleanup_failed" : "",
+        code: failures.length ? "ACCOUNT_DELETE_FAILED" : null
+      }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+    }
     async function createAccountDeletionRequestIfAbsent(uid, record, accessToken) {
       const fields = {};
       for (const [key, value] of Object.entries(record)) fields[key] = toFirestoreValue(value);
@@ -8148,6 +8207,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       const manifest = { ...(record.cleanupManifest || {}) };
       manifest.remainingOfferIds = Array.isArray(manifest.remainingOfferIds) ? manifest.remainingOfferIds : [];
       manifest.cleanupLimitations = Array.isArray(manifest.cleanupLimitations) ? manifest.cleanupLimitations : [];
+      // Existing exhaustive manifests are drained first, then both aliases
+      // are re-queried. An empty legacy ID array is never proof of completion.
+      if (!Object.prototype.hasOwnProperty.call(manifest, "offerSweepComplete")) manifest.offerSweepComplete = ["customer", "driver"].includes(manifest.role);
+      if (!manifest.offerSweepComplete && !["providerId", "providerUid", "done"].includes(manifest.offerSweepField)) manifest.offerSweepField = "providerId";
       // Manifests created before phone identity existed have no index to clean;
       // preserve their resumability rather than turning an old deletion into a
       // permanently pending request.
@@ -8167,6 +8230,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientVersionDeleted")) manifest.clientVersionDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientInstallationsDeleted")) manifest.clientInstallationsDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientInstallationSummaryDeleted")) manifest.clientInstallationSummaryDeleted = false;
+      const pendingStep = manifest.phoneIndexDeleted !== true ? "phoneIndexDeleted" :
+        manifest.certificatePublicId && manifest.certificateDeleted !== true ? "certificateDeleted" :
+        manifest.remainingOfferIds.length || !manifest.offerSweepComplete ? "offers" :
+        ["publicProfileDeleted", "privateDeviceDeleted", "driverRuntimeLocationDeleted",
+          "customerDeliveryPreferenceDeleted", "deliveryQuotesDeleted", "orderDeliveryPrivateDeleted",
+          "notificationItemsDeleted", "notificationUnreadDeleted", "notificationSummaryDeleted",
+          "clientVersionDeleted", "clientInstallationsDeleted", "clientInstallationSummaryDeleted",
+          "userDeleted", "verificationDeleted"].find((field) => manifest[field] !== true) || "complete";
       const failures = [];
       if (manifest.phoneIndexDeleted !== true) {
         if (!manifest.phoneIndexKey) {
@@ -8188,6 +8259,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
         }
       }
+      if (pendingStep === "phoneIndexDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       // Known media is optional infrastructure, isolated from all critical deletes.
       if (manifest.certificatePublicId && manifest.certificateDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -8200,16 +8272,55 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           failures.push("certificate_delete_failed");
         }
       }
-      for (const offerId of [...manifest.remainingOfferIds]) {
+      if (pendingStep === "certificateDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
+      if (manifest.remainingOfferIds.length) {
+        const offerId = manifest.remainingOfferIds[0];
+        if (!phase4aSafeSegment(offerId)) return yieldAccountDeletionCleanup(uid, owner, manifest, ["offer_id_invalid"], accessToken);
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
-          await deleteFirestoreDocument("offers", offerId, accessToken);
+          const offer = await getFirestoreSnapshot("offers", offerId, accessToken);
+          if (offer && resolveOfferProviderUid(offer.data) !== uid) throw new Error("Legacy offer owner changed");
+          if (offer && !await phase4aCommit([{
+            delete: phase4aDoc("offers", offerId, {}).name,
+            currentDocument: { updateTime: offer.updateTime }
+          }], accessToken)) throw new Error("Legacy offer changed");
           manifest.remainingOfferIds = manifest.remainingOfferIds.filter((id) => id !== offerId);
           const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch {
           failures.push("offer_delete_failed");
         }
+        return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
+      }
+      if (!manifest.offerSweepComplete) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          const field = manifest.offerSweepField;
+          const offers = await accountDeletionOfferPage(uid, field, accessToken);
+          if (offers.length) {
+            if (offers.some((offer) => !phase4aSafeSegment(offer.data?._id) || offer.data[field] !== uid || resolveOfferProviderUid(offer.data) !== uid)) {
+              failures.push("offer_owner_mismatch");
+            } else {
+              for (const offer of offers) {
+                for (const limitation of cleanupLimitationsFrom(offer.data, "offer")) {
+                  if (!manifest.cleanupLimitations.includes(limitation)) {
+                    if (manifest.cleanupLimitations.length < 32) manifest.cleanupLimitations.push(limitation);
+                    else manifest.cleanupLimitationsOverflow = true;
+                  }
+                }
+              }
+              // Persist the media audit before a possibly ambiguous delete.
+              // Re-reading the first page after interruption cannot skip it.
+              if (!await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+              const committed = await phase4aCommit(offers.map((offer) => ({ delete: offer.name, currentDocument: { updateTime: offer.updateTime } })), accessToken);
+              if (!committed) failures.push("offer_delete_conflict");
+            }
+          } else {
+            manifest.offerSweepField = field === "providerId" ? "providerUid" : "done";
+            manifest.offerSweepComplete = manifest.offerSweepField === "done";
+          }
+        } catch { failures.push("offer_sweep_failed"); }
+        return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       }
       if (manifest.publicProfileDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -8220,6 +8331,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("public_profile_delete_failed"); }
       }
+      if (pendingStep === "publicProfileDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.privateDeviceDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8229,6 +8341,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("private_device_delete_failed"); }
       }
+      if (pendingStep === "privateDeviceDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.driverRuntimeLocationDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8238,6 +8351,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("driver_runtime_location_delete_failed"); }
       }
+      if (pendingStep === "driverRuntimeLocationDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.customerDeliveryPreferenceDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8247,6 +8361,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("customer_delivery_preference_delete_failed"); }
       }
+      if (pendingStep === "customerDeliveryPreferenceDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.deliveryQuotesDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8256,6 +8371,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("delivery_quotes_delete_failed"); }
       }
+      if (pendingStep === "deliveryQuotesDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.orderDeliveryPrivateDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8265,6 +8381,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("order_delivery_private_delete_failed"); }
       }
+      if (pendingStep === "orderDeliveryPrivateDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.notificationItemsDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8274,6 +8391,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("notification_items_delete_failed"); }
       }
+      if (pendingStep === "notificationItemsDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.notificationUnreadDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8283,6 +8401,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("notification_unread_delete_failed"); }
       }
+      if (pendingStep === "notificationUnreadDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.notificationSummaryDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8292,6 +8411,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("notification_summary_delete_failed"); }
       }
+      if (pendingStep === "notificationSummaryDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.clientVersionDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8301,6 +8421,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("client_version_delete_failed"); }
       }
+      if (pendingStep === "clientVersionDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.clientInstallationsDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8310,6 +8431,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("client_installations_delete_failed"); }
       }
+      if (pendingStep === "clientInstallationsDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.clientInstallationSummaryDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8319,6 +8441,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("client_installation_summary_delete_failed"); }
       }
+      if (pendingStep === "clientInstallationSummaryDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.userDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8328,6 +8451,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("user_delete_failed"); }
       }
+      if (pendingStep === "userDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.verificationDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -8337,7 +8461,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("verification_delete_failed"); }
       }
-      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.driverRuntimeLocationDeleted === true && manifest.customerDeliveryPreferenceDeleted === true && manifest.deliveryQuotesDeleted === true && manifest.orderDeliveryPrivateDeleted === true && manifest.notificationItemsDeleted === true && manifest.notificationUnreadDeleted === true && manifest.notificationSummaryDeleted === true && manifest.clientInstallationsDeleted === true && manifest.clientInstallationSummaryDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
+      if (pendingStep === "verificationDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
+      const complete = manifest.remainingOfferIds.length === 0 && manifest.offerSweepComplete === true && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.driverRuntimeLocationDeleted === true && manifest.customerDeliveryPreferenceDeleted === true && manifest.deliveryQuotesDeleted === true && manifest.orderDeliveryPrivateDeleted === true && manifest.notificationItemsDeleted === true && manifest.notificationUnreadDeleted === true && manifest.notificationSummaryDeleted === true && manifest.clientVersionDeleted === true && manifest.clientInstallationsDeleted === true && manifest.clientInstallationSummaryDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
       const final = await writeDeletionState(uid, owner, {
         status: complete ? "completed" : "cleanup_pending",
         cleanupManifest: manifest,
@@ -8360,16 +8485,58 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (!user || !["customer", "provider", "driver"].includes(user.role) || user.isOwner === true || user.privileged === true) {
           return await writeDeletionState(uid, owner, { status: "failed", code: "ADMIN_REQUIRED", failureCode: "ineligible" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
-        const active = await accountDeletionActiveOrders(uid, user.role, accessToken);
-        if (active.length) {
-          return await writeDeletionState(uid, owner, { status: "failed", code: "ACTIVE_ORDERS", failureCode: "active_orders" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        const preflight = record.status === "requested" && record.orderPreflight?.role === user.role ? record.orderPreflight :
+          { role: user.role, fieldIndex: 0, cursor: null, complete: false };
+        if (preflight.complete && (preflight.fieldIndex !== ACCOUNT_DELETION_ORDER_FIELDS.length || preflight.cursor !== null)) throw new Error("Deletion preflight completion invalid");
+        if (!preflight.complete) {
+          if (!Number.isInteger(preflight.fieldIndex) || preflight.fieldIndex < 0 || preflight.fieldIndex >= ACCOUNT_DELETION_ORDER_FIELDS.length) throw new Error("Deletion preflight state invalid");
+          const page = await accountDeletionOrderPage(uid, ACCOUNT_DELETION_ORDER_FIELDS[preflight.fieldIndex], preflight.cursor, accessToken);
+          if (page.orders.some((order) => orderIsActive(order) || !["cancelled", "delivered", "rejected", "completed"].includes(order?.status))) {
+            return await writeDeletionState(uid, owner, { status: "failed", code: "ACTIVE_ORDERS", failureCode: "active_orders", orderPreflight: null }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+          }
+          const fieldIndex = preflight.fieldIndex + (page.complete ? 1 : 0);
+          const nextPreflight = { role: user.role, fieldIndex, cursor: page.complete ? null : page.cursor,
+            complete: fieldIndex === ACCOUNT_DELETION_ORDER_FIELDS.length };
+          record = await writeDeletionState(uid, owner, { status: "requested", orderPreflight: nextPreflight }, accessToken, true);
+          return record || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        }
+        // The existing Final Rules deny direct order/offer writes. Do not
+        // cross the Auth boundary under the deployed Bridge Rules. This exact
+        // binding is an owner-controlled deployment prerequisite, not a V2 flag.
+        if (env.ACCOUNT_DELETION_FINAL_RULES_ACTIVE !== "true") {
+          return await writeDeletionState(uid, owner, { status: "requested", code: "ACCOUNT_DELETE_FAILED", failureCode: "final_rules_required" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
         const cleanupManifest = await buildAccountDeletionManifest(uid, user, accessToken, env);
-        record = await writeDeletionState(uid, owner, { uid, role: user.role, status: "in_progress", cleanupManifest, code: null, failureCode: "" }, accessToken);
+        record = await writeDeletionState(uid, owner, { uid, role: user.role, status: "in_progress", deletionAttemptId: crypto.randomUUID(), cleanupManifest, code: null, failureCode: "" }, accessToken, true);
         if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        return record;
       }
       if (record.status === "in_progress") {
         if (!record.cleanupManifest) throw new Error("Cleanup manifest unavailable");
+        if (record.deletionAttemptId) {
+          // Marker creation and request CAS are one commit. An ambiguous
+          // response is reconciled by reading both documents before Auth.
+          let marker = await getFirestoreSnapshot(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken);
+          if (!marker) {
+            if (env.ACCOUNT_DELETION_FINAL_RULES_ACTIVE !== "true") return record;
+            const requestSnapshot = await getFirestoreSnapshot("account_deletion_requests", uid, accessToken);
+            if (!requestSnapshot || requestSnapshot.data.status !== "in_progress" || requestSnapshot.data.orderPreflight?.complete !== true ||
+                requestSnapshot.data.orderPreflight?.fieldIndex !== ACCOUNT_DELETION_ORDER_FIELDS.length ||
+                requestSnapshot.data.executionLeaseOwner !== owner || requestSnapshot.data.deletionAttemptId !== record.deletionAttemptId) return requestSnapshot?.data || record;
+            const now = new Date().toISOString();
+            try {
+              await phase4aCommit([{
+                update: phase4aDoc("account_deletion_requests", uid, { irreversibleStartedAt: now }),
+                updateMask: { fieldPaths: ["irreversibleStartedAt"] }, currentDocument: { updateTime: requestSnapshot.updateTime }
+              }, {
+                update: phase4aDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, { uid, attemptId: record.deletionAttemptId, startedAt: now }),
+                currentDocument: { exists: false }
+              }], accessToken);
+            } catch { /* Read authoritative state after an uncertain commit. */ }
+            marker = await getFirestoreSnapshot(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken);
+          }
+          if (marker?.data?.uid !== uid || marker.data.attemptId !== record.deletionAttemptId) return record;
+        }
         record = await writeDeletionState(uid, owner, { status: "in_progress" }, accessToken);
         if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         const authResult = await deleteFirebaseAuthUser(uid, env);
@@ -8377,7 +8544,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return await writeDeletionState(uid, owner, { status: "in_progress", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_uncertain" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
         if (authResult.outcome === "permanent") {
-          return await writeDeletionState(uid, owner, { status: "failed", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_rejected" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+          // Keep the same attempt and marker. A later repaired Auth
+          // configuration can resume it; restarting preflight would create a
+          // new attempt that could never match the irreversible marker.
+          return await writeDeletionState(uid, owner, { status: "in_progress", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_rejected" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
         record = await writeDeletionState(uid, owner, { status: "auth_deleted", authDeletedAt: new Date().toISOString(), code: null, failureCode: "" }, accessToken);
         if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -8406,7 +8576,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (!body || body.confirm !== true || Object.keys(body).some((key) => !["confirm"].includes(key))) return jsonResponse({ success: false, code: "INVALID_REQUEST", error: "confirm:true is required" }, 400);
       const existing = await getFirestoreDoc("account_deletion_requests", uid, accessToken);
       if (existing?.status === "completed") return jsonResponse({ success: true, status: "completed", code: null, idempotent: true });
-      if (existing?.status && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(existing.status)) return jsonResponse({ success: true, status: existing.status, code: existing.code || null, idempotent: true });
+      if (existing?.status && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(existing.status)) {
+        try {
+          const result = await processAccountDeletion(uid, env, accessToken, existing);
+          return jsonResponse({ success: result.status === "completed", status: result.status, code: result.code || null, idempotent: true });
+        } catch {
+          return jsonResponse({ success: false, status: existing.status, code: "ACCOUNT_DELETE_FAILED", error: "Account deletion could not be completed" }, 500);
+        }
+      }
       const user = await getFirestoreDoc("users", uid, accessToken);
       if (!user || !["customer", "provider", "driver"].includes(user.role) || user.isOwner === true || user.privileged === true) return jsonResponse({ success: false, code: "ADMIN_REQUIRED", error: "Account is not eligible" }, 403);
       const record = existing || { uid, role: user.role, status: "requested", requestedAt: new Date().toISOString() };
@@ -8422,14 +8599,62 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(handleAccountDeletion, "handleAccountDeletion");
     __name2(handleAccountDeletion, "handleAccountDeletion");
-    async function resumeAccountDeletionsWithAccessToken(env, suppliedAccessToken) {
-      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-      const records = [];
-      for (const status of ["requested", "in_progress", "auth_deleted", "cleanup_pending"]) records.push(...await queryFirestore("account_deletion_requests", "status", "EQUAL", status, accessToken));
-      for (const record of records.slice(0, 10)) {
-        try { await processAccountDeletion(record.uid, env, accessToken, record); } catch {}
+    const CRON_QUEUE_STATE_COLLECTION = "cron_maintenance_state";
+    const CRON_QUEUE_STATE_ID = "account_deletion_outbox_v2";
+    async function cronQueueNext(collection, status, accessToken) {
+      const key = collection + "_" + status;
+      const prefix = phase4aDoc(collection, "", {}).name;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let checkpoint = await getFirestoreSnapshot(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID, accessToken);
+        if (!checkpoint) {
+          await phase4aCommit([{ update: phase4aDoc(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID, { cursors: {} }), currentDocument: { exists: false } }], accessToken);
+          checkpoint = await getFirestoreSnapshot(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID, accessToken);
+          if (!checkpoint) return null;
+        }
+        const cursors = checkpoint.data.cursors && typeof checkpoint.data.cursors === "object" && !Array.isArray(checkpoint.data.cursors) ? checkpoint.data.cursors : {};
+        const prior = cursors[key] || null;
+        if (prior && (typeof prior !== "string" || !prior.startsWith(prefix) || prior.length > 2048)) throw new Error("Invalid Cron cursor");
+        const page = async (cursor) => {
+          const query = { from: [{ collectionId: collection }],
+            where: { fieldFilter: { field: { fieldPath: "status" }, op: "EQUAL", value: { stringValue: status } } },
+            orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }], limit: 3 };
+          if (cursor) query.startAt = { values: [{ referenceValue: cursor }], before: false };
+          const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + ":runQuery", {
+            method: "POST", headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+            body: JSON.stringify({ structuredQuery: query })
+          }, 8e3);
+          if (!response.ok || !Array.isArray(body) || !body.length || body.length > 4) throw new Error("Cron queue page failed");
+          const docs = body.filter((entry) => entry.document).map((entry) => entry.document);
+          if (docs.length > 3 || docs.some((doc) => !doc.name?.startsWith(prefix))) throw new Error("Cron queue page malformed");
+          return docs;
+        };
+        let docs = await page(prior);
+        if (!docs.length && prior) docs = await page(null);
+        const now = Date.now();
+        const selected = docs.map(parseFirestoreDoc).find((doc) =>
+          (!doc.leaseUntil || new Date(doc.leaseUntil).getTime() <= now) &&
+          (!doc.receiptLeaseUntil || new Date(doc.receiptLeaseUntil).getTime() <= now)) || null;
+        const nextCursor = selected ? phase4aDoc(collection, selected._id, {}).name : docs.length ? docs[docs.length - 1].name : null;
+        // A supported Commit updateTime precondition is the cursor CAS. On a
+        // lost response, the next invocation rereads the durable cursor;
+        // replaying a selected item remains safe only through its own lease.
+        const written = await phase4aCommit([{
+          update: phase4aDoc(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID,
+            { cursors: { ...cursors, [key]: nextCursor } }),
+          updateMask: { fieldPaths: ["cursors"] },
+          currentDocument: { updateTime: checkpoint.updateTime }
+        }], accessToken);
+        if (written) return selected;
       }
-      return records.length > 0;
+      return null;
+    }
+    async function resumeAccountDeletionsWithAccessToken(env, suppliedAccessToken, status = "requested") {
+      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      if (!["requested", "in_progress", "auth_deleted", "cleanup_pending"].includes(status)) throw new Error("Invalid deletion queue status");
+      const record = await cronQueueNext("account_deletion_requests", status, accessToken);
+      if (!record || !phase4aSafeSegment(record.uid)) return false;
+      try { await processAccountDeletion(record.uid, env, accessToken, record); } catch { /* State remains retryable on the next cursor sweep. */ }
+      return true;
     }
     async function resumeAccountDeletions(env) {
       return resumeAccountDeletionsWithAccessToken(env);
@@ -8524,31 +8749,20 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       const ids = [...new Set([...expired, ...used].map((quote) => quote?._id).filter(phase4aSafeSegment))].slice(0, 20);
       if (ids.length) await phase4aCommit(ids.map((id) => ({ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + id })), accessToken);
     }
-    async function handleScheduledOutbox(env, suppliedAccessToken) {
+    async function handleScheduledOutbox(env, suppliedAccessToken, status = "pending") {
       // Commercial entitlement reconciliation is intentionally event-driven
       // (entitlement reads and denied mutations). A minute-cron sweep would
       // require scanning users/offers or new index assumptions, so none is run.
       const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-      const [pending, failed, sent, pendingOrders] = await Promise.all([
-        queryFirestore("order_transition_events", "status", "EQUAL", "pending", accessToken),
-        queryFirestore("order_transition_events", "status", "EQUAL", "failed", accessToken),
-        queryFirestore("order_transition_events", "status", "EQUAL", "sent", accessToken),
-        // Only pending orders that still need the v1 -> v2 notification
-        // repair. The old status == "pending" scan re-read every stale
-        // pending order every minute (~26k reads/day on its own).
-        queryFirestoreAllEqual("orders", { status: "pending", transactionalNotificationVersion: 1 }, 25, accessToken)
-      ]);
-      // One outbox work item per invocation gives targeted matching a hard
-      // subrequest ceiling. Admin broadcasts use a separate architecture.
-      const retryableEvent = [...pending, ...failed].find((eventDoc) => !eventDoc.leaseUntil || new Date(eventDoc.leaseUntil).getTime() <= Date.now());
-      if (retryableEvent) {
-        await sendTransitionNotification(retryableEvent.transition, retryableEvent.orderId, accessToken, retryableEvent.stateVersion, retryableEvent._id);
+      if (["pending", "failed", "sent"].includes(status)) {
+        const eventDoc = await cronQueueNext("order_transition_events", status, accessToken);
+        if (!eventDoc) return false;
+        if (status === "sent") await pollOutboxReceipts(eventDoc, accessToken);
+        else await sendTransitionNotification(eventDoc.transition, eventDoc.orderId, accessToken, eventDoc.stateVersion, eventDoc._id);
         return true;
       }
-      if (sent.length) {
-        await pollOutboxReceipts(sent[0], accessToken);
-        return true;
-      }
+      if (status !== "legacy_order") throw new Error("Invalid outbox queue status");
+      const pendingOrders = await queryFirestoreAllEqual("orders", { status: "pending", transactionalNotificationVersion: 1 }, 3, accessToken);
       const repairOrder = pendingOrders.find((item) => item.status === "pending" && item.transactionalNotificationVersion === 1);
       if (repairOrder) {
         const order = repairOrder;
@@ -8563,24 +8777,36 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         }
         return true;
       }
-      return pending.length > 0 || failed.length > 0 || sent.length > 0 || pendingOrders.length > 0;
+      return false;
     }
     __name(handleScheduledOutbox, "handleScheduledOutbox");
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
     async function handleScheduledMaintenance(env) {
       const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-      // Never combine account-deletion work with outbox transport in the same
-      // invocation: deletion retries can be large and are not part of the
-      // targeted notification's fixed budget.
-      const deletionBusy = await resumeAccountDeletionsWithAccessToken(env, accessToken);
-      if (deletionBusy) return;
-      const outboxBusy = await handleScheduledOutbox(env, accessToken);
-      // Existing outbox and account-deletion work always has priority. On an
-      // idle minute, process one one-driver match page; cleanup uses the lane
-      // only when no match job is waiting. This keeps the modeled worst case
-      // below the 50-subrequest Free-plan ceiling without changing the cron.
-      if (outboxBusy) return;
-      if (!await processDeliveryMatchJobs(env, accessToken)) await cleanupDeliveryQuotes(env, accessToken);
+      return handleScheduledMaintenanceWithAccessToken(env, accessToken);
+    }
+    async function handleScheduledMaintenanceWithAccessToken(env, accessToken) {
+      // A fixed minute rotation guarantees that a persistent deletion or
+      // notification backlog cannot starve matching or quote cleanup. Each
+      // invocation runs at most one bounded business unit; no cadence change.
+      const minute = Math.floor(Date.now() / 6e4);
+      const lane = ["deletion", "outbox", "deletion", "outbox", "matching", "quotes"][minute % 6];
+      const statusIndex = Math.floor(minute / 2) % 4;
+      if (lane === "deletion" || lane === "outbox") {
+        const statuses = lane === "deletion"
+          ? ["requested", "in_progress", "auth_deleted", "cleanup_pending"]
+          : ["pending", "failed", "sent", "legacy_order"];
+        // Try each status at most once. A lone active status still gets both
+        // lane slots, while the rotating first choice prevents starvation.
+        for (let offset = 0; offset < statuses.length; offset++) {
+          const status = statuses[(statusIndex + offset) % statuses.length];
+          const worked = lane === "deletion"
+            ? await resumeAccountDeletionsWithAccessToken(env, accessToken, status)
+            : await handleScheduledOutbox(env, accessToken, status);
+          if (worked) break;
+        }
+      } else if (lane === "matching") await processDeliveryMatchJobs(env, accessToken);
+      else await cleanupDeliveryQuotes(env, accessToken);
     }
     // Offline tests load the compiled Worker in Node with this explicit process
     // flag. Cloudflare Workers have no `process`, so no test surface exists in
@@ -8611,6 +8837,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         phoneLoginActivationBlocker,
         executePhoneIndexBackfill,
         executeAccountDeletionCleanup,
+        accountDeletionOrderPage,
+        accountDeletionOfferPage,
+        processAccountDeletion,
+        handleAccountDeletion,
+        resumeAccountDeletionsWithAccessToken,
+        cronQueueNext,
+        handleScheduledOutbox,
+        handleScheduledMaintenance,
+        handleScheduledMaintenanceWithAccessToken,
         classifyPhoneIndexBackfill,
         phoneLookupKey,
         phase4aCommit,

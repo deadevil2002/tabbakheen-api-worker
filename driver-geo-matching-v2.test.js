@@ -379,8 +379,8 @@ test("targeted job and push remain coarse-only", () => {
 });
 test("targeted outbox uses stored page event and bounded cleanup", () => {
   const outbox = sourceBetween("async function handleScheduledOutbox", "async function handleScheduledMaintenance");
-  assert(outbox.includes("retryableEvent._id"));
-  assert(outbox.includes("One outbox work item per invocation"));
+  assert(outbox.includes('cronQueueNext("order_transition_events", status, accessToken)'));
+  assert(outbox.includes("eventDoc._id"));
   assert(source.includes('event === "driver_match_available_v2" ? null : accessToken'));
 });
 test("targeted worst-case budget is 36 with 14 headroom", () => {
@@ -389,8 +389,8 @@ test("targeted worst-case budget is 36 with 14 headroom", () => {
   assert.equal(hooks.targetedReceiptWorstCaseSubrequests(), 21);
   assert.equal(50 - hooks.targetedReceiptWorstCaseSubrequests(), 29);
   const maintenance = sourceBetween("async function handleScheduledMaintenance", "// Offline tests");
-  assert(maintenance.indexOf("resumeAccountDeletionsWithAccessToken") < maintenance.indexOf("handleScheduledOutbox"));
-  assert(maintenance.includes("if (deletionBusy) return"));
+  assert(maintenance.includes('const lane = ["deletion", "outbox", "deletion", "outbox", "matching", "quotes"]'));
+  assert(!maintenance.includes("if (deletionBusy) return"));
 });
 
 const activeDetailsOrder = { customerUid: "customer1", providerUid: "provider1", driverUid: "driver1", deliveryMethod: "driver", deliveryStatus: "driver_assigned", status: "assigned_to_driver" };
@@ -446,9 +446,9 @@ test("quote cleanup is bounded and active-safe", () => {
   assert(cleanup.includes('"status", "EQUAL", "used", 10'));
   assert(cleanup.includes("slice(0, 20)"));
   assert(!cleanup.includes("ORDER_DELIVERY_PRIVATE_COLLECTION"));
-  assert(source.includes("if (!await processDeliveryMatchJobs(env, accessToken)) await cleanupDeliveryQuotes(env, accessToken)"));
-  assert(source.includes("if (deletionBusy) return"));
-  assert(source.includes("if (outboxBusy) return"));
+  assert(source.includes('else if (lane === "matching") await processDeliveryMatchJobs(env, accessToken)'));
+  assert(source.includes('else await cleanupDeliveryQuotes(env, accessToken)'));
+  assert(!source.includes("if (deletionBusy) return"));
 });
 test("private collections rely on repository default deny", () => {
   const rules = fs.readFileSync("FINAL_FIRESTORE_RULES_READY_FOR_MANUAL_DEPLOY.txt", "utf8");
