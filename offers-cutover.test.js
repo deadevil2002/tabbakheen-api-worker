@@ -23,7 +23,10 @@ assert(!hooks.getAdminHTML().includes('id="s-cvg-ios-version"'), "Version gate c
 const BASE = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents/";
 let revision = 0;
 let lastCommit = [];
+let lastBatchDocuments = [];
 const docs = new Map();
+const transactions = new Map();
+let transactionSequence = 0;
 const updateTime = () => `2026-02-01T00:00:${String(++revision).padStart(2, "0")}.000Z`;
 const put = (path, data) => docs.set(path, { data, updateTime: updateTime() });
 const encode = (value) => {
@@ -53,9 +56,38 @@ global.fetch = async (url, init = {}) => {
   url = String(url);
   if (url === "https://oauth2.googleapis.com/token") return global.__settingsOutage ? response({ error: "unavailable" }, 503) : response({ access_token: "worker-token" });
   if (url.includes("securetoken@system.gserviceaccount.com")) return response({ keys: [JWK] });
-  if (!url.startsWith(BASE) && url !== BASE.slice(0, -1) + ":commit") throw new Error("Unexpected URL " + url);
+  if (!url.startsWith(BASE) && ![":commit", ":beginTransaction", ":batchGet", ":rollback"].some((suffix) => url === BASE.slice(0, -1) + suffix)) throw new Error("Unexpected URL " + url);
+  if (url === BASE.slice(0, -1) + ":beginTransaction") {
+    assert.deepEqual(JSON.parse(init.body).options, { readWrite: {} });
+    const transaction = "local-transaction-" + ++transactionSequence;
+    transactions.set(transaction, new Map());
+    return response({ transaction });
+  }
+  if (url === BASE.slice(0, -1) + ":batchGet") {
+    const { documents, transaction } = JSON.parse(init.body);
+    lastBatchDocuments = documents;
+    const reads = transactions.get(transaction);
+    assert(reads, "batchGet must use active transaction");
+    return response(documents.map((name) => {
+      const path = name.split("/documents/")[1];
+      const record = docs.get(path);
+      reads.set(path, record?.updateTime || null);
+      return record ? { found: { ...document(path, record), name } } : { missing: name };
+    }).reverse());
+  }
+  if (url === BASE.slice(0, -1) + ":rollback") {
+    transactions.delete(JSON.parse(init.body).transaction);
+    return response({});
+  }
   if (url === BASE.slice(0, -1) + ":commit") {
-    const writes = JSON.parse(init.body).writes;
+    const { writes, transaction } = JSON.parse(init.body);
+    if (transaction) {
+      assert(writes.every((write) => !write.verify), "order transaction cannot contain verify");
+      const reads = transactions.get(transaction);
+      assert(reads, "commit must use read transaction");
+      transactions.delete(transaction);
+      for (const [path, version] of reads) if ((docs.get(path)?.updateTime || null) !== version) return response({ error: { status: "ABORTED" } }, 409);
+    }
     lastCommit = writes;
     for (const write of writes) {
       const existing = docs.get(writePath(write));
@@ -138,7 +170,8 @@ const payload = () => ({
   assert.equal(offer.category, "main");
   assert.equal(typeof offer.createdAt, "string");
   assert.equal(offer.createdAt, offer.updatedAt);
-  assert(lastCommit.some((write) => write.verify && writePath(write) === "account_deletion_requests/provider-1"), "create must fence deletion state");
+  assert(lastBatchDocuments.some((name) => name.endsWith("/account_deletion_requests/provider-1")), "create must read deletion state in the transaction");
+  assert(lastCommit.every((write) => !write.verify));
   assert.equal(docs.get("offer_mutation_rate_limits/provider-1").data.uid, "provider-1", "rate-limit document is bound to the authenticated provider");
   result = await hooks.handleRequest(request("/offers", "POST", payload()));
   assert.deepEqual(await result.json(), { success: true, offerId: created.offerId }, "stable requestId prevents duplicate offers on retry");
@@ -158,7 +191,8 @@ const payload = () => ({
   assert.equal(updated.title, "Updated Kabsa");
   assert.equal(updated.providerUid, "provider-1");
   assert.equal(updated.createdAt, offer.createdAt);
-  assert(lastCommit.some((write) => write.verify && writePath(write) === "account_deletion_requests/provider-1"), "update must fence deletion state");
+  assert(lastBatchDocuments.some((name) => name.endsWith("/account_deletion_requests/provider-1")), "update must read deletion state in the transaction");
+  assert(lastCommit.every((write) => !write.verify));
   assert(lastCommit.some((write) => write.update && writePath(write) === "offers/" + created.offerId && write.currentDocument?.updateTime), "update must compare-and-set the offer version");
 
   put("users/provider-1", provider({ publicLocationEnabled: false, publicLocation: null }));

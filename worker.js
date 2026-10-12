@@ -1602,8 +1602,10 @@
           notificationEvent = action === "delivered_pending_confirmation" ? "delivery_pending_confirmation" : action;
         }
       }
-      const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
+      const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken, deletionFences);
       if (!committed.ok) {
+        if (committed.uncertain) return jsonResponse({ success: false, code: "state_uncertain", error: "Order outcome is uncertain; refresh before retrying" }, 503);
+        if (committed.deletionBlocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
         const latest = await getFirestoreDoc("orders", orderId, accessToken);
         if (action === "accept" && latest && latest.driverUid === uid && latest.deliveryStatus === "driver_assigned") {
           return jsonResponse({ success: true, idempotent: true, deliveryMethod: latest.deliveryMethod, deliveryStatus: latest.deliveryStatus, driverUid: uid });
@@ -1628,7 +1630,7 @@
     __name(handleDeliveryTransition, "handleDeliveryTransition");
     __name2(handleDeliveryTransition, "handleDeliveryTransition");
     const PRIVATE_DELIVERY_TERMINAL_EVENTS = ["customer_cancelled", "order_cancelled", "order_rejected", "self_pickup_selected", "self_pickup_completed", "delivered"];
-    async function commitOrderAndOutbox(orderId, fields, serverTimestampFields, updateTime, event, stateVersion, accessToken) {
+    async function commitOrderAndOutbox(orderId, fields, serverTimestampFields, updateTime, event, stateVersion, accessToken, deletionFences = []) {
       const document = FIRESTORE_BASE + "/orders/" + orderId;
       const firestoreFields = {};
       for (const [key, value] of Object.entries(fields)) firestoreFields[key] = toFirestoreValue(value);
@@ -1640,10 +1642,39 @@
         status: toFirestoreValue("pending"),
         createdAt: toFirestoreValue(new Date().toISOString())
       };
-      const response = await fetch(FIRESTORE_BASE + ":commit", {
-        method: "POST",
-        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ writes: [{
+      if (deletionFences.length) {
+        const root = phase4aDoc("orders", orderId, {}).name.slice(0, -("orders/" + orderId).length);
+        const orderName = root + "orders/" + orderId;
+        const eventName = root + "order_transition_events/" + eventId;
+        const deletionName = (uid) => root + "account_deletion_requests/" + uid;
+        const markerName = (uid) => root + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + "/" + uid;
+        const names = [...new Set([orderName, eventName, ...deletionFences.flatMap((guard) => [deletionName(guard.deletionGuardUid), markerName(guard.deletionGuardUid)])])];
+        const terminal = PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event);
+        const transaction = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+          if (read.get(orderName)?.updateTime !== updateTime || read.get(eventName)) return { abort: "state_conflict" };
+          for (const guard of deletionFences) {
+            if (read.get(markerName(guard.deletionGuardUid)) ||
+                (read.get(deletionName(guard.deletionGuardUid))?.updateTime || null) !== guard.deletionUpdateTime) return { abort: "account_deletion_blocked" };
+          }
+          return { writes: [{
+            update: { name: orderName, fields: firestoreFields }, updateMask: { fieldPaths: Object.keys(fields) },
+            currentDocument: { updateTime },
+            updateTransforms: serverTimestampFields.map((fieldPath) => ({ fieldPath, setToServerValue: "REQUEST_TIME" }))
+          }, { update: { name: eventName, fields: eventFields }, currentDocument: { exists: false } },
+          ...(terminal ? [{ delete: root + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : [])] };
+        }, async () => {
+          const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + "/order_transition_events/" + eventId,
+            { headers: { Authorization: "Bearer " + accessToken } }, 5e3);
+          if (!response.ok) return false;
+          const recorded = parseFirestoreDoc(body);
+          return !!recorded && recorded.orderId === orderId && recorded.transition === event && recorded.stateVersion === stateVersion;
+        }, 2, {}, 12);
+        if (transaction.kind === "committed" || transaction.kind === "reconciled") return { ok: true };
+        if (transaction.kind === "aborted" || transaction.kind === "conflict") return { ok: false, conflict: true, deletionBlocked: transaction.value === "account_deletion_blocked" };
+        if (transaction.kind === "uncertain") return { ok: false, uncertain: true };
+        throw new Error("Firestore order transition transaction failed: " + transaction.kind);
+      }
+      const directWrites = [{
           update: { name: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + orderId, fields: firestoreFields },
           updateMask: { fieldPaths: Object.keys(fields) },
           currentDocument: { updateTime },
@@ -1651,7 +1682,12 @@
         }, {
           update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
           currentDocument: { exists: false }
-        }, ...(PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event) ? [{ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : [])] })
+        }, ...(PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event) ? [{ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : []), ...deletionFences];
+      if (!directWrites.every(firestoreSupportedWrite)) throw new Error("Unsupported Firestore Write");
+      const response = await fetch(FIRESTORE_BASE + ":commit", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ writes: directWrites })
       });
       if (response.ok) return { ok: true };
       const text = await response.text();
@@ -1689,6 +1725,7 @@
       let fields;
       let timestamps = ["updatedAt"];
       let event;
+      let deletionFences = [];
       if (action === "cancel_customer_order") {
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
         if (order.status === "cancelled" && order.cancelledBy === "customer") {
@@ -1719,6 +1756,11 @@
           return jsonResponse({ success: true, idempotent: true, status: order.status });
         }
         if (order.status !== spec[0]) return jsonResponse({ success: false, code: "transition_not_allowed", error: "Illegal order transition" }, 409);
+        if (action === "provider_accept") {
+          const participants = await newActiveWorkDeletionFences([order.customerUid, order.providerUid], accessToken);
+          if (participants.blocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
+          deletionFences = participants.fences;
+        }
         fields = { status: target, stateVersion: nextVersion };
         if (action === "provider_reject" && body.reason != null) {
           const comment = String(body.reason).trim().slice(0, 500);
@@ -1729,8 +1771,10 @@
         }
         event = { provider_accept: "order_accepted", provider_reject: "order_rejected", provider_preparing: "order_preparing", provider_ready: "order_ready" }[action];
       }
-      const committed = await commitOrderAndOutbox(orderId, fields, timestamps, snapshot.updateTime, event, nextVersion, accessToken);
+      const committed = await commitOrderAndOutbox(orderId, fields, timestamps, snapshot.updateTime, event, nextVersion, accessToken, deletionFences);
       if (!committed.ok) {
+        if (committed.uncertain) return jsonResponse({ success: false, code: "state_uncertain", error: "Order outcome is uncertain; refresh before retrying" }, 503);
+        if (committed.deletionBlocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
         const latest = await getFirestoreDoc("orders", orderId, accessToken);
         if (latest && latest.status === (fields && fields.status) && (action !== "cancel_customer_order" || latest.cancelledBy === "customer")) {
           await sendTransitionNotification(event, orderId, accessToken, notificationStateVersion(latest, event));
@@ -2045,8 +2089,22 @@
       if (hasUid && hasId && offer.providerUid !== offer.providerId) return null;
       return hasUid ? offer.providerUid : offer.providerId;
     }
+    // Read-only marker fence for new business writes. This candidate does not
+    // create markers or change the legacy account-deletion lifecycle.
+    const ACCOUNT_DELETION_IRREVERSIBLE_MARKERS = "account_deletion_irreversible_markers";
     function phase4aDeletionFence(uid, snapshot) {
       return { verify: "projects/tabbakheen-99883/databases/(default)/documents/account_deletion_requests/" + uid, currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
+    }
+    // New participation is permitted only when every participant has NO
+    // deletion request. A malformed/failed record is not proof of safety.
+    // The same snapshots and irreversible markers are read in the order's
+    // transaction, so a request created after these reads aborts new work.
+    async function newActiveWorkDeletionFences(uids, accessToken, knownSnapshots = new Map()) {
+      const unique = [...new Set(uids)];
+      if (unique.some((uid) => !phase4aSafeSegment(uid))) return { blocked: true, fences: [] };
+      const snapshots = await Promise.all(unique.map((uid) => knownSnapshots.has(uid) ? knownSnapshots.get(uid) : getFirestoreSnapshot("account_deletion_requests", uid, accessToken)));
+      if (snapshots.some((snapshot) => !!snapshot)) return { blocked: true, fences: [] };
+      return { blocked: false, fences: unique.map((uid, index) => ({ deletionGuardUid: uid, deletionUpdateTime: snapshots[index]?.updateTime || null })) };
     }
     function phase4aProviderAccess(user) {
       if (!user || user.role !== "provider") return { ok: false, code: "FORBIDDEN", entitlement: evaluateSubscriptionEntitlement(user) };
@@ -2172,9 +2230,48 @@
       const deletion = deletionSnapshot?.data;
       if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.status)) return { response: phase4aError("account_deletion_blocked", "Account deletion is in progress", 403) };
       if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return { response: phase4aError("account_suspended", "Account is not active", 403) };
-      return { uid, user, deletionFence: phase4aDeletionFence(uid, deletionSnapshot) };
+      return { uid, user, deletionSnapshot, deletionFence: phase4aDeletionFence(uid, deletionSnapshot) };
+    }
+    function firestoreSupportedWrite(write) {
+      if (!write || typeof write !== "object" || Array.isArray(write)) return false;
+      const keys = Object.keys(write);
+      return keys.every((key) => ["update", "delete", "transform", "updateMask", "updateTransforms", "currentDocument"].includes(key)) &&
+        ["update", "delete", "transform"].filter((key) => Object.hasOwn(write, key)).length === 1 &&
+        (!write.updateMask && !write.updateTransforms || !!write.update) &&
+        (!write.currentDocument || Object.keys(write.currentDocument).length === 1 &&
+          (typeof write.currentDocument.updateTime === "string" || typeof write.currentDocument.exists === "boolean"));
     }
     async function phase4aCommit(writes, accessToken) {
+      if (!Array.isArray(writes) || !writes.length) throw new Error("Invalid Firestore Writes");
+      const checks = writes.filter((write) => write && Object.hasOwn(write, "verify"));
+      const mutations = writes.filter((write) => !write || !Object.hasOwn(write, "verify"));
+      if (!mutations.every(firestoreSupportedWrite)) throw new Error("Unsupported Firestore Write");
+      if (checks.length) {
+        const root = FIRESTORE_BASE.replace("https://firestore.googleapis.com/v1/", "") + "/";
+        if (!checks.every((check) => check && Object.keys(check).length === 2 &&
+            typeof check.verify === "string" && check.verify.startsWith(root) &&
+            check.currentDocument && Object.keys(check.currentDocument).length === 1 &&
+            (typeof check.currentDocument.updateTime === "string" ||
+              typeof check.currentDocument.exists === "boolean")))
+          throw new Error("Unsupported Firestore verification");
+        const names = [...new Set(checks.map((check) => check.verify))];
+        // A read-only verification commits with no Writes: the same transaction
+        // still detects a document created or changed after batchGet.
+        const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+          for (const check of checks) {
+            const current = read.get(check.verify);
+            const condition = check.currentDocument;
+            if (condition.updateTime && current?.updateTime !== condition.updateTime ||
+                condition.exists === true && !current || condition.exists === false && !!current)
+              return { abort: "state_conflict" };
+          }
+          return { writes: mutations };
+        }, null, 2, {}, 12, 101);
+        if (result.kind === "committed" || result.kind === "reconciled") return true;
+        if (result.kind === "aborted" || result.kind === "conflict") return false;
+        // An unknown commit outcome must not be blindly retried by this helper.
+        throw new Error("Firestore Phase 4A transaction " + result.kind + (result.stage ? " at " + result.stage : ""));
+      }
       const response = await fetch(FIRESTORE_BASE + ":commit", {
         method: "POST", headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
         body: JSON.stringify({ writes })
@@ -2184,6 +2281,129 @@
       let status = ""; try { status = JSON.parse(text).error?.status || ""; } catch {}
       if ([409, 412].includes(response.status) || ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(status)) return false;
       throw new Error("Firestore Phase 4A commit failed: " + response.status);
+    }
+    // Firestore REST v1 has no standalone Verify Write. Read protected documents
+    // inside an explicit read-write transaction, then commit supported Writes
+    // with that same transaction ID. Callers must derive their decision from
+    // these snapshots, not from pre-transaction GETs.
+    // Bound bytes while they arrive, and keep the deadline alive until the
+    // response body has been consumed. A timeout after sending :commit is an
+    // uncertain outcome, even if the HTTP response was never received.
+    async function firestoreBoundedJsonRequest(url, init, deadlineMs = 1e4) {
+      const maxBytes = 4 * 1024 * 1024;
+      if (!Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 3e4) throw new Error("Invalid Firestore request deadline");
+      const controller = new AbortController();
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("Firestore request deadline exceeded"));
+        }, deadlineMs);
+      });
+      const operation = (async () => {
+        const response = await fetch(url, { ...init, signal: controller.signal });
+        const declared = response.headers.get("content-length");
+        if (declared && /^\d+$/.test(declared) && Number(declared) > maxBytes) throw new Error("Firestore transaction response too large");
+        if (!response.body) return { response, body: {} };
+        const reader = response.body.getReader();
+        const cancelReader = () => { reader.cancel().catch(() => {}); };
+        controller.signal.addEventListener("abort", cancelReader, { once: true });
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        let bytes = 0;
+        const parts = [];
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!(value instanceof Uint8Array)) throw new Error("Invalid Firestore response chunk");
+            bytes += value.byteLength;
+            if (bytes > maxBytes) throw new Error("Firestore transaction response too large");
+            parts.push(decoder.decode(value, { stream: true }));
+          }
+          parts.push(decoder.decode());
+        } catch (error) {
+          controller.abort();
+          throw error;
+        } finally {
+          controller.signal.removeEventListener("abort", cancelReader);
+        }
+        const text = parts.join("");
+        return { response, body: text ? JSON.parse(text) : {} };
+      })();
+      try { return await Promise.race([operation, timeout]); }
+      catch (error) { controller.abort(); throw error; }
+      finally { clearTimeout(timer); }
+    }
+    async function firestoreReadWriteTransaction(names, accessToken, plan, reconcile, maxAttempts = 2, deadlines = {}, maxReadDocuments = 8, maxWriteDocuments = 8) {
+      if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 2) throw new Error("Invalid transaction retry budget");
+      if (!Number.isInteger(maxReadDocuments) || maxReadDocuments < 1 || maxReadDocuments > 12) throw new Error("Invalid transaction read budget");
+      if (!Number.isInteger(maxWriteDocuments) || maxWriteDocuments < 1 || maxWriteDocuments > 101) throw new Error("Invalid transaction write budget");
+      const limits = { begin: 8e3, batchGet: 1e4, commit: 1e4, rollback: 3e3, ...deadlines };
+      if (!Object.values(limits).every((value) => Number.isInteger(value) && value >= 1 && value <= 3e4)) throw new Error("Invalid transaction deadlines");
+      const documentRoot = FIRESTORE_BASE.replace("https://firestore.googleapis.com/v1/", "") + "/";
+      if (!Array.isArray(names) || !names.length || names.length > maxReadDocuments || new Set(names).size !== names.length ||
+          !names.every((name) => typeof name === "string" && name.startsWith(documentRoot))) {
+        throw new Error("Invalid transaction read set");
+      }
+      const headers = { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" };
+      const post = (suffix, body, deadlineMs) => firestoreBoundedJsonRequest(FIRESTORE_BASE + suffix,
+        { method: "POST", headers, body: JSON.stringify(body) }, deadlineMs);
+      const conflict = (response, body) => response.status === 409 || response.status === 412 ||
+        ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(body?.error?.status);
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let transaction = null;
+        let commitStarted = false;
+        const rollback = async () => {
+          if (transaction && !commitStarted) {
+            try { await post(":rollback", { transaction }, limits.rollback); } catch { /* bounded best effort */ }
+          }
+        };
+        try {
+          const { response: start, body: begun } = await post(":beginTransaction", { options: { readWrite: {} } }, limits.begin);
+          if (!start.ok || typeof begun.transaction !== "string" || !begun.transaction) return { kind: "permanent", attempt, stage: "begin", httpStatus: start.status };
+          transaction = begun.transaction;
+          const { response: readResponse, body: batch } = await post(":batchGet", { documents: names, transaction }, limits.batchGet);
+          if (!readResponse.ok) {
+            await rollback();
+            if (conflict(readResponse, batch) && attempt < maxAttempts) continue;
+            return { kind: conflict(readResponse, batch) ? "conflict" : "permanent", attempt, stage: "batchGet", httpStatus: readResponse.status };
+          }
+          if (!Array.isArray(batch) || batch.length !== names.length) throw new Error("Invalid Firestore batchGet cardinality");
+          const read = new Map();
+          for (const item of batch) {
+            const name = item?.found?.name || item?.missing;
+            if (!names.includes(name) || read.has(name) || !(item.found || item.missing) ||
+                item.found && typeof item.found.updateTime !== "string") throw new Error("Invalid Firestore batchGet document");
+            read.set(name, item.found ? { data: parseFirestoreDoc(item.found), updateTime: item.found.updateTime } : null);
+          }
+          const decision = plan(read);
+          if (decision?.abort) {
+            await rollback();
+            return { kind: "aborted", attempt, value: decision.abort };
+          }
+          const writes = decision?.writes;
+          if (!Array.isArray(writes) || writes.length > maxWriteDocuments || !writes.every(firestoreSupportedWrite))
+            throw new Error("Unsupported Firestore transaction Write");
+          commitStarted = true;
+          let committed;
+            try { committed = await post(":commit", { transaction, writes }, limits.commit); }
+          catch {
+            try { const value = reconcile && await reconcile(decision.expected); if (value) return { kind: "reconciled", attempt, value }; } catch {}
+            return { kind: "uncertain", attempt };
+          }
+            const { response: commitResponse, body: commitBody } = committed;
+            if (commitResponse.ok) return { kind: "committed", attempt, value: decision.value };
+            if (conflict(commitResponse, commitBody)) {
+            if (attempt < maxAttempts) continue;
+            return { kind: "conflict", attempt };
+          }
+            return { kind: "permanent", attempt, stage: "commit", httpStatus: commitResponse.status };
+        } catch (error) {
+          await rollback();
+          return { kind: "permanent", attempt, error };
+        }
+      }
+      return { kind: "conflict", attempt: maxAttempts };
     }
     function phase4aDoc(collection, id, fields) {
       const out = {}; for (const [key, value] of Object.entries(fields)) out[key] = toFirestoreValue(value);
@@ -2903,11 +3123,62 @@
       const snapshot = await getFirestoreSnapshot("app_settings", "main", accessToken);
       return {
         value: snapshot?.data || null,
-        fence: {
-          verify: "projects/tabbakheen-99883/databases/(default)/documents/app_settings/main",
-          currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false }
-        }
+        updateTime: snapshot?.updateTime || null
       };
+    }
+    async function createDeliveryQuoteV2Transaction(auth, orderId, dropoff, saveAsDefault, accessToken) {
+      const preview = await getFirestoreSnapshot("orders", orderId, accessToken);
+      if (!preview) return { error: phase4aError("NOT_FOUND", "Order not found", 404) };
+      if (preview.data.customerUid !== auth.uid) return { error: phase4aError("FORBIDDEN", "Forbidden", 403) };
+      const providerUid = preview.data.providerUid;
+      if (!phase4aSafeSegment(providerUid)) return { error: phase4aError("STATE_CONFLICT", "Order provider is unavailable", 409) };
+      const name = (collection, id) => "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id;
+      const orderName = name("orders", orderId), settingsName = name("app_settings", "main");
+      const userName = name("users", auth.uid), preferenceName = name(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid);
+      const deletionName = (uid) => name("account_deletion_requests", uid);
+      const markerName = (uid) => name(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid);
+      const quoteId = "dq_" + Date.now().toString(36) + "_" + crypto.randomUUID().replace(/-/g, "");
+      const quotedAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + DELIVERY_QUOTE_LIFETIME_MS).toISOString();
+      const names = [orderName, settingsName, userName, deletionName(auth.uid), markerName(auth.uid), deletionName(providerUid), markerName(providerUid)];
+      if (saveAsDefault) names.push(preferenceName);
+      const result = await firestoreReadWriteTransaction([...new Set(names)], accessToken, (read) => {
+        const order = read.get(orderName)?.data;
+        const user = read.get(userName)?.data;
+        if (!user || user.role !== "customer" || user.accountStatus === "suspended" || user.accountStatus === "disabled") return { abort: { code: "FORBIDDEN", status: 403 } };
+        if (read.get(deletionName(auth.uid)) || read.get(markerName(auth.uid)) || read.get(deletionName(providerUid)) || read.get(markerName(providerUid))) return { abort: { code: "ACCOUNT_DELETION_BLOCKED", status: 409 } };
+        if (!order || order.customerUid !== auth.uid || order.providerUid !== providerUid || order.driverUid || order.status !== "ready_for_pickup") return { abort: { code: "STATE_CONFLICT", status: 409 } };
+        if (!validSaudiCoordinatePair(order.providerLat, order.providerLng)) return { abort: { code: "PROVIDER_COORDINATES_REQUIRED", status: 422 } };
+        const calculated = calculateDeliveryPricing({ ...order, customerLat: dropoff.lat, customerLng: dropoff.lng }, read.get(settingsName)?.data || null);
+        if (!calculated.ok) return { abort: { code: calculated.code, status: calculated.code === "DELIVERY_PRICING_INVALID" ? 503 : 422 } };
+        const quoteFields = { quoteId, orderId, customerUid: auth.uid, providerUid, dropoffLat: dropoff.lat, dropoffLng: dropoff.lng,
+          addressLine: dropoff.addressLine, city: dropoff.city, district: dropoff.district,
+          deliveryDistanceKm: calculated.deliveryDistanceKm, deliveryFee: calculated.deliveryFee,
+          pricingVersion: calculated.pricingVersion, quotedAt, expiresAt, usedAt: null, status: "active", schemaVersion: 1 };
+        const writes = [{ update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, quoteFields), currentDocument: { exists: false } }];
+        let preferenceFields = null;
+        if (saveAsDefault) {
+          const preference = read.get(preferenceName);
+          preferenceFields = { ...dropoff, label: typeof preference?.data?.label === "string" ? preference.data.label.slice(0, 80) : "", schemaVersion: 1 };
+          writes.push({ update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, preferenceFields),
+            updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
+            currentDocument: preference ? { updateTime: preference.updateTime } : { exists: false } });
+        }
+        const response = { success: true, quoteId, deliveryDistanceKm: calculated.deliveryDistanceKm,
+          deliveryFee: calculated.deliveryFee, pricingVersion: calculated.pricingVersion, quotedAt, expiresAt, currency: "SAR" };
+        return { writes, value: response, expected: { quoteFields, preferenceFields, response } };
+      }, async (expected) => {
+        const quote = await getFirestoreSnapshot(DELIVERY_QUOTES_COLLECTION, quoteId, accessToken);
+        if (!quote || Object.entries(expected.quoteFields).some(([key, value]) => !sameFirestoreValue(quote.data[key], value))) return false;
+        if (expected.preferenceFields) {
+          const preference = await getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, accessToken);
+          if (!preference || Object.entries(expected.preferenceFields).some(([key, value]) => !sameFirestoreValue(preference.data[key], value))) return false;
+        }
+        return expected.response;
+      });
+      if (result.kind === "aborted") return { error: phase4aError(result.value.code, "Order, account or pricing is unavailable", result.value.status) };
+      if (!["committed", "reconciled"].includes(result.kind)) return { error: phase4aError(result.kind === "uncertain" ? "STATE_UNCERTAIN" : "STATE_CONFLICT", "Order or saved location changed; request a new quote", result.kind === "uncertain" ? 503 : 409) };
+      return { value: result.value };
     }
     // Legacy-only compatibility for deployed clients. Their quote/finalize routes accepted
     // missing coordinates with zero distance and base-only fee; keep this until the store
@@ -2943,11 +3214,21 @@
     }
     async function saveCustomerDeliveryPreference(uid, preference, accessToken, deletionFence, existingSnapshot) {
       const fields = { ...preference, schemaVersion: 1 };
-      return phase4aCommit([{
-        update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, fields),
-        updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
-        currentDocument: existingSnapshot ? { updateTime: existingSnapshot.updateTime } : { exists: false }
-      }, deletionFence], accessToken);
+      const root = "projects/tabbakheen-99883/databases/(default)/documents/";
+      const userName = root + "users/" + uid, deletionName = root + "account_deletion_requests/" + uid;
+      const markerName = root + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + "/" + uid;
+      const preferenceName = root + CUSTOMER_DELIVERY_PREFERENCES_COLLECTION + "/" + uid;
+      const result = await firestoreReadWriteTransaction([userName, deletionName, markerName, preferenceName], accessToken, (read) => {
+        const user = read.get(userName), current = read.get(preferenceName);
+        if (!user || user.data.role !== "customer" || ["suspended", "disabled"].includes(user.data.accountStatus) || read.get(deletionName) || read.get(markerName)) return { abort: "FORBIDDEN" };
+        return { writes: [{ update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, fields),
+          updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
+          currentDocument: current ? { updateTime: current.updateTime } : { exists: false } }], expected: fields };
+      }, async (expected) => {
+        const saved = await getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, accessToken);
+        return saved && Object.keys(expected).every((field) => saved.data[field] === expected[field]);
+      });
+      return ["committed", "reconciled"].includes(result.kind);
     }
     function deliveryFinalizationV2IsIdempotent(order, quoteId, deliveryPaymentMethod) {
       return !!order && order.deliveryQuoteId === quoteId && order.deliveryPaymentMethod === deliveryPaymentMethod && isDriverDeliveryMethod(order.deliveryMethod) && ["ready_for_driver", "driver_assigned", "picked_up", "arrived", "delivered_pending_confirmation", "delivered"].includes(order.deliveryStatus);
@@ -2982,79 +3263,75 @@
       if (!addressLine || !city || !district) return null;
       return { success: true, addressLine, city, district, lat: value.lat, lng: value.lng, deliveryNotes: typeof value.deliveryNotes === "string" ? value.deliveryNotes.slice(0, 500) : "" };
     }
-    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, stateVersion, accessToken, deletionFence, pricingFence) {
-      const event = "driver_delivery_requested_v2";
-      const eventId = notificationEventId(orderId, event, stateVersion);
-      const jobId = "dm_" + orderId + "_" + stateVersion;
-      const now = new Date().toISOString();
-      const orderFields = {};
-      for (const [key, value] of Object.entries(fields)) orderFields[key] = toFirestoreValue(value);
-      const privateFields = {};
-      for (const [key, value] of Object.entries({
-        orderId,
-        customerUid: privateDestination.customerUid,
-        providerUid: privateDestination.providerUid,
-        lat: privateDestination.lat,
-        lng: privateDestination.lng,
-        addressLine: privateDestination.addressLine,
-        city: privateDestination.city,
-        district: privateDestination.district,
-        deliveryNotes: privateDestination.deliveryNotes,
-        createdAt: typeof privateSnapshot?.data?.createdAt === "string" ? privateSnapshot.data.createdAt : now,
-        updatedAt: now,
-        schemaVersion: 1
-      })) privateFields[key] = toFirestoreValue(value);
-      const quoteFields = { status: toFirestoreValue("used"), usedAt: toFirestoreValue(now) };
-      const eventFields = {
-        orderId: toFirestoreValue(orderId),
-        transition: toFirestoreValue(event),
-        stateVersion: toFirestoreValue(stateVersion),
-        status: toFirestoreValue("pending"),
-        createdAt: toFirestoreValue(now)
-      };
-      const jobFields = {
-        orderId: toFirestoreValue(orderId),
-        stateVersion: toFirestoreValue(stateVersion),
-        status: toFirestoreValue("pending"),
-        cursor: toFirestoreValue(null),
-        scannedCount: toFirestoreValue(0),
-        matchedCount: toFirestoreValue(0),
-        notifiedCount: toFirestoreValue(0),
-        pageSequence: toFirestoreValue(0),
-        createdAt: toFirestoreValue(now),
-        updatedAt: toFirestoreValue(now),
-        schemaVersion: toFirestoreValue(1)
-      };
-      const response = await fetch(FIRESTORE_BASE + ":commit", {
-        method: "POST",
-        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ writes: [{
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + orderId, fields: orderFields },
-          // Masking absent private paths deletes any legacy destination/contact
-          // values that may already exist on the readable order.
-          updateMask: { fieldPaths: [...new Set([...Object.keys(fields), ...ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS])] },
-          currentDocument: { updateTime: orderSnapshot.updateTime }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId, fields: privateFields },
-          currentDocument: privateSnapshot ? { updateTime: privateSnapshot.updateTime } : { exists: false }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + quoteId, fields: quoteFields },
-          updateMask: { fieldPaths: ["status", "usedAt"] },
-          currentDocument: { updateTime: quoteSnapshot.updateTime }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
-          currentDocument: { exists: false }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_MATCH_JOBS_COLLECTION + "/" + jobId, fields: jobFields },
-          currentDocument: { exists: false }
-        }, deletionFence, pricingFence] })
-      });
-      if (response.ok) return { ok: true, event, jobId };
-      const text = await response.text();
-      let status = "";
-      try { status = JSON.parse(text).error?.status || ""; } catch {}
-      if ([409, 412].includes(response.status) || ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(status)) return { ok: false, conflict: true };
-      throw new Error("Firestore delivery V2 finalization failed: " + response.status);
+    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, paymentMethod, accessToken, pricingSnapshot) {
+      const uid = orderSnapshot.data.customerUid, providerUid = orderSnapshot.data.providerUid;
+      if (!phase4aSafeSegment(uid) || !phase4aSafeSegment(providerUid)) return { ok: false, conflict: true };
+      const name = (collection, id) => "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id;
+      const orderName = name("orders", orderId), quoteName = name(DELIVERY_QUOTES_COLLECTION, quoteId);
+      const privateName = name(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId), settingsName = name("app_settings", "main");
+      const userName = name("users", uid);
+      const deletionName = (member) => name("account_deletion_requests", member);
+      const markerName = (member) => name(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, member);
+      const names = [orderName, quoteName, privateName, settingsName, userName,
+        deletionName(uid), markerName(uid), deletionName(providerUid), markerName(providerUid)];
+      const now = new Date().toISOString(), event = "driver_delivery_requested_v2";
+      const result = await firestoreReadWriteTransaction([...new Set(names)], accessToken, (read) => {
+        const orderRead = read.get(orderName), quoteRead = read.get(quoteName), privateRead = read.get(privateName), settingsRead = read.get(settingsName);
+        const user = read.get(userName)?.data;
+        if (!user || user.role !== "customer" || user.accountStatus === "suspended" || user.accountStatus === "disabled") return { abort: "FORBIDDEN" };
+        if (read.get(deletionName(uid)) || read.get(markerName(uid)) || read.get(deletionName(providerUid)) || read.get(markerName(providerUid))) return { abort: "ACCOUNT_DELETION_BLOCKED" };
+        if (!orderRead || !quoteRead || orderRead.updateTime !== orderSnapshot.updateTime || quoteRead.updateTime !== quoteSnapshot.updateTime ||
+            (privateRead?.updateTime || null) !== (privateSnapshot?.updateTime || null)) return { abort: "STATE_CONFLICT" };
+        if ((settingsRead?.updateTime || null) !== pricingSnapshot.updateTime) return { abort: "STALE_DELIVERY_QUOTE" };
+        const order = orderRead.data, quote = quoteRead.data;
+        if (order.customerUid !== uid || order.providerUid !== providerUid || order.driverUid || order.status !== "ready_for_pickup" ||
+            quote.customerUid !== uid || quote.orderId !== orderId || quote.providerUid !== providerUid || quote.status !== "active" || quote.usedAt ||
+            new Date(quote.expiresAt || 0).getTime() <= Date.now()) return { abort: "STALE_DELIVERY_QUOTE" };
+        if (!validSaudiCoordinatePair(quote.dropoffLat, quote.dropoffLng) || !boundedRequiredString(quote.addressLine, 300) ||
+            !boundedRequiredString(quote.city, 120) || !boundedRequiredString(quote.district, 120)) return { abort: "STALE_DELIVERY_QUOTE" };
+        const confirmed = calculateDeliveryPricing({ ...order, customerLat: quote.dropoffLat, customerLng: quote.dropoffLng }, settingsRead?.data || null);
+        if (!confirmed.ok || confirmed.pricingVersion !== quote.pricingVersion || confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm || confirmed.deliveryFee !== quote.deliveryFee) return { abort: "STALE_DELIVERY_QUOTE" };
+        const subtotal = order.priceSnapshot;
+        if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return { abort: "ORDER_PRICE_INVALID" };
+        const stateVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
+        const fields = { deliveryMethod: "driver", dropoffCity: quote.city, dropoffDistrict: quote.district, dropoffConfirmedAt: now,
+          deliveryDistanceKm: quote.deliveryDistanceKm, deliveryFee: quote.deliveryFee, totalAmount: subtotal + quote.deliveryFee,
+          deliveryQuoteId: quoteId, deliveryPricingVersion: quote.pricingVersion, deliveryPaymentMethod: paymentMethod,
+          platformDeliveryCommission: 0, driverGrossDeliveryEarnings: quote.deliveryFee, driverUid: null,
+          deliveryStatus: "ready_for_driver", status: "searching_driver", deliveryStateVersion: stateVersion, updatedAt: now };
+        const privateFields = { orderId, customerUid: uid, providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng,
+          addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "",
+          createdAt: typeof privateRead?.data?.createdAt === "string" ? privateRead.data.createdAt : now,
+          updatedAt: now, schemaVersion: 1 };
+        const eventId = notificationEventId(orderId, event, stateVersion), jobId = "dm_" + orderId + "_" + stateVersion;
+        const eventFields = { orderId, transition: event, stateVersion, status: "pending", createdAt: now };
+        const jobFields = { orderId, stateVersion, status: "pending", cursor: null, scannedCount: 0, matchedCount: 0,
+          notifiedCount: 0, pageSequence: 0, createdAt: now, updatedAt: now, schemaVersion: 1 };
+        const writes = [
+          { update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: [...new Set([...Object.keys(fields), ...ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS])] }, currentDocument: { updateTime: orderRead.updateTime } },
+          { update: phase4aDoc(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId, privateFields), currentDocument: privateRead ? { updateTime: privateRead.updateTime } : { exists: false } },
+          { update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, { status: "used", usedAt: now }), updateMask: { fieldPaths: ["status", "usedAt"] }, currentDocument: { updateTime: quoteRead.updateTime } },
+          { update: phase4aDoc("order_transition_events", eventId, eventFields), currentDocument: { exists: false } },
+          { update: phase4aDoc(DELIVERY_MATCH_JOBS_COLLECTION, jobId, jobFields), currentDocument: { exists: false } }
+        ];
+        return { writes, value: { event, jobId, fields, order, stateVersion }, expected: { fields, privateFields, eventId, jobId, stateVersion, usedAt: now } };
+      }, async (expected) => {
+        const [order, quote, destination, outbox, job] = await Promise.all([
+          getFirestoreSnapshot("orders", orderId, accessToken), getFirestoreSnapshot(DELIVERY_QUOTES_COLLECTION, quoteId, accessToken),
+          getFirestoreSnapshot(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId, accessToken),
+          getFirestoreSnapshot("order_transition_events", expected.eventId, accessToken),
+          getFirestoreSnapshot(DELIVERY_MATCH_JOBS_COLLECTION, expected.jobId, accessToken)
+        ]);
+        if (!order || !quote || !destination || !outbox || !job ||
+            Object.entries(expected.fields).some(([key, value]) => !sameFirestoreValue(order.data[key], value)) ||
+            Object.entries(expected.privateFields).some(([key, value]) => !sameFirestoreValue(destination.data[key], value)) ||
+            quote.data.status !== "used" || quote.data.usedAt !== expected.usedAt ||
+            outbox.data.orderId !== orderId || outbox.data.stateVersion !== expected.stateVersion ||
+            job.data.orderId !== orderId || job.data.stateVersion !== expected.stateVersion) return false;
+        return { event, jobId: expected.jobId, fields: expected.fields, order: order.data, stateVersion: expected.stateVersion };
+      }, 2, {}, 12);
+      if (["committed", "reconciled"].includes(result.kind)) return { ok: true, ...result.value };
+      return { ok: false, conflict: result.kind !== "uncertain", uncertain: result.kind === "uncertain" };
     }
     function parseAppleSubscriptionStatusPayload(payload) {
       if (!payload || typeof payload !== "object") return null;
@@ -3698,7 +3975,18 @@
       if (!(await phase4aCommit([{ update: phase4aDoc("offers", offerId, input), updateMask: { fieldPaths: Object.keys(input) }, currentDocument: { updateTime: offerSnap.updateTime } }, { update: phase4aDoc("offer_mutation_rate_limits", auth.uid, rate.fields), updateMask: { fieldPaths: Object.keys(rate.fields) }, currentDocument: rate.snapshot ? { updateTime: rate.snapshot.updateTime } : { exists: false } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Offer changed; refresh and retry", 409);
       return jsonResponse({ success: true });
     }
+    const PRIVATE_DESTINATION_ORDER_CONTRACT = "explicit_v2";
+    // A missing binding is deliberately OFF. Existing V2 orders continue
+    // through the V2 delivery paths when new creation is disabled.
+    function v2OrderCreationEnabled(env) {
+      return env?.V2_ORDER_CREATION_ENABLED === "true";
+    }
+    function isPrivateDestinationOrder(order) {
+      return order?.destinationContract === PRIVATE_DESTINATION_ORDER_CONTRACT;
+    }
     async function handlePhase4aOrderCreate(request, env, accessToken) {
+      const privateDestinationCreation = new URL(request.url).pathname === "/orders/create-v2";
+      if (privateDestinationCreation && !v2OrderCreationEnabled(env)) return phase4aError("v2_creation_disabled", "V2 order creation is unavailable", 503);
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
       if (auth.user.role !== "customer") return phase4aError("forbidden", "Customer account required", 403);
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
@@ -3708,49 +3996,123 @@
       if (!["cash", "cod", "bank_transfer", "stc", "stc_pay"].includes(paymentMethod)) return phase4aError("invalid_payment_method", "Unsupported payment method");
       const canonicalPaymentMethod = { cash: "CASH", cod: "CASH", bank_transfer: "BANK_TRANSFER", stc: "STC_PAY", stc_pay: "STC_PAY" }[paymentMethod];
       const input = { offerId: body.offerId, quantity, paymentMethod: canonicalPaymentMethod, note: typeof body.note === "string" ? body.note.trim().slice(0, 1000) : "" };
+      // Keep the legacy hash byte-for-byte compatible with existing request IDs.
+      // A request ID cannot replay across the two creation contracts.
+      const intentHash = JSON.stringify(privateDestinationCreation ? { ...input, destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : input);
       const idemPath = "order_creation_requests", idemId = auth.uid + "_" + body.requestId.trim();
-      const prior = await getFirestoreDoc(idemPath, idemId, accessToken);
-      if (prior) { if (prior.intentHash !== JSON.stringify(input)) return phase4aError("idempotency_conflict", "Request id already used", 409); const replayOrder = await getFirestoreDoc("orders", prior.orderId, accessToken); return jsonResponse({ success: true, orderId: prior.orderId, order: replayOrder && { ...replayOrder, id: prior.orderId }, idempotent: true }); }
-      const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
-      const offer = offerSnap?.data;
-      if (!offer) return phase4aError("offer_not_found", "Offer not found", 404);
-      const selectedProviderUid = resolveOfferProviderUid(offer);
-      if (!selectedProviderUid) return phase4aError("invalid_offer", "Offer provider is malformed", 403);
-      // providerUid is retained in the mobile request as an explicit selected
-      // provider, but the offer remains authoritative. A mismatch is rejected
-      // before any provider/payment data is used.
-      if (body.providerUid !== selectedProviderUid) return phase4aError("invalid_offer", "Offer does not belong to selected provider", 409);
-      if (offer.isAvailable !== undefined && typeof offer.isAvailable !== "boolean") return phase4aError("invalid_offer", "Offer availability is malformed");
-      if (offer.isAvailable === false) return phase4aError("offer_unavailable", "Offer unavailable", 409);
-      const offerProviderSnapshot = await getFirestoreSnapshot("users", selectedProviderUid, accessToken);
-      const offerProvider = offerProviderSnapshot?.data;
-      if (selectedProviderUid === auth.uid) return phase4aError("invalid_offer", "Offer provider is not eligible");
-      const offerAccess = phase4aProviderAccess(offerProvider);
-      if (!offerAccess.ok) {
-        await normalizeCommercialAccess(selectedProviderUid, offerProvider, offerAccess.entitlement, accessToken);
-        return phase4aError(offerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403);
-      }
-      // The order's selected method must be enabled by this exact provider.
-      // Cash is the product's universal COD option; destination methods are
-      // never assumed merely because a client named one.
-      const methods = offerProvider.paymentMethods || {};
-      if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) {
-        return phase4aError("payment_rejected", "Selected payment method is unavailable", 409);
-      }
-      const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
-      if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return phase4aError("invalid_offer", "Offer is malformed");
-      const providerUid = selectedProviderUid, now = new Date().toISOString(), orderId = crypto.randomUUID();
+      const providerUid = body.providerUid, now = new Date().toISOString(), orderId = crypto.randomUUID();
       const orderNumber = "TB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 8).toUpperCase();
-      const customer = auth.user, provider = offerProvider;
       const orderRef = "TAB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 12).toUpperCase();
-      const order = { id: orderId, orderNumber, orderRef, customerUid: auth.uid, providerUid, offerId: body.offerId, offerTitleSnapshot: offer.title.trim(), offerAvailabilityType: normalizedAvailability, offerPreparationTimeMinutes: normalizedAvailability === "preorder" ? offer.preparationTimeMinutes : null, title: offer.title.trim(), priceSnapshot: offer.price, unitPrice: offer.price, quantity, totalAmount: offer.price, paymentMethod: canonicalPaymentMethod, paymentStatus: "PENDING", status: "pending", driverUid: null, deliveryFee: 0, deliveryMethod: null, deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "", providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null, providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null, customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null, customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null, pickupAddress: provider && typeof provider.address === "string" ? provider.address : "", dropoffAddress: typeof customer.address === "string" ? customer.address : "", note: input.note, createdAt: now, updatedAt: now, stateVersion: 1, transactionalNotificationVersion: 1 };
       const eventId = notificationEventId(orderId, "order_created", 1);
       const event = { orderId, transition: "order_created", stateVersion: 1, status: "pending", createdAt: now };
-      const providerDeletion = await getFirestoreSnapshot("account_deletion_requests", providerUid, accessToken);
-      if (providerDeletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(providerDeletion.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Provider deletion is active", 409);
-      const ok = await phase4aCommit([{ update: phase4aDoc("offers", body.offerId, { lastOrderCreatedAt: now }), updateMask: { fieldPaths: ["lastOrderCreatedAt"] }, currentDocument: { updateTime: offerSnap.updateTime } }, { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + providerUid, currentDocument: { updateTime: offerProviderSnapshot.updateTime } }, { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } }, { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } }, { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash: JSON.stringify(input), createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } }, { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } }, auth.deletionFence, phase4aDeletionFence(providerUid, providerDeletion)], accessToken);
-      if (!ok) { const retry = await getFirestoreDoc(idemPath, idemId, accessToken); if (retry && retry.intentHash === JSON.stringify(input)) { const replayOrder = await getFirestoreDoc("orders", retry.orderId, accessToken); return jsonResponse({ success: true, orderId: retry.orderId, order: replayOrder && { ...replayOrder, id: retry.orderId }, idempotent: true }); } return phase4aError("state_conflict", "Request conflicted; retry", 409); }
-      return jsonResponse({ success: true, orderId, order });
+      const paths = [
+        ["users", auth.uid], ["users", providerUid], ["offers", body.offerId],
+        ["account_deletion_requests", auth.uid], ["account_deletion_requests", providerUid],
+        [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid], [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, providerUid],
+        [idemPath, idemId]
+      ];
+      const names = paths.map(([collection, id]) => phase4aDoc(collection, id, {}).name);
+      let firstVersions = null;
+      const boundedOrderGet = async (collection, id) => {
+        const { response, body: document } = await firestoreBoundedJsonRequest(
+          FIRESTORE_BASE + "/" + collection + "/" + id,
+          { headers: { Authorization: "Bearer " + accessToken } }, 5e3);
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error("Order reconciliation read failed: " + response.status);
+        return parseFirestoreDoc(document);
+      };
+      const matchesCreationContract = (order) => privateDestinationCreation
+        ? isPrivateDestinationOrder(order) && !ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS.some((field) => Object.prototype.hasOwnProperty.call(order, field))
+        : order?.destinationContract == null;
+      const replay = async (existingOrderId) => {
+        if (!phase4aSafeSegment(existingOrderId)) return null;
+        const replayOrder = await boundedOrderGet("orders", existingOrderId);
+        return replayOrder && matchesCreationContract(replayOrder) && replayOrder.customerUid === auth.uid && replayOrder.offerId === body.offerId && replayOrder.providerUid === providerUid
+          ? { success: true, orderId: existingOrderId, order: { ...replayOrder, id: existingOrderId }, idempotent: true } : null;
+      };
+      const reconcile = async () => {
+        const prior = await boundedOrderGet(idemPath, idemId);
+        if (!prior || prior.uid !== auth.uid || prior.intentHash !== intentHash || !phase4aSafeSegment(prior.orderId)) return null;
+        const [storedOrder, storedEvent, storedNumber] = await Promise.all([
+          boundedOrderGet("orders", prior.orderId),
+          boundedOrderGet("order_transition_events", notificationEventId(prior.orderId, "order_created", 1)),
+          boundedOrderGet("order_numbers", orderNumber)
+        ]);
+        if (!storedOrder || !storedEvent || !storedNumber || !matchesCreationContract(storedOrder) || storedOrder.customerUid !== auth.uid ||
+            storedOrder.providerUid !== providerUid || storedOrder.offerId !== body.offerId ||
+            storedOrder.orderNumber !== orderNumber || storedEvent.orderId !== prior.orderId ||
+            storedEvent.transition !== "order_created" || storedEvent.stateVersion !== 1 ||
+            storedNumber.orderId !== prior.orderId) return null;
+        return { success: true, orderId: prior.orderId, order: { ...storedOrder, id: prior.orderId }, idempotent: true };
+      };
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const customerSnap = read.get(names[0]), providerSnap = read.get(names[1]), offerSnap = read.get(names[2]);
+        const prior = read.get(names[7])?.data;
+        if (prior) return { abort: prior.uid === auth.uid && prior.intentHash === intentHash && phase4aSafeSegment(prior.orderId)
+          ? { replayOrderId: prior.orderId } : phase4aError("idempotency_conflict", "Request id already used", 409) };
+        if (!customerSnap || customerSnap.data.role !== "customer" || ["suspended", "disabled"].includes(customerSnap.data.accountStatus)) return { abort: phase4aError("forbidden", "Customer account required", 403) };
+        if (read.get(names[3]) || read.get(names[4]) || read.get(names[5]) || read.get(names[6])) return { abort: phase4aError("account_deletion_blocked", "A participant has requested account deletion", 409) };
+        const offer = offerSnap?.data;
+        if (!offer) return { abort: phase4aError("offer_not_found", "Offer not found", 404) };
+        const selectedProviderUid = resolveOfferProviderUid(offer);
+        if (!selectedProviderUid) return { abort: phase4aError("invalid_offer", "Offer provider is malformed", 403) };
+        if (selectedProviderUid !== providerUid) return { abort: phase4aError("invalid_offer", "Offer does not belong to selected provider", 409) };
+        if (offer.isAvailable !== undefined && typeof offer.isAvailable !== "boolean") return { abort: phase4aError("invalid_offer", "Offer availability is malformed") };
+        if (offer.isAvailable === false) return { abort: phase4aError("offer_unavailable", "Offer unavailable", 409) };
+        const provider = providerSnap?.data;
+        if (providerUid === auth.uid) return { abort: phase4aError("invalid_offer", "Offer provider is not eligible") };
+        const providerAccess = phase4aProviderAccess(provider);
+        // Do not perform best-effort user/profile writes after rejecting an
+        // ineligible provider: deletion may begin after this read transaction.
+        if (!providerAccess.ok) return { abort: phase4aError(providerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403) };
+        const methods = provider.paymentMethods || {};
+        if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) return { abort: phase4aError("payment_rejected", "Selected payment method is unavailable", 409) };
+        const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
+        if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return { abort: phase4aError("invalid_offer", "Offer is malformed") };
+        const versions = [customerSnap.updateTime, providerSnap.updateTime, offerSnap.updateTime];
+        if (firstVersions && versions.some((version, index) => version !== firstVersions[index])) return { abort: phase4aError("state_conflict", "Order inputs changed; retry", 409) };
+        firstVersions = versions;
+        const customer = customerSnap.data;
+        const order = {
+          id: orderId, orderNumber, orderRef, customerUid: auth.uid, providerUid, offerId: body.offerId,
+          offerTitleSnapshot: offer.title.trim(), offerAvailabilityType: normalizedAvailability,
+          offerPreparationTimeMinutes: normalizedAvailability === "preorder" ? offer.preparationTimeMinutes : null,
+          title: offer.title.trim(), priceSnapshot: offer.price, unitPrice: offer.price, quantity,
+          totalAmount: offer.price, paymentMethod: canonicalPaymentMethod, paymentStatus: "PENDING",
+          status: "pending", driverUid: null, deliveryFee: 0, deliveryMethod: null,
+          deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "",
+          providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null,
+          providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null,
+          ...(privateDestinationCreation ? { destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : {
+            customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null,
+            customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null,
+            dropoffAddress: typeof customer.address === "string" ? customer.address : ""
+          }),
+          pickupAddress: typeof provider.address === "string" ? provider.address : "",
+          note: input.note, createdAt: now, updatedAt: now, stateVersion: 1,
+          transactionalNotificationVersion: 1
+        };
+        return { writes: [
+          { update: phase4aDoc("offers", body.offerId, { lastOrderCreatedAt: now }), updateMask: { fieldPaths: ["lastOrderCreatedAt"] }, currentDocument: { updateTime: offerSnap.updateTime } },
+          { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } },
+          { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } },
+          { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash, createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } },
+          { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } }
+        ], value: { success: true, orderId, order }, expected: { orderId } };
+      }, reconcile);
+      if (result.kind === "aborted") {
+        if (result.value?.replayOrderId) {
+          const priorOrder = await replay(result.value.replayOrderId);
+          return priorOrder ? jsonResponse(priorOrder) : phase4aError("state_conflict", "Existing order is unavailable", 409);
+        }
+        return result.value;
+      }
+      if (result.kind === "committed" || result.kind === "reconciled") return jsonResponse(result.value);
+      if (result.kind === "conflict") {
+        const priorOrder = await reconcile();
+        return priorOrder ? jsonResponse(priorOrder) : phase4aError("state_conflict", "Request conflicted; retry", 409);
+      }
+      return phase4aError(result.kind === "uncertain" ? "state_uncertain" : "internal_error", "Order creation could not be confirmed", 503);
     }
     async function sha1Hex(str) {
       const data = new TextEncoder().encode(str);
@@ -8225,6 +8587,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     // production.
     if (typeof process !== "undefined" && process?.env?.PHONE_AUTH_TEST_MODE === "1") {
       globalThis.__PHONE_AUTH_TEST_HOOKS = {
+        firestoreReadWriteTransaction,
         escapeHtml,
         validateInvoicePayload,
         generateInvoiceHTML,
@@ -8372,6 +8735,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       }
       try {
         if (typeof ADMIN_TOKEN_SECRET !== "undefined") env.ADMIN_TOKEN_SECRET = ADMIN_TOKEN_SECRET;
+      } catch {
+      }
+      try {
+        if (typeof V2_ORDER_CREATION_ENABLED !== "undefined") env.V2_ORDER_CREATION_ENABLED = V2_ORDER_CREATION_ENABLED;
       } catch {
       }
       try {
@@ -8870,10 +9237,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return phase4aError("internal_error", "Internal error", 500);
         }
       }
-      if (["/orders/create", "/offers/create", "/offers/update", "/orders/payment-proof", "/orders/payment-confirm", "/orders/payment-reject"].includes(path) && request.method === "POST") {
+      if (["/orders/create", "/orders/create-v2", "/offers/create", "/offers/update", "/orders/payment-proof", "/orders/payment-confirm", "/orders/payment-reject"].includes(path) && request.method === "POST") {
+        // Reject even authenticated direct calls before OAuth or Firestore I/O.
+        if (path === "/orders/create-v2" && !v2OrderCreationEnabled(env)) return phase4aError("v2_creation_disabled", "V2 order creation is unavailable", 503);
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          if (path === "/orders/create") return await handlePhase4aOrderCreate(request, env, accessToken);
+          if (path === "/orders/create" || path === "/orders/create-v2") return await handlePhase4aOrderCreate(request, env, accessToken);
           if (path === "/offers/create") return await handlePhase4aOfferCreate(request, env, accessToken);
           const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
           let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
@@ -10186,57 +10555,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!exactObjectKeys(body, ["orderId", "dropoff", "saveAsDefault"]) || !phase4aSafeSegment(body.orderId) || typeof body.saveAsDefault !== "boolean") return phase4aError("CUSTOMER_DROPOFF_REQUIRED", "Order and customer dropoff are required");
           const dropoff = validateCustomerDropoff(body.dropoff, false);
           if (!dropoff.ok) return phase4aError(dropoff.code, "A valid Saudi delivery location with address, city and district is required", 422);
-          const [orderSnapshot, preferenceSnapshot] = await Promise.all([
-            getFirestoreSnapshot("orders", body.orderId, accessToken),
-            body.saveAsDefault ? getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, accessToken) : Promise.resolve(null)
-          ]);
-          if (!orderSnapshot) return phase4aError("NOT_FOUND", "Order not found", 404);
-          const order = orderSnapshot.data;
-          if (order.customerUid !== auth.uid) return phase4aError("FORBIDDEN", "Forbidden", 403);
-          if (order.driverUid || order.status !== "ready_for_pickup") return phase4aError("TRANSITION_NOT_ALLOWED", "Delivery destination can no longer be changed", 409);
-          if (!validSaudiCoordinatePair(order.providerLat, order.providerLng)) return phase4aError("PROVIDER_COORDINATES_REQUIRED", "Provider pickup coordinates are required", 422);
-          const pricing = await loadDeliveryPricing(accessToken);
-          const calculated = calculateDeliveryPricing({ ...order, customerLat: dropoff.value.lat, customerLng: dropoff.value.lng }, pricing.value);
-          if (!calculated.ok) return calculated.code === "DELIVERY_PRICING_INVALID" ? phase4aError(calculated.code, "Delivery pricing is temporarily unavailable", 503) : phase4aError(calculated.code, "Valid provider and customer coordinates are required", 422);
-          const quoteId = "dq_" + Date.now().toString(36) + "_" + crypto.randomUUID().replace(/-/g, "");
-          const quotedAt = new Date().toISOString();
-          const expiresAt = new Date(Date.now() + DELIVERY_QUOTE_LIFETIME_MS).toISOString();
-          const quoteFields = {
-            quoteId,
-            orderId: body.orderId,
-            customerUid: auth.uid,
-            providerUid: order.providerUid,
-            dropoffLat: dropoff.value.lat,
-            dropoffLng: dropoff.value.lng,
-            addressLine: dropoff.value.addressLine,
-            city: dropoff.value.city,
-            district: dropoff.value.district,
-            deliveryDistanceKm: calculated.deliveryDistanceKm,
-            deliveryFee: calculated.deliveryFee,
-            pricingVersion: calculated.pricingVersion,
-            quotedAt,
-            expiresAt,
-            usedAt: null,
-            status: "active",
-            schemaVersion: 1
-          };
-          const writes = [{
-            update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, quoteFields),
-            currentDocument: { exists: false }
-          }, {
-            verify: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + body.orderId,
-            currentDocument: { updateTime: orderSnapshot.updateTime }
-          }, pricing.fence, auth.deletionFence];
-          if (body.saveAsDefault) {
-            const preferenceFields = { ...dropoff.value, label: typeof preferenceSnapshot?.data?.label === "string" ? preferenceSnapshot.data.label.slice(0, 80) : "", schemaVersion: 1 };
-            writes.splice(1, 0, {
-              update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, preferenceFields),
-              updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
-              currentDocument: preferenceSnapshot ? { updateTime: preferenceSnapshot.updateTime } : { exists: false }
-            });
-          }
-          if (!await phase4aCommit(writes, accessToken)) return phase4aError("STATE_CONFLICT", "Order or saved location changed; request a new quote", 409);
-          return jsonResponse({ success: true, quoteId, deliveryDistanceKm: calculated.deliveryDistanceKm, deliveryFee: calculated.deliveryFee, pricingVersion: calculated.pricingVersion, quotedAt, expiresAt, currency: "SAR" });
+          const created = await createDeliveryQuoteV2Transaction(auth, body.orderId, dropoff.value, body.saveAsDefault, accessToken);
+          return created.error || jsonResponse(created.value);
         } catch (error) {
           console.error("[DeliveryQuoteV2] Failed:", error && error.message ? error.message : error);
           return phase4aError("INTERNAL_ERROR", "Unable to create delivery quote", 500);
@@ -10293,14 +10613,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             updatedAt: now
           };
           const privateDestination = { customerUid: auth.uid, providerUid: order.providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng, addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "" };
-          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, nextVersion, accessToken, auth.deletionFence, pricing.fence);
+          const participants = await newActiveWorkDeletionFences([auth.uid, order.providerUid], accessToken, new Map([[auth.uid, auth.deletionSnapshot]]));
+          if (participants.blocked) return phase4aError("ACCOUNT_DELETION_BLOCKED", "A participant has requested account deletion", 409);
+          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, body.deliveryPaymentMethod, accessToken, pricing);
           if (!committed.ok) {
+            if (committed.uncertain) return phase4aError("STATE_UNCERTAIN", "Delivery finalization outcome is uncertain; check the order before retrying", 503);
             const latest = await getFirestoreDoc("orders", body.orderId, accessToken);
             if (latest && deliveryFinalizationV2IsIdempotent(latest, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(latest, true));
             return phase4aError("STALE_DELIVERY_QUOTE", "Order or quote changed; request a new quote", 409);
           }
-          await sendTransitionNotification(committed.event, body.orderId, accessToken, nextVersion);
-          return jsonResponse(deliveryFinalizationV2Response({ ...order, ...fields }));
+          await sendTransitionNotification(committed.event, body.orderId, accessToken, committed.stateVersion);
+          return jsonResponse(deliveryFinalizationV2Response({ ...committed.order, ...committed.fields }));
         } catch (error) {
           console.error("[FinalizeDeliveryV2] Failed:", error && error.message ? error.message : error);
           return phase4aError("INTERNAL_ERROR", "Unable to finalize delivery", 500);
@@ -10344,6 +10667,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           const order = snapshot.data;
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+          // A V2-created order has no legacy location snapshot. Self-pickup
+          // remains valid, but driver delivery must use an explicit V2 quote.
+          if (method === "driver" && isPrivateDestinationOrder(order)) return jsonResponse({ success: false, code: "explicit_destination_required", error: "Use an explicit V2 delivery quote" }, 409);
           const expectedStatus = method === "self_pickup" ? "self_pickup_selected" : "ready_for_driver";
           if (order.deliveryMethod === method && order.deliveryStatus === expectedStatus && !order.driverUid) {
             return jsonResponse({
@@ -10396,8 +10722,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             responseData = { deliveryFee: quote.deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: quote.deliveryDistanceKm, deliveryQuoteId: quoteId };
             notificationEvent = "driver_delivery_requested";
           }
-          const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
-          if (!committed.ok) return jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
+          let deletionFences = [];
+          if (method === "driver") {
+            const participants = await newActiveWorkDeletionFences([order.customerUid, order.providerUid], accessToken);
+            if (participants.blocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
+            deletionFences = participants.fences;
+          }
+          const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken, deletionFences);
+          if (!committed.ok) return committed.uncertain
+            ? jsonResponse({ success: false, code: "state_uncertain", error: "Order outcome is uncertain; refresh before retrying" }, 503)
+            : committed.deletionBlocked
+              ? jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409)
+              : jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
           await sendTransitionNotification(notificationEvent, orderId, accessToken, nextVersion);
           return jsonResponse({ success: true, ...responseData });
         } catch (error) {
@@ -10424,6 +10760,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           }
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+          if (isPrivateDestinationOrder(order)) return jsonResponse({ success: false, code: "explicit_destination_required", error: "Use an explicit V2 delivery quote" }, 409);
           const quote = await calculateLegacyDeliveryPricing(order, accessToken, "quote");
           const priceSnapshot = order.priceSnapshot || 0;
           return Response.json({

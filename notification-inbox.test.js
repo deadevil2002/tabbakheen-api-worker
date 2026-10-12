@@ -12,6 +12,8 @@ const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 20
 const PRIVATE_KEY = privateKey.export({ format: "pem", type: "pkcs8" });
 const FIREBASE_TEST_JWK = { ...publicKey.export({ format: "jwk" }), kid: "test-kid", alg: "RS256", use: "sig" };
 const documents = new Map();
+const transactions = new Map();
+let transactionSequence = 0;
 let clock = 0;
 let subrequestCount = 0;
 let forcedReadAllCommitConflicts = 0;
@@ -53,16 +55,36 @@ global.fetch = async (rawUrl, init = {}) => {
   const url = new URL(String(rawUrl));
   if (url.href === "https://oauth2.googleapis.com/token") return response({ access_token: "oauth-token" });
   if (url.href.includes("securetoken@system.gserviceaccount.com")) return response({ keys: [FIREBASE_TEST_JWK] });
+  if (url.href === `${BASE}:beginTransaction`) {
+    assert.deepEqual(JSON.parse(init.body).options, { readWrite: {} });
+    const transaction = "notification-transaction-" + ++transactionSequence;
+    transactions.set(transaction, new Map());
+    return response({ transaction });
+  }
+  if (url.href === `${BASE}:rollback`) {
+    transactions.delete(JSON.parse(init.body).transaction);
+    return response({});
+  }
   if (url.href === `${BASE}:batchGet`) {
-    const { documents: names } = JSON.parse(init.body);
+    const { documents: names, transaction } = JSON.parse(init.body);
+    const reads = transaction ? transactions.get(transaction) : null;
+    if (transaction) assert(reads, "batchGet must use active transaction");
     return response(names.map((name) => {
       const path = name.slice(name.indexOf("/documents/") + 11);
       const item = documents.get(path);
-      return item ? { found: firestoreDoc(item) } : { missing: name };
+      if (reads) reads.set(path, item?.updateTime || null);
+      return item ? { found: { ...firestoreDoc(item), name } } : { missing: name };
     }));
   }
   if (url.href === `${BASE}:commit`) {
-    const { writes } = JSON.parse(init.body);
+    const { writes, transaction } = JSON.parse(init.body);
+    if (transaction) {
+      assert(writes.every((write) => !write.verify), "transaction cannot emit unsupported verify");
+      const reads = transactions.get(transaction);
+      assert(reads, "commit must use read transaction");
+      transactions.delete(transaction);
+      for (const [path, updateTime] of reads) if ((documents.get(path)?.updateTime || null) !== updateTime) return response({ error: { status: "ABORTED" } }, 409);
+    }
     if (forcedReadAllCommitConflicts > 0 && writes.some((write) => String(write.delete || "").includes("/notification_unread/"))) {
       forcedReadAllCommitConflicts -= 1;
       return response({ error: { status: "FAILED_PRECONDITION" } }, 412);

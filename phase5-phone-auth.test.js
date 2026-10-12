@@ -18,6 +18,8 @@ const FIREBASE_TEST_JWK = { ...publicKey.export({ format: "jwk" }), kid: "test-k
 const BASE = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents/";
 let revision = 0;
 const docs = new Map();
+const transactions = new Map();
+let transactionSequence = 0;
 const pathOf = (collection, id) => `${collection}/${id}`;
 const now = () => `2026-01-01T00:00:${String(++revision).padStart(2, "0")}.000Z`;
 const encode = (value) => {
@@ -46,7 +48,7 @@ const firestoreDoc = (path, record) => ({
 });
 const response = (body, status = 200) => new Response(body == null ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 const writeTarget = (write) => (write.update?.name || write.delete || write.verify).split("/documents/")[1];
-function reset() { docs.clear(); revision = 0; }
+function reset() { docs.clear(); transactions.clear(); revision = 0; }
 
 global.fetch = async (url, init = {}) => {
   url = String(url);
@@ -54,13 +56,45 @@ global.fetch = async (url, init = {}) => {
   if (url.includes("securetoken@system.gserviceaccount.com")) return new Response(JSON.stringify({ keys: [FIREBASE_TEST_JWK] }), { headers: { "Content-Type": "application/json", "cache-control": "max-age=3600" } });
   if (url.includes("accounts:lookup")) return response({ users: [{ email: "hidden@example.test" }] });
   if (url.includes("accounts:signInWithPassword")) return response({ localId: global.__passwordUid || "uid-1" });
-  if (!(url.startsWith(BASE) || url === BASE.slice(0, -1) + ":commit" || url === BASE.slice(0, -1) + ":runQuery")) throw new Error("Unexpected mocked URL: " + url);
+  if (!(url.startsWith(BASE) || [":commit", ":runQuery", ":beginTransaction", ":batchGet", ":rollback"].some((suffix) => url === BASE.slice(0, -1) + suffix))) throw new Error("Unexpected mocked URL: " + url);
+  if (url === BASE.slice(0, -1) + ":beginTransaction") {
+    assert.deepEqual(JSON.parse(init.body).options, { readWrite: {} });
+    const transaction = "local-transaction-" + ++transactionSequence;
+    transactions.set(transaction, new Map());
+    return response({ transaction });
+  }
+  if (url === BASE.slice(0, -1) + ":batchGet") {
+    const { documents, transaction } = JSON.parse(init.body);
+    const reads = transactions.get(transaction);
+    assert(reads, "transaction must exist for batchGet");
+    return response(documents.map((name) => {
+      const path = name.split("/documents/")[1];
+      const record = docs.get(path);
+      reads.set(path, record?.updateTime || null);
+      return record ? { found: { ...firestoreDoc(path, record), name } } : { missing: name };
+    }).reverse());
+  }
+  if (url === BASE.slice(0, -1) + ":rollback") {
+    transactions.delete(JSON.parse(init.body).transaction);
+    return response({});
+  }
   if (url === BASE.slice(0, -1) + ":commit") {
-    const writes = JSON.parse(init.body).writes;
+    const { writes, transaction } = JSON.parse(init.body);
+    if (transaction) {
+      assert(writes.every((write) => !write.verify), "transaction Write must use official REST shape");
+      assert(transactions.has(transaction), "commit must use the read transaction");
+    }
     if (global.__createDeletionBeforeNextCommit) {
       const uid = global.__createDeletionBeforeNextCommit;
       global.__createDeletionBeforeNextCommit = "";
       put("account_deletion_requests/" + uid, { status: "in_progress" });
+    }
+    if (transaction) {
+      const reads = transactions.get(transaction);
+      transactions.delete(transaction);
+      for (const [path, version] of reads) {
+        if ((docs.get(path)?.updateTime || null) !== version) return response({ error: { status: "ABORTED" } }, 409);
+      }
     }
     for (const write of writes) {
       const target = writeTarget(write);
@@ -107,9 +141,14 @@ global.fetch = async (url, init = {}) => {
     docs.delete(rawPath);
     return response({});
   }
-  if (rawPath === "users") {
-    const documents = [...docs.entries()].filter(([path]) => path.startsWith("users/")).map(([path, record]) => firestoreDoc(path, record));
-    return response({ documents });
+  if (rawPath === "users" || /^phone_index_backfill_runs\/[^/]+\/groups$/.test(rawPath)) {
+    const params = new URLSearchParams(query);
+    const pageSize = Number(params.get("pageSize") || 1000), offset = Number(params.get("pageToken") || 0);
+    const all = [...docs.entries()].filter(([path]) => path.startsWith(rawPath + "/") && !path.slice(rawPath.length + 1).includes("/"))
+      .sort(([left], [right]) => left.localeCompare(right));
+    const page = all.slice(offset, offset + pageSize);
+    return response({ documents: page.map(([path, record]) => firestoreDoc(path, record)),
+      ...(offset + pageSize < all.length ? { nextPageToken: String(offset + pageSize) } : {}) });
   }
   if (/^(provider_ratings|driver_ratings)\/[^/]+\/ratings$/.test(rawPath)) {
     const documents = [...docs.entries()].filter(([path]) => path.startsWith(rawPath + "/")).map(([path, record]) => firestoreDoc(path, record));

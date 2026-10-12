@@ -18,6 +18,8 @@ const PLAY = "https://androidpublisher.googleapis.com/androidpublisher/v3/applic
 
 let revision = 0;
 const docs = new Map();
+const transactions = new Map();
+let transactionSequence = 0;
 const put = (path, data) => docs.set(path, { data, updateTime: `2026-01-01T00:00:${String(++revision).padStart(2, "0")}.000Z` });
 const encode = (value) => {
   if (value === null || value === undefined) return { nullValue: null };
@@ -58,8 +60,38 @@ global.fetch = async (url, init = {}) => {
     acknowledged.push(url);
     return json({});
   }
+  if (url === BASE.slice(0, -1) + ":beginTransaction") {
+    assert.deepEqual(JSON.parse(init.body).options, { readWrite: {} });
+    const transaction = "local-transaction-" + ++transactionSequence;
+    transactions.set(transaction, new Map());
+    return json({ transaction });
+  }
+  if (url === BASE.slice(0, -1) + ":batchGet") {
+    const { documents, transaction } = JSON.parse(init.body);
+    const reads = transactions.get(transaction);
+    assert(reads, "batchGet needs active transaction");
+    return json(documents.map((name) => {
+      const path = name.split("/documents/")[1];
+      const record = docs.get(path);
+      reads.set(path, record?.updateTime || null);
+      return record ? { found: { name, updateTime: record.updateTime, fields: Object.fromEntries(Object.entries(record.data).map(([k, v]) => [k, encode(v)])) } } : { missing: name };
+    }).reverse());
+  }
+  if (url === BASE.slice(0, -1) + ":rollback") {
+    transactions.delete(JSON.parse(init.body).transaction);
+    return json({});
+  }
   if (url === BASE.slice(0, -1) + ":commit") {
-    const writes = JSON.parse(init.body).writes;
+    const { writes, transaction } = JSON.parse(init.body);
+    if (transaction) {
+      assert(writes.every((write) => !write.verify), "migrated projection cannot send verify");
+      const reads = transactions.get(transaction);
+      assert(reads, "commit needs active read transaction");
+      transactions.delete(transaction);
+      for (const [path, version] of reads) {
+        if ((docs.get(path)?.updateTime || null) !== version) return json({ error: { status: "ABORTED" } }, 409);
+      }
+    }
     for (const write of writes) {
       const existing = docs.get(target(write));
       if (write.currentDocument?.exists === false && existing) return json({ error: { status: "ALREADY_EXISTS" } }, 409);
@@ -107,7 +139,7 @@ async function playPurchase(uid, overrides = {}) {
   };
 }
 function reset() {
-  docs.clear(); playPurchases.clear(); acknowledged.length = 0; revision = 0;
+  docs.clear(); transactions.clear(); playPurchases.clear(); acknowledged.length = 0; revision = 0;
   put("users/provider-1", { role: "provider", displayName: "Provider", createdAt: "2026-01-01T00:00:00.000Z", subscriptionStatus: "inactive" });
   put("users/driver-1", { role: "driver", displayName: "Driver", createdAt: "2026-01-01T00:00:00.000Z", subscriptionStatus: "inactive" });
 }

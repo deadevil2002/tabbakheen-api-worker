@@ -16,6 +16,8 @@ const privatePem = privateKey.export({ format: "pem", type: "pkcs8" });
 const publicJwk = { ...publicKey.export({ format: "jwk" }), kid: "legacy-delivery-test", alg: "RS256", use: "sig" };
 const firestoreBase = "https://firestore.googleapis.com/v1/projects/tabbakheen-99883/databases/(default)/documents/";
 const records = new Map();
+const transactions = new Map();
+let transactionSequence = 0;
 let revision = 0;
 let firestoreWrites = 0;
 let beforeCommit = null;
@@ -55,10 +57,36 @@ global.fetch = async (url, init = {}) => {
   if (target === "https://oauth2.googleapis.com/token") return json({ access_token: "local-access-token" });
   if (target.includes("securetoken@system.gserviceaccount.com")) return new Response(JSON.stringify({ keys: [publicJwk] }), { headers: { "Content-Type": "application/json", "cache-control": "max-age=3600" } });
   if (target === firestoreBase.slice(0, -1) + ":runQuery") return json([]);
+  if (target === firestoreBase.slice(0, -1) + ":beginTransaction") {
+    const id = "local-transaction-" + ++transactionSequence;
+    transactions.set(id, new Map());
+    return json({ transaction: id });
+  }
+  if (target === firestoreBase.slice(0, -1) + ":batchGet") {
+    const { documents, transaction } = JSON.parse(init.body);
+    const reads = transactions.get(transaction);
+    assert(reads);
+    return json(documents.map((name) => {
+      const path = name.split("/documents/")[1], record = records.get(path);
+      reads.set(path, record?.updateTime || null);
+      return record ? { found: { ...document(path, record), name } } : { missing: name };
+    }).reverse());
+  }
+  if (target === firestoreBase.slice(0, -1) + ":rollback") {
+    transactions.delete(JSON.parse(init.body).transaction);
+    return json({});
+  }
   if (target === firestoreBase.slice(0, -1) + ":commit") {
     firestoreWrites++;
     if (beforeCommit) { const action = beforeCommit; beforeCommit = null; action(); }
-    const writes = JSON.parse(init.body).writes;
+    const { writes, transaction } = JSON.parse(init.body);
+    if (transaction) {
+      assert(writes.every((write) => !write.verify));
+      const reads = transactions.get(transaction);
+      assert(reads);
+      transactions.delete(transaction);
+      for (const [path, version] of reads) if ((records.get(path)?.updateTime || null) !== version) return json({ error: { status: "ABORTED" } }, 409);
+    }
     for (const write of writes) {
       const path = (write.update?.name || write.delete || write.verify).split("/documents/")[1];
       const previous = records.get(path);
@@ -193,6 +221,37 @@ function expectedOldPricing(order, settings = { baseFee: 5, perKmInsideCity: 2, 
   assert.equal(v2.body.code, "STALE_DELIVERY_QUOTE");
   assert.equal(firestoreWrites, writesBeforeV2, "rejected V2 requests cannot write orders or fall back to legacy pricing");
 
+  // Creation may be switched OFF after V2 orders exist. Persisted order data,
+  // not a request flag, blocks the legacy fee/job path while V2 continues.
+  const privateOrder = orderWith();
+  delete privateOrder.customerLat;
+  delete privateOrder.customerLng;
+  privateOrder.destinationContract = "explicit_v2";
+  put("orders/private-existing", privateOrder);
+  const privateWritesBeforeLegacy = firestoreWrites;
+  const privateLegacyQuote = await call("/delivery-quote", { orderId: "private-existing" });
+  assert.equal(privateLegacyQuote.status, 409);
+  assert.equal(privateLegacyQuote.body.code, "explicit_destination_required");
+  const privateLegacyFinalize = await call("/finalize-delivery", { orderId: "private-existing", method: "driver" });
+  assert.equal(privateLegacyFinalize.status, 409);
+  assert.equal(privateLegacyFinalize.body.code, "explicit_destination_required");
+  assert.equal(firestoreWrites, privateWritesBeforeLegacy, "legacy calls must not create a fallback-fee job or outbox event");
+  const privateQuote = await call("/delivery-quote-v2", { orderId: "private-existing", dropoff, saveAsDefault: false });
+  assert.equal(privateQuote.status, 200, JSON.stringify(privateQuote));
+  assert(privateQuote.body.deliveryFee > 5, "V2 quote uses explicit destination distance, not base-only fallback");
+  const privateFinal = await call("/finalize-delivery-v2", { orderId: "private-existing", quoteId: privateQuote.body.quoteId, deliveryPaymentMethod: "cod" });
+  assert.equal(privateFinal.status, 200, JSON.stringify(privateFinal));
+  assert.equal(privateFinal.body.deliveryFee, privateQuote.body.deliveryFee);
+  const continued = records.get("orders/private-existing").data;
+  assert.equal(continued.destinationContract, "explicit_v2");
+  assert.equal(continued.deliveryStatus, "ready_for_driver");
+  assert(!Object.hasOwn(continued, "customerLat") && !Object.hasOwn(continued, "dropoffAddress"));
+  assert(records.has("order_delivery_private/private-existing"), "validated destination is stored privately");
+  assert(records.has("delivery_match_jobs/dm_private-existing_1"), "V2 job follows a confirmed private destination");
+  const privateRetry = await call("/finalize-delivery-v2", { orderId: "private-existing", quoteId: privateQuote.body.quoteId, deliveryPaymentMethod: "cod" });
+  assert.equal(privateRetry.status, 200);
+  assert.equal(privateRetry.body.idempotent, true);
+
   const longDropoff = { ...dropoff, lat: 25.464, lng: 46.7 };
   const cappedSettings = { deliveryPricing: { currency: "SAR", baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 } };
   const uncappedSettings = { ...cappedSettings, deliveryPricingV2: { feeCapMode: "uncapped" } };
@@ -300,9 +359,9 @@ function expectedOldPricing(order, settings = { baseFee: 5, perKmInsideCity: 2, 
   const quoteCountBeforeRace = [...records.keys()].filter((key) => key.startsWith("delivery_quotes/")).length;
   beforeCommit = () => put("app_settings/main", cappedSettings);
   const quoteRace = await call("/delivery-quote-v2", { orderId: "policy-quote-race", dropoff: longDropoff, saveAsDefault: false });
-  assert.equal(quoteRace.status, 409, "pricing settings changed before quote commit");
-  assert.equal(quoteRace.body.code, "STATE_CONFLICT");
-  assert.equal([...records.keys()].filter((key) => key.startsWith("delivery_quotes/")).length, quoteCountBeforeRace);
+  assert.equal(quoteRace.status, 200, "bounded transaction retry recalculates against the new pricing settings");
+  assert.equal(quoteRace.body.deliveryFee, 50);
+  assert.equal([...records.keys()].filter((key) => key.startsWith("delivery_quotes/")).length, quoteCountBeforeRace + 1);
 
   put("app_settings/main", uncappedSettings);
   put("orders/legacy-with-v2-policy", orderWith({ customerLat: 25.464, customerLng: 46.7 }));
