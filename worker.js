@@ -8747,7 +8747,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "status", "EQUAL", "used", 10, accessToken)
       ]);
       const ids = [...new Set([...expired, ...used].map((quote) => quote?._id).filter(phase4aSafeSegment))].slice(0, 20);
-      if (ids.length) await phase4aCommit(ids.map((id) => ({ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + id })), accessToken);
+      return ids.length ? !!await phase4aCommit(ids.map((id) => ({ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + id })), accessToken) : false;
     }
     async function handleScheduledOutbox(env, suppliedAccessToken, status = "pending") {
       // Commercial entitlement reconciliation is intentionally event-driven
@@ -8786,27 +8786,42 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       return handleScheduledMaintenanceWithAccessToken(env, accessToken);
     }
     async function handleScheduledMaintenanceWithAccessToken(env, accessToken) {
-      // A fixed minute rotation guarantees that a persistent deletion or
-      // notification backlog cannot starve matching or quote cleanup. Each
-      // invocation runs at most one bounded business unit; no cadence change.
+      // Fast lanes share four of six minute slots; deletion and quote cleanup
+      // retain reserved slots. An empty maintenance lane yields to fast work.
+      // At most two bounded business units run on a fast invocation.
       const minute = Math.floor(Date.now() / 6e4);
-      const lane = ["deletion", "outbox", "deletion", "outbox", "matching", "quotes"][minute % 6];
-      const statusIndex = Math.floor(minute / 2) % 4;
-      if (lane === "deletion" || lane === "outbox") {
-        const statuses = lane === "deletion"
+      const lane = ["fast", "fast", "deletion", "fast", "fast", "quotes"][minute % 6];
+      const runQueue = async (queue) => {
+        const statusIndex = queue === "deletion" ? Math.floor(minute / 6) % 4 : minute % 4;
+        const statuses = queue === "deletion"
           ? ["requested", "in_progress", "auth_deleted", "cleanup_pending"]
           : ["pending", "failed", "sent", "legacy_order"];
-        // Try each status at most once. A lone active status still gets both
-        // lane slots, while the rotating first choice prevents starvation.
+        // Rotating first choice prevents a persistent status from starving the
+        // other durable queues; a lone active status is found every slot.
         for (let offset = 0; offset < statuses.length; offset++) {
           const status = statuses[(statusIndex + offset) % statuses.length];
-          const worked = lane === "deletion"
+          const worked = queue === "deletion"
             ? await resumeAccountDeletionsWithAccessToken(env, accessToken, status)
             : await handleScheduledOutbox(env, accessToken, status);
-          if (worked) break;
+          if (worked) return true;
         }
-      } else if (lane === "matching") await processDeliveryMatchJobs(env, accessToken);
-      else await cleanupDeliveryQuotes(env, accessToken);
+        return false;
+      };
+      const runFast = async () => {
+        let failure;
+        try { await runQueue("outbox"); } catch (error) { failure = error; }
+        try { await processDeliveryMatchJobs(env, accessToken); } catch (error) { failure ||= error; }
+        if (failure) throw failure;
+      };
+      if (lane === "fast") return runFast();
+      let worked = false;
+      let failure;
+      try { worked = lane === "deletion" ? await runQueue("deletion") : await cleanupDeliveryQuotes(env, accessToken); }
+      catch (error) { failure = error; }
+      if (!worked) {
+        try { await runFast(); } catch (error) { failure ||= error; }
+      }
+      if (failure) throw failure;
     }
     // Offline tests load the compiled Worker in Node with this explicit process
     // flag. Cloudflare Workers have no `process`, so no test surface exists in

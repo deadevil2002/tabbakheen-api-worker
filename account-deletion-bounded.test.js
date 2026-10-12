@@ -22,7 +22,7 @@ const output = (body, status = 200) => new Response(JSON.stringify(body), { stat
 function fixture() {
   const docs = new Map();
   const calls = [];
-  const fixtureState = { docs, calls, authDeletes: 0, authReject: false, loseMarkerResponse: false };
+  const fixtureState = { docs, calls, authDeletes: 0, authReject: false, loseMarkerResponse: false, failCollection: null };
   let version = 0;
   const put = (path, data) => docs.set(path, { data: structuredClone(data), updateTime: "2026-10-12T00:00:" + String(++version).padStart(6, "0") + "Z" });
   const document = (path, entry, select) => {
@@ -46,6 +46,7 @@ function fixture() {
       const collection = query.from[0].collectionId;
       call.collection = collection;
       call.limit = query.limit;
+      if (collection === fixtureState.failCollection) return output({ error: { status: "UNAVAILABLE" } }, 503);
       const filters = query.where?.compositeFilter?.filters || [query.where?.fieldFilter].filter(Boolean).map((fieldFilter) => ({ fieldFilter }));
       const cursor = query.startAt?.values?.[0]?.referenceValue || null;
       const matches = [...docs.entries()].filter(([path, entry]) => path.startsWith(collection + "/") &&
@@ -222,7 +223,7 @@ test("direct POST resumes partial cleanup without reporting completion early", a
   assert.equal(second.success, true);
 }));
 
-test("scheduled lane rotation visits deletion, outbox, matching and quotes", async () => withFixture(async (f) => {
+test("scheduled lane rotation reserves deletion and quotes while servicing fast lanes", async () => withFixture(async (f) => {
   const BaseDate = originalDate;
   for (let minute = 0; minute < 6; minute++) {
     global.Date = class extends BaseDate { constructor(...args) { super(...(args.length ? args : [minute * 60000])); } static now() { return minute * 60000; } };
@@ -230,6 +231,8 @@ test("scheduled lane rotation visits deletion, outbox, matching and quotes", asy
   }
   assert(f.calls.some((call) => call.collection === "account_deletion_requests"));
   assert(f.calls.some((call) => call.collection === "order_transition_events"));
+  assert(f.calls.some((call) => call.collection === "delivery_match_jobs"));
+  assert(f.calls.some((call) => call.collection === "delivery_quotes"));
   assert(f.calls.some((call) => call.suffix.includes("cron_maintenance_state")));
   assert(f.calls.some((call) => call.suffix === ":runQuery"));
 }));
@@ -241,15 +244,15 @@ test("large leased queues use bounded pages and cannot starve another lane", asy
     f.put("order_transition_events/e" + id, { orderId: "o" + id, status: "pending", leaseUntil: "2099-01-01T00:00:00Z" });
   }
   const BaseDate = originalDate;
-  for (const minute of [0, 1]) {
+  for (const minute of [0, 1, 2, 3, 4, 5]) {
     global.Date = class extends BaseDate { constructor(...args) { super(...(args.length ? args : [minute * 60000])); } static now() { return minute * 60000; } };
     const before = f.calls.length;
     await hooks.handleScheduledMaintenanceWithAccessToken(env, "token");
-    assert(f.calls.length - before <= 20, "one invocation exceeded synthetic selection budget");
+    assert(f.calls.length - before <= 40, "one invocation exceeded synthetic selection budget");
   }
   assert(f.calls.some((call) => call.collection === "account_deletion_requests"));
   assert(f.calls.some((call) => call.collection === "order_transition_events"));
-  assert(f.calls.filter((call) => call.collection).every((call) => call.limit === 3));
+  assert(f.calls.filter((call) => call.collection).every((call) => call.limit <= 10));
 }));
 
 test("scheduled deletion advances the same durable page as direct POST", async () => withFixture(async (f) => {
@@ -257,7 +260,7 @@ test("scheduled deletion advances the same durable page as direct POST", async (
   f.put("account_deletion_requests/customer", { uid: "customer", role: "customer", status: "requested" });
   for (let index = 0; index < 12; index++) f.put("orders/o" + String(index).padStart(3, "0"), terminal(index));
   const BaseDate = originalDate;
-  global.Date = class extends BaseDate { constructor(...args) { super(...(args.length ? args : [0])); } static now() { return 0; } };
+  global.Date = class extends BaseDate { constructor(...args) { super(...(args.length ? args : [2 * 60000])); } static now() { return 2 * 60000; } };
   const before = f.calls.length;
   await hooks.handleScheduledMaintenance(env);
   assert(f.calls.length - before <= 12, "scheduled preflight exceeded its synthetic request budget");
@@ -267,6 +270,68 @@ test("scheduled deletion advances the same durable page as direct POST", async (
   assert(state.orderPreflight.cursor.endsWith("/orders/o009"));
   assert.equal(f.authDeletes, 0);
   assert.equal(f.calls.filter((call) => call.collection === "orders").at(-1).limit, 10);
+}));
+
+test("sustained outbox and matching backlogs progress each available minute without starving quotes", async () => withFixture(async (f) => {
+  for (let index = 0; index < 20; index++) {
+    const id = String(index).padStart(3, "0");
+    f.put("order_transition_events/e" + id, { orderId: "missing" + id, transition: "order_created", stateVersion: 1, status: "sent", recipients: [] });
+    f.put("delivery_match_jobs/j" + id, { orderId: "missing" + id, status: "pending", stateVersion: 1 });
+  }
+  f.put("delivery_quotes/q0", { status: "used" });
+  f.put("delivery_quotes/q1", { status: "used" });
+  const BaseDate = originalDate;
+  const perMinute = [];
+  for (let minute = 0; minute < 12; minute++) {
+    global.Date = class extends BaseDate { constructor(...args) { super(...(args.length ? args : [minute * 60000])); } static now() { return minute * 60000; } };
+    const before = f.calls.length;
+    await hooks.handleScheduledMaintenanceWithAccessToken(env, "token");
+    const calls = f.calls.slice(before);
+    perMinute.push({ minute, requests: calls.length, outbox: calls.some((call) => call.collection === "order_transition_events"), matching: calls.some((call) => call.collection === "delivery_match_jobs") });
+    assert(calls.length <= 40, "scheduled invocation exceeded synthetic request budget at minute " + minute);
+    assert(calls.filter((call) => call.collection).every((call) => call.limit <= 10), "unbounded scheduled query");
+  }
+  const fastMinutes = perMinute.filter((item) => item.outbox && item.matching).length;
+  assert(fastMinutes >= 10, "fast lanes did not run promptly");
+  const serviced = perMinute.filter((item) => item.outbox && item.matching).map((item) => item.minute);
+  assert(serviced.every((minute, index) => !index || minute - serviced[index - 1] <= 2), "fast-lane service gap exceeded two minutes");
+  assert.equal(f.docs.get("delivery_quotes/q0"), undefined);
+  assert.equal(f.docs.get("delivery_quotes/q1"), undefined);
+  assert.equal([...f.docs.values()].filter((entry) => entry.data.transition === "order_created" && entry.data.status === "terminal").length, fastMinutes);
+  assert.equal([...f.docs.values()].filter((entry) => entry.data.stopReason === "order_not_available").length, fastMinutes);
+}));
+
+test("reserved deletion slots advance separate requests during sustained fast-lane backlog", async () => withFixture(async (f) => {
+  for (const uid of ["customer0", "customer1"]) {
+    f.put("users/" + uid, { role: "customer" });
+    f.put("account_deletion_requests/" + uid, { uid, role: "customer", status: "requested" });
+    for (let index = 0; index < 12; index++) f.put("orders/" + uid + "o" + String(index).padStart(3, "0"), { customerUid: uid, status: "delivered", deliveryStatus: "delivered" });
+  }
+  for (let index = 0; index < 12; index++) {
+    f.put("order_transition_events/e" + index, { orderId: "missing" + index, transition: "order_created", stateVersion: 1, status: "sent", recipients: [] });
+    f.put("delivery_match_jobs/j" + index, { orderId: "missing" + index, status: "pending", stateVersion: 1 });
+  }
+  const BaseDate = originalDate;
+  for (let minute = 0; minute < 9; minute++) {
+    global.Date = class extends BaseDate { constructor(...args) { super(...(args.length ? args : [minute * 60000])); } static now() { return minute * 60000; } };
+    const before = f.calls.length;
+    await hooks.handleScheduledMaintenanceWithAccessToken(env, "token");
+    assert(f.calls.length - before <= 40, "mixed backlog exceeded synthetic request budget");
+  }
+  assert(f.docs.get("account_deletion_requests/customer0").data.orderPreflight.cursor.endsWith("/orders/customer0o009"));
+  assert(f.docs.get("account_deletion_requests/customer1").data.orderPreflight.cursor.endsWith("/orders/customer1o009"));
+  assert([...f.docs.values()].some((entry) => entry.data.stopReason === "order_not_available"));
+  assert([...f.docs.values()].some((entry) => entry.data.transition === "order_created" && entry.data.status === "terminal"));
+  assert.equal(f.authDeletes, 0);
+}));
+
+test("outbox query failure is surfaced without suppressing matching", async () => withFixture(async (f) => {
+  f.failCollection = "order_transition_events";
+  f.put("delivery_match_jobs/j0", { orderId: "missing", status: "pending", stateVersion: 1 });
+  const BaseDate = originalDate;
+  global.Date = class extends BaseDate { constructor(...args) { super(...(args.length ? args : [0])); } static now() { return 0; } };
+  await assert.rejects(hooks.handleScheduledMaintenanceWithAccessToken(env, "token"), /Cron queue page failed/);
+  assert.equal(f.docs.get("delivery_match_jobs/j0").data.stopReason, "order_not_available");
 }));
 
 test("10,000 orders and offers remain bounded per invocation", async () => withFixture(async (f) => {

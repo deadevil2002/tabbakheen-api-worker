@@ -383,13 +383,13 @@ test("targeted outbox uses stored page event and bounded cleanup", () => {
   assert(outbox.includes("eventDoc._id"));
   assert(source.includes('event === "driver_match_available_v2" ? null : accessToken'));
 });
-test("targeted worst-case budget is 36 with 14 headroom", () => {
+test("targeted notification and receipt paths retain their individual bounds", () => {
   assert.equal(hooks.targetedNotificationWorstCaseSubrequests(), 36);
-  assert.equal(50 - hooks.targetedNotificationWorstCaseSubrequests(), 14);
   assert.equal(hooks.targetedReceiptWorstCaseSubrequests(), 21);
-  assert.equal(50 - hooks.targetedReceiptWorstCaseSubrequests(), 29);
   const maintenance = sourceBetween("async function handleScheduledMaintenance", "// Offline tests");
-  assert(maintenance.includes('const lane = ["deletion", "outbox", "deletion", "outbox", "matching", "quotes"]'));
+  assert(maintenance.includes('const lane = ["fast", "fast", "deletion", "fast", "fast", "quotes"]'));
+  assert(maintenance.includes('await runQueue("outbox")'));
+  assert(maintenance.includes('await processDeliveryMatchJobs(env, accessToken)'));
   assert(!maintenance.includes("if (deletionBusy) return"));
 });
 
@@ -446,8 +446,8 @@ test("quote cleanup is bounded and active-safe", () => {
   assert(cleanup.includes('"status", "EQUAL", "used", 10'));
   assert(cleanup.includes("slice(0, 20)"));
   assert(!cleanup.includes("ORDER_DELIVERY_PRIVATE_COLLECTION"));
-  assert(source.includes('else if (lane === "matching") await processDeliveryMatchJobs(env, accessToken)'));
-  assert(source.includes('else await cleanupDeliveryQuotes(env, accessToken)'));
+  assert(source.includes('await processDeliveryMatchJobs(env, accessToken)'));
+  assert(source.includes('await cleanupDeliveryQuotes(env, accessToken)'));
   assert(!source.includes("if (deletionBusy) return"));
 });
 test("private collections rely on repository default deny", () => {
