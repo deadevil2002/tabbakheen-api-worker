@@ -4,11 +4,14 @@
 
 ## Evidence used and current gaps
 
-The candidate in `FINAL_FIRESTORE_RULES_READY_FOR_MANUAL_DEPLOY.txt` was produced from the currently available mobile and Worker source paths, not from a claim that the historical Bridge text is the current live Rules source:
+The candidate in `FINAL_FIRESTORE_RULES_READY_FOR_MANUAL_DEPLOY.txt` was produced from the available mobile and Worker source paths, not from a claim that the historical Bridge text is the current live Rules source:
 
-- the baseline mobile audit found owner profile/verification reads, broad `offers` collection and `users` role subscriptions, owner/participant order subscriptions, an `app_settings/main` subscription, and legacy direct offer/order/complaint/rating/user-query writes. Subsequent mobile confirmation states that direct `app_settings/main` is removed in favor of the Worker `GET /app-settings/public` DTO and driver availability uses retained `POST /drivers/availability`; release verification must ensure the final source has no stale legacy call sites;
+- the historical pre-release mobile baseline had broad `offers` and `users` subscriptions, direct `app_settings/main` reads, and direct offer/order/complaint/rating writes. **It is not the EAS 1.0.6 build source.** Read-only EAS build metadata identifies Android 1.0.6 (116), build `7048c476-a04b-4808-92d8-e3c72a4c0932`, and iOS 1.0.6 (14), build `1de0b816-1d09-419b-af39-e5b3c871fc73`, with the same Git commit `31e83f4356719cf3b5b4e23d3fb35e044ce45a7b`. Both use runtime 1.0.6 and the production update channel. All nine production-channel runtime-1.0.6 EAS update groups inspected through 2026-10-09 identify commits whose direct Firestore order-service blob is identical to the build's; the user-service blobs differ only in snapshot cache metadata. The latest group `74396ec6-b095-41e4-8035-8c8e1903d077` identifies `a116dae82c8e73c4b295f82faf2bdcbea4c3ed80` on both platforms. This is source-provenance evidence, **not** a byte comparison with installed binaries or proof of OTA uptake on every device;
+- at that EAS build commit and the inspected OTA commits, direct client Firestore operations are owner `users/{uid}` get/listen and allowlisted update, owner `verifications/{uid}` get/listen, public `public_profiles` role query, and participant-filtered `orders` get/listen. Offer catalogue, registration, order/offer mutations, settings, complaints, ratings and delivery discovery use Worker APIs. No direct Firestore operation requiring a broad Bridge grant was found in these inspected application services. The same direct-access contract is retained by Mobile Draft PR #13 `d41209b`;
 - the concurrent Worker source contains canonical `POST /offers`, `PATCH /offers/{offerId}`, retained `/offers/create` and `/offers/update` aliases, sanitized `GET /offers/public`, order mutation endpoints, complaint endpoints, the private-device endpoint, public-location consent endpoint, and Worker-owned chat/rate-limit paths;
-- `public_profiles` is an intentionally public, Worker/Admin-built projection. The Worker projection contract and tests—not Firestore Rules field filtering—are its privacy control. Direct offer reads are fully denied; the mobile catalogue migration uses the Worker sanitized `GET /offers/public` DTO.
+- `public_profiles` is an intentionally public, Worker/Admin-built projection. The Worker projection contract and tests—not Firestore Rules field filtering—are its privacy control. Direct offer reads are fully denied; the inspected 1.0.6 and V2 mobile catalogue uses the Worker sanitized `GET /offers/public` DTO.
+
+**One-policy finding (source and emulator scope):** the unchanged candidate can authorize the inspected 1.0.6 Android/iOS source operations and the V2 PR source without permitting direct order, offer, payment, delivery-state or sensitive-collection writes. It does not authorize the older historical direct-write client. Store publication, each installed binary's exact contents, OTA uptake, the currently active Rules source, and production public-profile contents remain **UNVERIFIED**. No client-reported version is used by the Rules for authorization. This finding is not permission to publish the candidate.
 
 The exact active Rules text was not live-verified here. Historical Bridge text is not treated as proof of current production content. Before any human deployment, export the active Rules source using approved read-only Firebase access, record its hash, and prove removal/replacement of every overlapping allow. A `false` match cannot override a broader earlier `true` allow.
 
@@ -16,7 +19,7 @@ The exact active Rules text was not live-verified here. Historical Bridge text i
 
 Firestore Rules are not field filters. `public_profiles` is therefore public `get/list` by design, but only because it is a separate trusted Worker/Admin projection with client writes permanently denied. Rules do **not** sanitize it. Before cutover, the Worker projection tests and a production public-profile inventory/migration must prove its allowlisted projection contains no private account fields and that coordinates exist only through explicit public-location consent.
 
-Offers are not safe for direct public reads because legacy and Worker offer shapes may differ and Rules cannot redact them. All direct offer reads and writes are denied; the mobile catalogue must use the sanitized Worker `GET /offers/public` DTO. The baseline direct offers subscription and any residual `users` role query must not survive the release.
+Offers are not safe for direct public reads because historical and Worker offer shapes may differ and Rules cannot redact them. All direct offer reads and writes are denied; the mobile catalogue uses the sanitized Worker `GET /offers/public` DTO. The historical pre-release direct offers subscription and `users` role query are absent from the inspected EAS 1.0.6 source; verify any additional supported client cohort before cutover.
 
 ## Explicit owner `users/{uid}` update contract for the mobile cutover
 
@@ -33,7 +36,7 @@ It deliberately denies direct owner mutation of:
 - account status, subscription/trial/platform/entitlement, admin approval/activation, suspension/disable fields;
 - verification, ratings/statistics, push-token/device fields, notification records, and every unknown field.
 
-There is **no direct `users` create/delete**, no collection list, and no cross-user `get`. Registration and phone updates must use their authenticated Worker flows. Final release review must confirm removal of every baseline legacy direct `fsUserExistsByEmail`, `fsCreateUser`, `users` role query, phone/token write, and denied-field mutation.
+There is **no direct `users` create/delete**, no collection list, and no cross-user `get`. Registration and phone updates must use their authenticated Worker flows. The denied historical direct-write/query paths are absent from the inspected EAS 1.0.6 build/OTA and V2 PR source; check any additional supported client cohort before Rules publication.
 
 ## Namespace decision matrix
 
@@ -61,7 +64,7 @@ Offers have no direct client read permission at all. The Worker `GET /offers/pub
 
 ### Settings migration requirement
 
-The candidate denies `app_settings/main` and every other direct Firestore settings document. Mobile confirmation records migration away from `main` to the Worker `GET /app-settings/public` sanitized runtime DTO; that endpoint, not a Firestore `app_settings/public` document, is the approved client path. It returns an explicit `503` on infrastructure failure rather than raw/stale configuration. Do not make `main` public or add a Firestore `app_settings/public` permission without a separate schema/data/writer review.
+The candidate denies `app_settings/main` and every other direct Firestore settings document. The inspected EAS 1.0.6 source and V2 PR use the Worker `GET /app-settings/public` sanitized runtime DTO; that endpoint, not a Firestore `app_settings/public` document, is the approved client path. It returns an explicit `503` on infrastructure failure rather than raw/stale configuration. Do not make `main` public or add a Firestore `app_settings/public` permission without a separate schema/data/writer review.
 
 ## Real emulator harness and matrix
 
@@ -83,7 +86,7 @@ The matrix was actually executed after Java became available; it is not a static
 
 The harness programmatically loaded this candidate into the Firestore emulator, so the CLI's generic notice that no Rules filename was configured in temporary `firebase.json` does not mean allow-all was tested. Expected `PERMISSION_DENIED` responses were asserted as denial passes. No Firebase project credentials, production project ID, production collection, or production Rules endpoint was used.
 
-This is an authorization-matrix pass, **not release/cutover readiness**: it proves direct Firestore offer and settings access is denied and private boundaries hold. The revised matrix below additionally proves the intended public-profile `get/list` access. Mobile confirmation records settings migration to `GET /app-settings/public`; final release review must verify no denied legacy offer/settings/user-query call sites remain and that catalogue/discovery use reviewed Worker DTOs.
+This historical 65-assertion result covered a different candidate hash. The current candidate SHA-256 `d4d0a2403ff0b00a54349619e0f53110ea707ba7c0a4dea3f30845f59e839c2a` passed **92/92** isolated real-emulator ALLOW/DENY assertions on 2026-10-11: 65 existing cases plus 27 supplemental cases. On 2026-10-12, the same unchanged Rules passed **93/93** assertions using the existing isolated Java 21/Firestore emulator and demo project: 66 main cases, including the exact 1.0.6/V2 `public_profiles` role-filtered query, plus the same 27 supplemental cases. The supplemental cases cover role/owner spoofing, legacy participant reads, private V2 destination and sensitive deletion namespaces. The current Rules source is unchanged in Worker PR #13 `c1073b9`; neither test result establishes release/cutover readiness, binary verification or production-data hygiene.
 
 When an isolated environment with Java is available, install `firebase-tools` and `@firebase/rules-unit-testing` **only in a fresh `/tmp` directory** using the approved package-management procedure. Do not alter repository Firebase config or use a project ID from `.firebaserc`. Create this temporary `firebase.json` there:
 
@@ -135,11 +138,11 @@ Record actual command output, random project ID, Firebase CLI version, Java vers
 ## Required manual cutover sequence
 
 1. Preserve the exact active Bridge Rules text and hash as an immediate rollback artifact. Export the current active Rules source read-only and review every matching path/helper/recursive wildcard. Remove/rewrite all overlapping grants in the same complete ruleset.
-2. Merge/release the mobile version that no longer uses direct offers/orders/ratings/complaints/chat/devices/users-email-listing/private-profile peer reads, `users` role queries, the broad offers subscription, or direct `app_settings/main`. It must use retained `POST /drivers/availability`, Worker `GET /app-settings/public`, and sanitized `GET /offers/public` / reviewed discovery DTOs.
+2. Confirm that every still-supported installed client is represented by the inspected EAS 1.0.6 build/OTA source or V2 source. The inspected 1.0.6 sources already use Worker APIs instead of the denied historical direct-write/query paths. If another client cohort still performs a denied operation, do not broaden Rules; retire or migrate that cohort with a verified compatible update flow.
 3. Deploy only a separately tested, backward-compatible Worker that owns registration, offers, orders, payments, ratings, complaints, devices, chat, public-profile projection, public-location consent, offer mutation rate limits/idempotency, and required catalogue/discovery/settings DTOs.
 4. Run the public-profile projection inventory/migration server-side. Verify every public profile against the Worker projection contract; verify no legacy private coordinate was promoted without explicit public consent. Independently test the sanitized `/offers/public` DTO contract.
-5. Release Android and iOS builds. Verify real production flows for each role while Bridge Rules remain active. Do **not** enable force update during this preparation.
-6. After release adoption, enable the independently reviewed minimum-version/force-update policy to retire legacy clients. Confirm no active supported client depends on any permission this candidate denies.
+5. Verify the EAS build-to-store and installed runtime/OTA provenance on real Android/iOS devices, plus representative customer/provider/driver flows, while the active Rules remain unchanged. A new native build is not inferred to be necessary solely for the inspected 1.0.6 Rules contract. Do **not** enable force update during this preparation.
+6. If clients older than the inspected compatible 1.0.6 cohort are still supported, establish a separately approved, verified update/retirement path before cutover. The local mandatory-update control is not in Worker PR #13, and owner authentication/provider support remains unverified; never use an unverified client version string as a Rules authorization boundary.
 7. In the isolated random emulator project, run the full harness above and the separate Worker handler suite. Fix failures, then repeat from clean synthetic data.
 8. Perform a human two-person review of the final candidate and active-rules replacement diff. Confirm every required production collection is named and unknown default-deny remains.
 9. The owner manually publishes the full candidate. No agent performs this step.
