@@ -1328,24 +1328,39 @@
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) return null;
       const priorEvent = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
-      const recipientUids = await getEventRecipientUids(transition, order, accessToken, priorEvent?.data);
-      const recipients = recipientUids.map((uid) => ({ uid, status: "pending", attempts: 0, receiptAttempts: 0 }));
-      const url = FIRESTORE_BASE + "/order_transition_events/" + eventId + "?currentDocument.exists=false";
-      let response = await fetch(url, {
-        method: "PATCH",
-        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ fields: {
-          orderId: toFirestoreValue(orderId),
-          transition: toFirestoreValue(transition),
-          stateVersion: toFirestoreValue(stateVersion),
-          status: toFirestoreValue("pending"),
-          createdAt: toFirestoreValue(new Date().toISOString())
-        } })
-      });
-      if (response.ok) await response.json();
+      if (!priorEvent) {
+        const url = FIRESTORE_BASE + "/order_transition_events/" + eventId + "?currentDocument.exists=false";
+        const response = await fetch(url, {
+          method: "PATCH",
+          headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+          body: JSON.stringify({ fields: {
+            orderId: toFirestoreValue(orderId),
+            transition: toFirestoreValue(transition),
+            stateVersion: toFirestoreValue(stateVersion),
+            status: toFirestoreValue("pending"),
+            createdAt: toFirestoreValue(new Date().toISOString())
+          } }),
+          signal: AbortSignal.timeout(8e3)
+        });
+        try {
+          // A concurrent creator may win. Read its durable event below; all
+          // other failures leave the event retryable instead of sending early.
+          if (!response.ok && response.status !== 409 && response.status !== 412) throw new Error("Notification event creation failed: " + response.status);
+        } finally {
+          // Neither a successful create nor an expected conflict needs its
+          // response payload. Cancel it before another Firestore request.
+          if (response.body) await response.body.cancel();
+        }
+      }
       let snapshot = priorEvent || await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
       if (!snapshot || snapshot.data.status === "sent" || snapshot.data.status === "terminal") return null;
-      let current = snapshot.data.recipients || recipients;
+      // The first successful lease freezes the fan-out. Later batches use only
+      // this stored list, never a fresh all-driver discovery.
+      let current = snapshot.data.recipients;
+      if (!Array.isArray(current)) {
+        const recipientUids = await getEventRecipientUids(transition, order, accessToken, snapshot.data);
+        current = recipientUids.map((uid) => ({ uid, status: "pending", attempts: 0, receiptAttempts: 0 }));
+      }
       const now = Date.now();
       const owner = crypto.randomUUID();
       const candidates = current.filter((recipient) => (recipient.status === "pending" || recipient.status === "failed") && (!recipient.leaseUntil || new Date(recipient.leaseUntil).getTime() <= now)).slice(0, 10);
@@ -4709,13 +4724,6 @@
     }
     __name(getUserPushToken, "getUserPushToken");
     __name2(getUserPushToken, "getUserPushToken");
-    async function getDriverPushTokens(accessToken) {
-      const drivers = await queryFirestore("users", "role", "EQUAL", "driver", accessToken);
-      const tokens = await Promise.all(drivers.map((driver) => driver?._id ? getUserPushToken(driver._id, accessToken) : null));
-      return tokens.filter(Boolean);
-    }
-    __name(getDriverPushTokens, "getDriverPushTokens");
-    __name2(getDriverPushTokens, "getDriverPushTokens");
     async function clearDeviceNotRegisteredToken(token, accessToken) {
       if (!accessToken || !isExpoPushToken(token)) return;
       const privateOwners = await queryFirestore("private_devices", "expoPushToken", "EQUAL", token, accessToken);
@@ -4924,10 +4932,15 @@
           break;
         }
         case "driver_delivery_requested": {
-          if (order.providerUid) {
+          // Only the current leased batch may be read or sent. The remaining
+          // frozen recipients stay in the outbox for later bounded retries.
+          const claimedUids = Array.isArray(recipientUids) ? recipientUids : [];
+          if (order.providerUid && claimedUids.includes(order.providerUid)) {
             const providerToken = await getUserPushToken(order.providerUid, accessToken);
+            preloadedTokens.set(order.providerUid, providerToken);
             if (providerToken) {
               messages.push({
+                _recipientUid: order.providerUid,
                 to: providerToken,
                 title: "\u062A\u0648\u0635\u064A\u0644 \u0628\u0645\u0646\u062F\u0648\u0628 \u{1F697}",
                 body: '\u0627\u0644\u0639\u0645\u064A\u0644 \u0637\u0644\u0628 \u062A\u0648\u0635\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u0628\u0648\u0627\u0633\u0637\u0629 \u0645\u0646\u062F\u0648\u0628',
@@ -4936,9 +4949,13 @@
               });
             }
           }
-          const driverTokens = await getDriverPushTokens(accessToken);
-          for (const token of driverTokens) {
+          for (const uid of claimedUids) {
+            if (uid === order.providerUid) continue;
+            const token = await getUserPushToken(uid, accessToken);
+            preloadedTokens.set(uid, token);
+            if (!token) continue;
             messages.push({
+              _recipientUid: uid,
               to: token,
               title: "\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u{1F680}",
               body: '\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u0644\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
@@ -5278,8 +5295,8 @@
           else skippedRecipientUids.push(uid);
         }
         for (let i = messages.length - 1; i >= 0; i--) {
-          const uid = tokenOwners.get(messages[i].to);
-          if (!uid) messages.splice(i, 1);
+          const uid = event === "driver_delivery_requested" ? messages[i]._recipientUid : tokenOwners.get(messages[i].to);
+          if (!uid || event === "driver_delivery_requested" && !recipientUids.includes(uid)) messages.splice(i, 1);
           else {
             messages[i]._recipientUid = uid;
             if (badgeByUid.has(uid)) messages[i].badge = badgeByUid.get(uid);
@@ -8930,6 +8947,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         handleMyComplaints,
         handleComplaintCreate,
         claimNotificationEvent,
+        sendTransitionNotification,
         getEventRecipientUids,
         prepareNotificationCreate,
         persistUserNotification,
