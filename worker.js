@@ -1679,7 +1679,8 @@
             currentDocument: { updateTime },
             updateTransforms: serverTimestampFields.map((fieldPath) => ({ fieldPath, setToServerValue: "REQUEST_TIME" }))
           }, { update: { name: eventName, fields: eventFields }, currentDocument: { exists: false } },
-          ...(terminal ? [{ delete: root + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : [])] };
+          ...(terminal ? [{ delete: root + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : []),
+          ...trackingJobWrite(orderId, eventId)] };
         }, async () => {
           const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + "/order_transition_events/" + eventId,
             { headers: { Authorization: "Bearer " + accessToken } }, 5e3);
@@ -1700,7 +1701,7 @@
         }, {
           update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
           currentDocument: { exists: false }
-        }, ...(PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event) ? [{ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : []), ...deletionFences];
+        }, ...(PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event) ? [{ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : []), ...deletionFences, ...trackingJobWrite(orderId, eventId)];
       if (!directWrites.every(firestoreSupportedWrite)) throw new Error("Unsupported Firestore Write");
       const response = await fetch(FIRESTORE_BASE + ":commit", {
         method: "POST",
@@ -3330,7 +3331,8 @@
           { update: phase4aDoc(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId, privateFields), currentDocument: privateRead ? { updateTime: privateRead.updateTime } : { exists: false } },
           { update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, { status: "used", usedAt: now }), updateMask: { fieldPaths: ["status", "usedAt"] }, currentDocument: { updateTime: quoteRead.updateTime } },
           { update: phase4aDoc("order_transition_events", eventId, eventFields), currentDocument: { exists: false } },
-          { update: phase4aDoc(DELIVERY_MATCH_JOBS_COLLECTION, jobId, jobFields), currentDocument: { exists: false } }
+          { update: phase4aDoc(DELIVERY_MATCH_JOBS_COLLECTION, jobId, jobFields), currentDocument: { exists: false } },
+          ...trackingJobWrite(orderId, eventId, now)
         ];
         return { writes, value: { event, jobId, fields, order, stateVersion }, expected: { fields, privateFields, eventId, jobId, stateVersion, usedAt: now } };
       }, async (expected) => {
@@ -4115,7 +4117,8 @@
           { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } },
           { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } },
           { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash, createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } },
-          { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } }
+          { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } },
+          ...trackingJobWrite(orderId, eventId, now)
         ], value: { success: true, orderId, order }, expected: { orderId } };
       }, reconcile);
       if (result.kind === "aborted") {
@@ -8618,6 +8621,426 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name2(handleAccountDeletion, "handleAccountDeletion");
     const CRON_QUEUE_STATE_COLLECTION = "cron_maintenance_state";
     const CRON_QUEUE_STATE_ID = "account_deletion_outbox_v2";
+    const TRACKING_SESSIONS = "order_tracking_sessions";
+    const TRACKING_REGISTRIES = "order_tracking_registries";
+    const TRACKING_LEASES = "order_tracking_leases";
+    const TRACKING_RATE_LIMITS = "order_tracking_rate_limits";
+    const TRACKING_JOBS = "order_tracking_jobs";
+    const TRACKING_ROOT = "projects/tabbakheen-99883/databases/(default)/documents/";
+    const TRACKING_LEASE_SECONDS = 8 * 3600;
+    function trackingReady(env) {
+      return env.ORDER_TRACKING_IOS_REMOTE_ENABLED === "true" && env.ORDER_TRACKING_ANDROID_REMOTE_ENABLED === "true" &&
+        typeof env.ORDER_TRACKING_LEASE_SECRET === "string" && env.ORDER_TRACKING_LEASE_SECRET.length >= 32 &&
+        typeof env.ORDER_TRACKING_APNS_TEAM_ID === "string" && /^[A-Z0-9]{10}$/.test(env.ORDER_TRACKING_APNS_TEAM_ID) &&
+        typeof env.ORDER_TRACKING_APNS_KEY_ID === "string" && /^[A-Z0-9]{10}$/.test(env.ORDER_TRACKING_APNS_KEY_ID) &&
+        typeof env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8 === "string" && env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8.includes("BEGIN PRIVATE KEY") &&
+        ["production", "development"].includes(env.ORDER_TRACKING_APNS_ENV) &&
+        typeof env.FIREBASE_CLIENT_EMAIL === "string" && typeof env.FIREBASE_PRIVATE_KEY === "string";
+    }
+    function trackingDoc(collection, id) { return TRACKING_ROOT + collection + "/" + id; }
+    async function trackingSnapshot(collection, id, accessToken) {
+      if (!phase4aSafeSegment(id)) throw new Error("Invalid tracking document ID");
+      const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + "/" + collection + "/" + id,
+        { headers: { Authorization: "Bearer " + accessToken } }, 8e3);
+      if (response.status === 404) return null;
+      if (!response.ok || typeof body?.updateTime !== "string" || !body.fields) throw new Error("Tracking document read failed");
+      return { data: parseFirestoreDoc(body), updateTime: body.updateTime };
+    }
+    async function trackingGet(collection, id, accessToken) { return (await trackingSnapshot(collection, id, accessToken))?.data || null; }
+    async function trackingHash(value) { return base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))); }
+    async function trackingLease(env, uid, orderId, sessionId, nonce) {
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.ORDER_TRACKING_LEASE_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      return base64url(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode([uid, orderId, sessionId, nonce].join("\n"))));
+    }
+    function trackingTokenValid(platform, token) {
+      return typeof token === "string" && (platform === "ios" ? /^[0-9a-fA-F]{64,512}$/.test(token) && token.length % 2 === 0 :
+        platform === "android" && token.length <= 4096 && /^[\x21-\x7E]{20,4096}$/.test(token) &&
+          !token.startsWith("ExponentPushToken[") && !token.startsWith("ExpoPushToken["));
+    }
+    function trackingState(order, nowSeconds = Math.floor(Date.now() / 1e3)) {
+      const status = order?.status, delivery = order?.deliveryStatus;
+      let stage = "unknown";
+      if (status === "cancelled" || delivery === "cancelled") stage = "cancelled";
+      else if (status === "rejected") stage = "rejected";
+      else if (status === "delivered" || delivery === "delivered") stage = "completed";
+      else if (order?.paymentStatus === "PAYMENT_REJECTED") stage = "payment_failed";
+      else if (delivery === "arrived" || delivery === "delivered_pending_confirmation") stage = "arrived";
+      else if (delivery === "picked_up" || status === "picked_up") stage = "picked_up";
+      else if (delivery === "in_transit") stage = "in_transit";
+      else if (delivery === "driver_assigned" || status === "assigned_to_driver") stage = "assigned";
+      else if (status === "searching_driver" || ["pending_driver", "ready_for_driver", "driver_rejected"].includes(delivery)) stage = "searching";
+      else if (order?.deliveryMethod === "self_pickup" && delivery === "self_pickup_selected") stage = "self_pickup";
+      else if (status === "ready_for_pickup") stage = "ready";
+      else if (status === "preparing") stage = "preparing";
+      else if (status === "accepted") stage = "confirmed";
+      else if (status === "pending") stage = "received";
+      const orderVersion = Number.isSafeInteger(order?.stateVersion) && order.stateVersion >= 0 ? order.stateVersion : 0;
+      const deliveryVersion = Number.isSafeInteger(order?.deliveryStateVersion) && order.deliveryStateVersion >= 0 ? order.deliveryStateVersion : 0;
+      return { schemaVersion: 1, stage, orderVersion, deliveryVersion, updatedAt: nowSeconds, staleAt: nowSeconds + 600, etaEpochSeconds: null };
+    }
+    function trackingTerminal(stage) { return ["completed", "cancelled", "rejected", "payment_failed", "unknown"].includes(stage); }
+    function trackingVector(state) { return [state.orderVersion, state.deliveryVersion]; }
+    function trackingIsNewer(next, previous) {
+      if (!previous || !Number.isSafeInteger(previous.orderVersion) || !Number.isSafeInteger(previous.deliveryVersion)) return true;
+      return next.orderVersion >= previous.orderVersion && next.deliveryVersion >= previous.deliveryVersion &&
+        (next.orderVersion > previous.orderVersion || next.deliveryVersion > previous.deliveryVersion || next.stage !== previous.stage);
+    }
+    function trackingJobWrite(orderId, eventId, now = new Date().toISOString()) {
+      if (!trackingReady(globalThis)) return [];
+      return [{ update: phase4aDoc(TRACKING_JOBS, eventId, { orderId, eventId, status: "pending", createdAt: now }), currentDocument: { exists: false } }];
+    }
+    async function trackingRegister(uid, body, env, accessToken) {
+      if (!exactObjectKeys(body, ["schemaVersion", "orderId", "sessionId", "platform", "pushToken", "locale"]) || body.schemaVersion !== 1 ||
+          !phase4aSafeSegment(body.orderId) || !/^[A-Za-z0-9_-]{1,128}$/.test(body.sessionId) ||
+          !["ar", "en"].includes(body.locale) || !trackingTokenValid(body.platform, body.pushToken))
+        return { status: 400, code: "invalid_request" };
+      const now = Math.floor(Date.now() / 1e3);
+      const sessionId = await trackingHash([uid, body.orderId, body.sessionId].join("\n"));
+      const registryId = await trackingHash(body.orderId);
+      const nonce = base64url(crypto.getRandomValues(new Uint8Array(24)));
+      const newLease = await trackingLease(env, uid, body.orderId, body.sessionId, nonce);
+      const newHash = await trackingHash(newLease);
+      const names = [trackingDoc("orders", body.orderId), trackingDoc("users", uid),
+        trackingDoc("account_deletion_requests", uid), trackingDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid),
+        trackingDoc(TRACKING_REGISTRIES, registryId), trackingDoc(TRACKING_SESSIONS, sessionId), trackingDoc(TRACKING_RATE_LIMITS, uid)];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const order = read.get(names[0])?.data, user = read.get(names[1])?.data;
+        if (!order || order.customerUid !== uid || !user || user.role !== "customer" ||
+            ["disabled", "suspended"].includes(user.accountStatus) || read.get(names[2]) || read.get(names[3])) return { abort: "forbidden" };
+        const state = trackingState(order, now);
+        if (trackingTerminal(state.stage)) return { abort: "order_terminal" };
+        const registry = read.get(names[4]), previous = read.get(names[5]), rate = read.get(names[6]);
+        if (previous && (previous.data.uid !== uid || previous.data.orderId !== body.orderId ||
+            previous.data.sessionId !== body.sessionId || previous.data.platform !== body.platform)) return { abort: "forbidden" };
+        const slots = (Array.isArray(registry?.data?.sessions) ? registry.data.sessions : [])
+          .filter((slot) => slot && typeof slot.id === "string" && Number.isFinite(slot.expiresAt) && slot.expiresAt > now);
+        if (slots.filter((slot) => slot.id !== sessionId).length >= 3) return { abort: "capacity" };
+        // A Firebase-authenticated re-registration renews before the native
+        // client's five-minute refresh threshold, never with an expired lease.
+        const active = previous && previous.data.status !== "revoked" && previous.data.expiresAt > now + 300;
+        const changed = !active || previous.data.pushToken !== body.pushToken;
+        const windowStart = Number.isFinite(rate?.data?.windowStart) && rate.data.windowStart > now - 3600 ? rate.data.windowStart : now;
+        const count = windowStart === rate?.data?.windowStart ? Number(rate.data.count) || 0 : 0;
+        if (changed && count >= 12) return { abort: "rate_limited" };
+        const selectedNonce = active ? previous.data.leaseNonce : nonce;
+        const selectedHash = active ? previous.data.leaseHash : newHash;
+        if (!selectedNonce || !selectedHash) return { abort: "state_conflict" };
+        const expiresAt = active ? previous.data.expiresAt : now + TRACKING_LEASE_SECONDS;
+        const selectedSlots = [...slots.filter((slot) => slot.id !== sessionId), { id: sessionId, expiresAt }];
+        const newer = trackingIsNewer(state, previous?.data?.pendingState || previous?.data?.sentState);
+        const update = changed || newer || !slots.some((slot) => slot.id === sessionId);
+        const value = { nonce: selectedNonce, expiresAt, sessionId };
+        if (!update) return { writes: [], value, expected: value };
+        const fields = { uid, orderId: body.orderId, sessionId: body.sessionId, platform: body.platform,
+          pushToken: body.pushToken, locale: body.locale, leaseNonce: selectedNonce, leaseHash: selectedHash,
+          expiresAt, tokenGeneration: (previous?.data?.tokenGeneration || 0) + (changed ? 1 : 0),
+          pendingState: state, pendingEventId: "registration", status: "pending", attempts: 0, updatedAt: new Date().toISOString() };
+        const writes = [
+          { update: phase4aDoc(TRACKING_SESSIONS, sessionId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: previous ? { updateTime: previous.updateTime } : { exists: false } },
+          { update: phase4aDoc(TRACKING_REGISTRIES, registryId, { orderId: body.orderId, sessions: selectedSlots }), updateMask: { fieldPaths: ["orderId", "sessions"] }, currentDocument: registry ? { updateTime: registry.updateTime } : { exists: false } }
+        ];
+        if (!active) writes.push({ update: phase4aDoc(TRACKING_LEASES, selectedHash, { sessionDocId: sessionId, expiresAt }), currentDocument: { exists: false } });
+        if (changed) writes.push({ update: phase4aDoc(TRACKING_RATE_LIMITS, uid, { windowStart, count: count + 1 }), updateMask: { fieldPaths: ["windowStart", "count"] }, currentDocument: rate ? { updateTime: rate.updateTime } : { exists: false } });
+        return { writes, value, expected: value };
+      }, async (expected) => {
+        const stored = await trackingGet(TRACKING_SESSIONS, sessionId, accessToken);
+        return stored && stored.uid === uid && stored.orderId === body.orderId && stored.leaseNonce === expected.nonce &&
+          stored.expiresAt === expected.expiresAt ? expected : null;
+      }, 2, {}, 7, 4);
+      if (result.kind === "aborted") return { status: result.value === "rate_limited" ? 429 : result.value === "capacity" ? 409 : 403, code: result.value };
+      if (!["committed", "reconciled"].includes(result.kind)) return { status: 503, code: "state_conflict" };
+      const lease = await trackingLease(env, uid, body.orderId, body.sessionId, result.value.nonce);
+      return { status: 200, value: { success: true, lease, expiresAt: result.value.expiresAt } };
+    }
+    async function trackingLeaseMutation(action, request, env, accessToken) {
+      const match = /^OrderTrackingLease ([A-Za-z0-9_-]{32,512})$/.exec(request.headers.get("Authorization") || "");
+      if (!match) return { status: 401, code: "unauthorized" };
+      let body;
+      try { if (Number(request.headers.get("content-length")) > 8192) throw Error(); body = JSON.parse(await trackingReadTransportBody(request)); } catch { return { status: 400, code: "invalid_request" }; }
+      if (!exactObjectKeys(body, action === "rotate" ? ["schemaVersion", "sessionId", "pushToken"] : ["schemaVersion", "sessionId"]) ||
+          body.schemaVersion !== 1 || !/^[A-Za-z0-9_-]{1,128}$/.test(body.sessionId)) return { status: 400, code: "invalid_request" };
+      const leaseHash = await trackingHash(match[1]);
+      const leaseIndex = await trackingGet(TRACKING_LEASES, leaseHash, accessToken);
+      if (!leaseIndex || !phase4aSafeSegment(leaseIndex.sessionDocId)) return action === "end" ? { status: 200, value: { success: true } } : { status: 401, code: "unauthorized" };
+      const sessionDocId = leaseIndex.sessionDocId;
+      const preview = await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken);
+      if (!preview || preview.leaseHash !== leaseHash || preview.sessionId !== body.sessionId || preview.status === "revoked" ||
+          preview.expiresAt <= Date.now() / 1e3) return action === "end" ? { status: 200, value: { success: true } } : { status: 401, code: "unauthorized" };
+      if (action === "rotate" && !trackingTokenValid(preview.platform, body.pushToken)) return { status: 400, code: "invalid_request" };
+      const registryId = await trackingHash(preview.orderId);
+      const names = [trackingDoc(TRACKING_SESSIONS, sessionDocId), trackingDoc(TRACKING_LEASES, leaseHash), trackingDoc(TRACKING_REGISTRIES, registryId),
+        trackingDoc("orders", preview.orderId), trackingDoc("users", preview.uid), trackingDoc("account_deletion_requests", preview.uid),
+        trackingDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, preview.uid)];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const session = read.get(names[0]), index = read.get(names[1]), registry = read.get(names[2]);
+        if (!session || !index || session.data.leaseHash !== leaseHash || index.data.sessionDocId !== sessionDocId ||
+            session.data.sessionId !== body.sessionId || session.data.expiresAt <= Date.now() / 1e3) return { abort: "unauthorized" };
+        if (action === "end") {
+          const slots = (registry?.data?.sessions || []).filter((slot) => slot.id !== sessionDocId);
+          const writes = [
+            { update: phase4aDoc(TRACKING_SESSIONS, sessionDocId, { status: "revoked", pushToken: null, leaseHash: null, pendingState: null }),
+              updateMask: { fieldPaths: ["status", "pushToken", "leaseHash", "pendingState", "expiresAt"] }, currentDocument: { updateTime: session.updateTime } },
+            { delete: names[1], currentDocument: { updateTime: index.updateTime } }
+          ];
+          if (registry) writes.push({ update: phase4aDoc(TRACKING_REGISTRIES, registryId, { sessions: slots }), updateMask: { fieldPaths: ["sessions"] }, currentDocument: { updateTime: registry.updateTime } });
+          return { writes, value: true, expected: true };
+        }
+        const order = read.get(names[3])?.data, user = read.get(names[4])?.data;
+        if (!order || order.customerUid !== session.data.uid || !user || user.role !== "customer" ||
+            read.get(names[5]) || read.get(names[6]) || trackingTerminal(trackingState(order).stage)) return { abort: "forbidden" };
+        if (session.data.pushToken === body.pushToken) return { writes: [], value: true, expected: true };
+        const now = Math.floor(Date.now() / 1e3);
+        const windowStart = session.data.rotationWindowStart > now - 3600 ? session.data.rotationWindowStart : now;
+        const count = windowStart === session.data.rotationWindowStart ? session.data.rotationCount || 0 : 0;
+        if (count >= 12) return { abort: "rate_limited" };
+        const fields = { pushToken: body.pushToken, tokenGeneration: (session.data.tokenGeneration || 0) + 1,
+          pendingState: trackingState(order, now), pendingEventId: "rotation", status: "pending", attempts: 0,
+          rotationWindowStart: windowStart, rotationCount: count + 1 };
+        return { writes: [{ update: phase4aDoc(TRACKING_SESSIONS, sessionDocId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: session.updateTime } }], value: true, expected: true };
+      }, async () => {
+        const latest = await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken);
+        return action === "end" ? latest?.status === "revoked" : latest?.pushToken === body.pushToken;
+      }, 2, {}, 7, 3);
+      if (["committed", "reconciled"].includes(result.kind)) return { status: 200, value: { success: true } };
+      if (result.kind === "aborted") return { status: result.value === "rate_limited" ? 429 : result.value === "forbidden" ? 403 : 401, code: result.value };
+      return { status: 503, code: "state_conflict" };
+    }
+    async function handleOrderTrackingRequest(request, path, env) {
+      const action = path.slice("/order-tracking/".length);
+      if (!["capabilities", "register", "rotate", "end"].includes(action)) return jsonResponse({ success: false, code: "not_found" }, 404);
+      if (action === "capabilities" && request.method !== "GET" || action !== "capabilities" && request.method !== "POST") return jsonResponse({ success: false, code: "method_not_allowed" }, 405);
+      try {
+        let uid = null;
+        if (action === "capabilities" || action === "register") {
+          try { uid = await verifyFirebaseIdToken(getTokenFromRequest(request)); } catch { return jsonResponse({ success: false, code: "unauthorized" }, 401); }
+        }
+        if (action === "capabilities") return jsonResponse({ success: true, schemaVersion: 1, iosRemote: trackingReady(env), androidRemote: trackingReady(env) });
+        if (!trackingReady(env) && action !== "end") return jsonResponse({ success: false, code: "tracking_unavailable" }, 503);
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        let outcome;
+        if (action === "register") {
+          let body;
+          try { if (Number(request.headers.get("content-length")) > 8192) throw Error(); body = JSON.parse(await trackingReadTransportBody(request)); } catch { return jsonResponse({ success: false, code: "invalid_request" }, 400); }
+          outcome = await trackingRegister(uid, body, env, accessToken);
+        } else outcome = await trackingLeaseMutation(action, request, env, accessToken);
+        return jsonResponse(outcome.value || { success: false, code: outcome.code }, outcome.status);
+      } catch { return jsonResponse({ success: false, code: "tracking_unavailable" }, 503); }
+    }
+    async function trackingReadTransportBody(response) {
+      if (!response.body) return "";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      let result = "", bytes = 0;
+      let timer;
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Tracking response deadline exceeded")), 8e3);
+      });
+      try {
+        while (true) {
+          const chunk = await Promise.race([reader.read(), deadline]);
+          if (chunk.done) break;
+          bytes += chunk.value.byteLength;
+          if (bytes > 8192) throw new Error("Tracking transport response too large");
+          result += decoder.decode(chunk.value, { stream: true });
+        }
+        return result + decoder.decode();
+      } finally { clearTimeout(timer); try { await reader.cancel(); } catch {} }
+    }
+    async function trackingMessagingAccessToken(env) {
+      const jwt = await createJWT(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY,
+        "https://www.googleapis.com/auth/firebase.messaging");
+      const response = await fetch(TOKEN_URL, {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(8e3),
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Ajwt-bearer&assertion=${jwt}`
+      });
+      const raw = await trackingReadTransportBody(response);
+      if (!response.ok) throw new Error("Tracking OAuth unavailable");
+      const token = JSON.parse(raw).access_token;
+      if (typeof token !== "string" || token.length < 1 || token.length > 8192) throw new Error("Invalid tracking OAuth response");
+      return token;
+    }
+    async function trackingApnsJwt(env) {
+      const pem = env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8.replace(/\\n/g, "\n").replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, "");
+      const bytes = Uint8Array.from(atob(pem), (char) => char.charCodeAt(0));
+      const key = await crypto.subtle.importKey("pkcs8", bytes, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+      const part = base64urlStr(JSON.stringify({ alg: "ES256", kid: env.ORDER_TRACKING_APNS_KEY_ID })) + "." +
+        base64urlStr(JSON.stringify({ iss: env.ORDER_TRACKING_APNS_TEAM_ID, iat: Math.floor(Date.now() / 1e3) }));
+      return part + "." + base64url(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(part)));
+    }
+    async function trackingSend(env, session, state, event) {
+      try {
+        if (session.platform === "ios") {
+          const host = env.ORDER_TRACKING_APNS_ENV === "production" ? "https://api.push.apple.com" : "https://api.sandbox.push.apple.com";
+          const aps = { timestamp: Math.floor(Date.now() / 1e3), event, "content-state": state, "stale-date": state.staleAt,
+            ...(event === "end" ? { "dismissal-date": Math.floor(Date.now() / 1e3) } : {}) };
+          const response = await fetch(host + "/3/device/" + session.pushToken, {
+            method: "POST", redirect: "error", signal: AbortSignal.timeout(8e3),
+            headers: { authorization: "bearer " + await trackingApnsJwt(env), "apns-topic": "com.tabbakheen.app.push-type.liveactivity",
+              "apns-push-type": "liveactivity", "apns-priority": "10", "content-type": "application/json" },
+            body: JSON.stringify({ aps })
+          });
+          await trackingReadTransportBody(response);
+          if (response.status === 200) return "accepted";
+          if (response.status === 410) return "retired";
+          if (response.status === 429) return "retry";
+          return "uncertain";
+        }
+        const tracking = JSON.stringify({ schemaVersion: 1, sessionId: session.sessionId, orderId: session.orderId, event, "content-state": state });
+        if (new TextEncoder().encode(tracking).byteLength > 4096) return "uncertain";
+        const bearer = await trackingMessagingAccessToken(env);
+        const response = await fetch("https://fcm.googleapis.com/v1/projects/tabbakheen-99883/messages:send", {
+          method: "POST", redirect: "error", signal: AbortSignal.timeout(8e3),
+          headers: { authorization: "Bearer " + bearer, "content-type": "application/json" },
+          body: JSON.stringify({ message: { token: session.pushToken, data: { kind: "tabbakheen.order-tracking.v1", tracking },
+            android: { priority: "HIGH", ttl: "60s" } } })
+        });
+        const raw = await trackingReadTransportBody(response);
+        if (response.status === 200) return "accepted";
+        let errorCode = "";
+        try { errorCode = (JSON.parse(raw).error?.details || []).find((detail) => detail.errorCode)?.errorCode || ""; } catch {}
+        if (errorCode === "UNREGISTERED" || errorCode === "SENDER_ID_MISMATCH") return "retired";
+        if (response.status === 429) return "retry";
+        return "uncertain";
+      } catch { return "uncertain"; }
+    }
+    async function trackingProjectJob(job, accessToken) {
+      if (!job || !phase4aSafeSegment(job.orderId) || !phase4aSafeSegment(job._id)) return false;
+      const registryId = await trackingHash(job.orderId);
+      const registry = await trackingGet(TRACKING_REGISTRIES, registryId, accessToken);
+      const ids = (Array.isArray(registry?.sessions) ? registry.sessions : []).map((slot) => slot?.id);
+      if (ids.length > 3 || ids.some((id) => !phase4aSafeSegment(id))) throw new Error("Tracking registry exceeds cap");
+      const names = [trackingDoc(TRACKING_JOBS, job._id), trackingDoc("orders", job.orderId), trackingDoc(TRACKING_REGISTRIES, registryId),
+        ...ids.map((id) => trackingDoc(TRACKING_SESSIONS, id))];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const currentJob = read.get(names[0]), order = read.get(names[1])?.data, currentRegistry = read.get(names[2]);
+        if (!currentJob || !["pending", "failed"].includes(currentJob.data.status)) return { abort: "already_done" };
+        if (JSON.stringify((currentRegistry?.data?.sessions || []).map((slot) => slot.id)) !== JSON.stringify(ids)) return { abort: "registry_changed" };
+        const state = trackingState(order);
+        const writes = [];
+        for (let index = 0; index < ids.length; index++) {
+          const snapshot = read.get(names[3 + index]);
+          if (!snapshot || snapshot.data.orderId !== job.orderId || snapshot.data.status === "revoked" ||
+              snapshot.data.expiresAt <= Date.now() / 1e3) continue;
+          const previousState = snapshot.data.pendingState || snapshot.data.sentState;
+          const target = order ? state : { ...state,
+            orderVersion: Math.max(state.orderVersion, previousState?.orderVersion || 0),
+            deliveryVersion: Math.max(state.deliveryVersion, previousState?.deliveryVersion || 0) };
+          if (!trackingIsNewer(target, previousState)) continue;
+          const fields = { pendingState: target, pendingEventId: job.eventId || job._id, status: "pending", attempts: 0 };
+          writes.push({ update: phase4aDoc(TRACKING_SESSIONS, ids[index], fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snapshot.updateTime } });
+        }
+        writes.push({ update: phase4aDoc(TRACKING_JOBS, job._id, { status: "terminal", completedAt: new Date().toISOString() }),
+          updateMask: { fieldPaths: ["status", "completedAt"] }, currentDocument: { updateTime: currentJob.updateTime } });
+        return { writes, value: true, expected: true };
+      }, async () => (await trackingGet(TRACKING_JOBS, job._id, accessToken))?.status === "terminal", 2, {}, 6, 4);
+      return ["committed", "reconciled"].includes(result.kind);
+    }
+    async function trackingRetire(sessionDocId, accessToken) {
+      const preview = await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken);
+      if (!preview || preview.status === "revoked" && preview.expiresAt == null) return true;
+      const registryId = await trackingHash(preview.orderId);
+      const names = [trackingDoc(TRACKING_SESSIONS, sessionDocId), trackingDoc(TRACKING_REGISTRIES, registryId),
+        ...(preview.leaseHash ? [trackingDoc(TRACKING_LEASES, preview.leaseHash)] : [])];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const session = read.get(names[0]), registry = read.get(names[1]), index = names[2] ? read.get(names[2]) : null;
+        if (!session || session.data.orderId !== preview.orderId || session.data.leaseHash !== preview.leaseHash) return { abort: "changed" };
+        const fields = { status: "revoked", pushToken: null, leaseHash: null, pendingState: null };
+        const writes = [{ update: phase4aDoc(TRACKING_SESSIONS, sessionDocId, fields), updateMask: { fieldPaths: [...Object.keys(fields), "expiresAt"] },
+          currentDocument: { updateTime: session.updateTime } }];
+        if (registry) writes.push({ update: phase4aDoc(TRACKING_REGISTRIES, registryId,
+          { sessions: (registry.data.sessions || []).filter((slot) => slot.id !== sessionDocId) }),
+          updateMask: { fieldPaths: ["sessions"] }, currentDocument: { updateTime: registry.updateTime } });
+        if (index) writes.push({ delete: names[2], currentDocument: { updateTime: index.updateTime } });
+        return { writes, value: true, expected: true };
+      }, async () => (await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken))?.status === "revoked", 2, {}, 3, 3);
+      return ["committed", "reconciled"].includes(result.kind);
+    }
+    async function trackingDispatch(sessionDoc, env, accessToken) {
+      if (!sessionDoc || !phase4aSafeSegment(sessionDoc._id) || !phase4aSafeSegment(sessionDoc.orderId)) return false;
+      const now = Math.floor(Date.now() / 1e3);
+      if (sessionDoc.nextAttemptAt && sessionDoc.nextAttemptAt > now) return false;
+      const owner = crypto.randomUUID();
+      const names = [trackingDoc(TRACKING_SESSIONS, sessionDoc._id), trackingDoc("orders", sessionDoc.orderId),
+        trackingDoc("users", sessionDoc.uid), trackingDoc("account_deletion_requests", sessionDoc.uid),
+        trackingDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, sessionDoc.uid)];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const session = read.get(names[0]), order = read.get(names[1])?.data, user = read.get(names[2])?.data;
+        if (!session || !["pending", "failed"].includes(session.data.status) || !session.data.pushToken ||
+            session.data.expiresAt <= now) return { abort: "inactive" };
+        const authorized = !!order && order.customerUid === session.data.uid && user?.role === "customer" &&
+          !["disabled", "suspended"].includes(user.accountStatus) && !read.get(names[3]) && !read.get(names[4]);
+        const state = trackingState(authorized ? order : null, now);
+        const latest = !authorized ? { ...state,
+          orderVersion: Math.max(state.orderVersion, session.data.pendingState?.orderVersion || 0),
+          deliveryVersion: Math.max(state.deliveryVersion, session.data.pendingState?.deliveryVersion || 0) } :
+          trackingIsNewer(state, session.data.pendingState) ? state : session.data.pendingState;
+        const event = !authorized || trackingTerminal(latest.stage) ? "end" : "update";
+        const fields = { status: "inflight", dispatchOwner: owner, dispatchUntil: now + 30, pendingState: latest,
+          dispatchKey: [session.data.pendingEventId || "registration", session.data.sessionId, session.data.tokenGeneration || 1,
+            ...trackingVector(latest)].join(":"), attempts: (session.data.attempts || 0) + 1 };
+        return { writes: [{ update: phase4aDoc(TRACKING_SESSIONS, sessionDoc._id, fields), updateMask: { fieldPaths: Object.keys(fields) },
+          currentDocument: { updateTime: session.updateTime } }], value: { state: latest, event }, expected: { owner } };
+      }, async (expected) => {
+        const persisted = await trackingGet(TRACKING_SESSIONS, sessionDoc._id, accessToken);
+        return persisted?.dispatchOwner === expected.owner && persisted.status === "inflight" ? { state: persisted.pendingState,
+          event: trackingTerminal(persisted.pendingState?.stage) ? "end" : "update" } : null;
+      }, 2, {}, 5, 1);
+      if (!["committed", "reconciled"].includes(result.kind)) return false;
+      const claimed = await trackingSnapshot(TRACKING_SESSIONS, sessionDoc._id, accessToken);
+      if (!claimed || claimed.data.dispatchOwner !== owner || claimed.data.status !== "inflight" || claimed.data.dispatchUntil <= Date.now() / 1e3) return false;
+      const [currentOrder, currentUser, deletion, marker] = await Promise.all([
+        trackingGet("orders", claimed.data.orderId, accessToken), trackingGet("users", claimed.data.uid, accessToken),
+        trackingGet("account_deletion_requests", claimed.data.uid, accessToken),
+        trackingGet(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, claimed.data.uid, accessToken)
+      ]);
+      const stillAuthorized = currentOrder?.customerUid === claimed.data.uid && currentUser?.role === "customer" &&
+        !["disabled", "suspended"].includes(currentUser.accountStatus) && !deletion && !marker;
+      if (!stillAuthorized && claimed.data.pendingState?.stage !== "unknown" ||
+          stillAuthorized && trackingIsNewer(trackingState(currentOrder), claimed.data.pendingState)) {
+        const fresh = trackingState(stillAuthorized ? currentOrder : null);
+        const next = stillAuthorized ? fresh : { ...fresh,
+          orderVersion: Math.max(fresh.orderVersion, claimed.data.pendingState?.orderVersion || 0),
+          deliveryVersion: Math.max(fresh.deliveryVersion, claimed.data.pendingState?.deliveryVersion || 0) };
+        await compareAndSetFirestoreDocument(TRACKING_SESSIONS, sessionDoc._id,
+          { pendingState: next, status: "pending", dispatchOwner: null, attempts: 0 }, claimed.updateTime, accessToken);
+        return false;
+      }
+      // Persisted `inflight` is deliberately NOT retryable after a crash or a
+      // lost transport response. A future authoritative state can supersede it.
+      const outcome = await trackingSend(env, claimed.data, claimed.data.pendingState, result.value.event);
+      const fields = outcome === "accepted" ? { status: trackingTerminal(claimed.data.pendingState.stage) ? "terminal" : "sent", sentState: claimed.data.pendingState } :
+        outcome === "retired" ? { status: "revoked", pushToken: null } :
+        outcome === "retry" && claimed.data.attempts < 3 ? { status: "failed", nextAttemptAt: Math.floor(Date.now() / 1e3) + 60 * claimed.data.attempts } :
+        { status: "uncertain" };
+      const saved = await compareAndSetFirestoreDocument(TRACKING_SESSIONS, sessionDoc._id, { ...fields, dispatchOwner: null }, claimed.updateTime, accessToken);
+      if (saved.ok && (outcome === "retired" || outcome === "accepted" && result.value.event === "end"))
+        await trackingRetire(sessionDoc._id, accessToken);
+      return true;
+    }
+    async function handleScheduledTracking(env, accessToken) {
+      if (!trackingReady(env)) return false;
+      const minute = Math.floor(Date.now() / 6e4);
+      const expireOne = async () => {
+        const expired = await queryFirestoreLimited(TRACKING_SESSIONS, "expiresAt", "LESS_THAN_OR_EQUAL", Math.floor(Date.now() / 1e3), 1, accessToken);
+        return expired[0] ? trackingRetire(expired[0]._id, accessToken) : false;
+      };
+      // Reserve one fast-lane slot per six minutes for expired-lease cleanup,
+      // even under a sustained tracking backlog. Each call still does one unit.
+      if (minute % 6 === 0 && await expireOne()) return true;
+      const project = async () => {
+        const job = await cronQueueNext(TRACKING_JOBS, minute % 2 ? "pending" : "failed", accessToken) ||
+          await cronQueueNext(TRACKING_JOBS, minute % 2 ? "failed" : "pending", accessToken);
+        return job ? trackingProjectJob(job, accessToken) : false;
+      };
+      const dispatch = async () => {
+        const session = await cronQueueNext(TRACKING_SESSIONS, minute % 2 ? "failed" : "pending", accessToken) ||
+          await cronQueueNext(TRACKING_SESSIONS, minute % 2 ? "pending" : "failed", accessToken);
+        return session ? trackingDispatch(session, env, accessToken) : false;
+      };
+      if (minute % 2 ? await project() || await dispatch() : await dispatch() || await project()) return true;
+      return minute % 6 === 0 ? false : expireOne();
+    }
     async function cronQueueNext(collection, status, accessToken) {
       const key = collection + "_" + status;
       const prefix = phase4aDoc(collection, "", {}).name;
@@ -8828,6 +9251,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         let failure;
         try { await runQueue("outbox"); } catch (error) { failure = error; }
         try { await processDeliveryMatchJobs(env, accessToken); } catch (error) { failure ||= error; }
+        // One bounded native-tracking unit only when both owner-controlled
+        // transports and their credentials are configured. Legacy Cron is
+        // unchanged while this new feature remains DEFAULT OFF.
+        try { await handleScheduledTracking(env, accessToken); } catch (error) { failure ||= error; }
         if (failure) throw failure;
       };
       if (lane === "fast") return runFast();
@@ -8845,6 +9272,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     // production.
     if (typeof process !== "undefined" && process?.env?.PHONE_AUTH_TEST_MODE === "1") {
       globalThis.__PHONE_AUTH_TEST_HOOKS = {
+        trackingReady,
+        trackingState,
+        trackingTokenValid,
+        trackingIsNewer,
+        trackingRegister,
+        trackingLeaseMutation,
+        trackingProjectJob,
+        trackingDispatch,
+        trackingSend,
+        handleScheduledTracking,
+        handleOrderTrackingRequest,
         firestoreReadWriteTransaction,
         escapeHtml,
         validateInvoicePayload,
@@ -9009,6 +9447,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof V2_ORDER_CREATION_ENABLED !== "undefined") env.V2_ORDER_CREATION_ENABLED = V2_ORDER_CREATION_ENABLED;
       } catch {
       }
+      try { if (typeof ORDER_TRACKING_IOS_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_IOS_REMOTE_ENABLED = ORDER_TRACKING_IOS_REMOTE_ENABLED; } catch {}
+      try { if (typeof ORDER_TRACKING_ANDROID_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_ANDROID_REMOTE_ENABLED = ORDER_TRACKING_ANDROID_REMOTE_ENABLED; } catch {}
+      try { if (typeof ORDER_TRACKING_LEASE_SECRET !== "undefined") env.ORDER_TRACKING_LEASE_SECRET = ORDER_TRACKING_LEASE_SECRET; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_TEAM_ID !== "undefined") env.ORDER_TRACKING_APNS_TEAM_ID = ORDER_TRACKING_APNS_TEAM_ID; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_KEY_ID !== "undefined") env.ORDER_TRACKING_APNS_KEY_ID = ORDER_TRACKING_APNS_KEY_ID; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_PRIVATE_KEY_P8 !== "undefined") env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8 = ORDER_TRACKING_APNS_PRIVATE_KEY_P8; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_ENV !== "undefined") env.ORDER_TRACKING_APNS_ENV = ORDER_TRACKING_APNS_ENV; } catch {}
       try {
         if (typeof CLOUDINARY_CLOUD_NAME !== "undefined") env.CLOUDINARY_CLOUD_NAME = CLOUDINARY_CLOUD_NAME;
       } catch {
@@ -9561,7 +10006,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const providerAccess = phase4aProviderAccess(auth.user);
             if (!providerAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, providerAccess.entitlement, accessToken); return phase4aError(providerAccess.code, "Provider subscription required", 403); }
             const fields = { paymentStatus: "PAYMENT_REJECTED", paymentRejectionReason: String(body.reason || "").trim(), paymentRejectedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-            if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
+            const trackingEventId = await trackingHash("payment-rejected\n" + body.orderId + "\n" + snap.updateTime);
+            if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence,
+              ...trackingJobWrite(body.orderId, trackingEventId)], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
             return jsonResponse({ success: true, orderId: body.orderId, paymentStatus: "PAYMENT_REJECTED" });
           }
         } catch (e) { console.error("[Phase4A] mutation error:", e); return phase4aError("internal_error", "Internal error", 500); }
@@ -10422,6 +10869,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         catch { return jsonResponse({ success: false, error: "Unauthorized" }, 401); }
         const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
         return await handleAccountDeletion(request, env, accessToken, claims.sub, claims);
+      }
+      if (["/order-tracking/capabilities", "/order-tracking/register", "/order-tracking/rotate", "/order-tracking/end"].includes(path)) {
+        return handleOrderTrackingRequest(request, path, env);
       }
       const apiKey = request.headers.get("x-api-key");
       const hasServiceKey = !!apiKey && !!env.API_KEY && apiKey === env.API_KEY;
