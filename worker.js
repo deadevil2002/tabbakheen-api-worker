@@ -2538,6 +2538,7 @@
     const ADMIN_BROADCAST_MAX_PROCESS_CALLS = 1000;
     const RELEASE_REMINDER_COOLDOWN_MS = 72 * 60 * 60 * 1e3;
     const RELEASE_CURRENT_VERSION = "1.0.6";
+    const RELEASE_TEST_VERSION = "1.0.7";
     function compareReleaseSemver(left, right) {
       const parse = /* @__PURE__ */ __name((value) => String(value || "").split(".").map((part) => Number(part)), "parse");
       const a = parse(left);
@@ -2551,10 +2552,17 @@
       const comparison = compareReleaseSemver(record.appVersion, RELEASE_CURRENT_VERSION);
       return comparison !== null && comparison >= 0 ? "CURRENT" : "UPDATE_REQUIRED";
     }
+    function classifyReleaseDisplay(record) {
+      if (!record || !validClientSemver(record.appVersion)) return "UNKNOWN";
+      if (record.appVersion === RELEASE_TEST_VERSION) return "TEST_RELEASE";
+      if (record.appVersion === RELEASE_CURRENT_VERSION) return "PUBLIC_RELEASE";
+      return compareReleaseSemver(record.appVersion, RELEASE_CURRENT_VERSION) < 0 ? "OLDER" : "OTHER_REPORTED";
+    }
     function summarizeClientVersion(record) {
       return {
         appVersion: validClientSemver(record?.appVersion) ? record.appVersion : null,
         classification: classifyClientVersion(record),
+        displayCategory: classifyReleaseDisplay(record),
         lastReminderAt: typeof record?.lastReminderAt === "string" ? record.lastReminderAt : null
       };
     }
@@ -2574,8 +2582,9 @@
         ]);
         if (publicProfileDeletionActive(deletionSnapshot)) return { blocked: true };
         const previous = versionSnapshot?.data || null;
-        const comparison = validClientSemver(previous?.appVersion) ? compareReleaseSemver(parsed.appVersion, previous.appVersion) : 1;
-        if (comparison !== null && comparison <= 0) return { changed: false, appVersion: previous.appVersion };
+        // An account can report from more than one installation. Store the last
+        // received version, not the highest version ever observed for that UID.
+        if (previous?.appVersion === parsed.appVersion) return { changed: false, appVersion: previous.appVersion };
         const record = { appVersion: parsed.appVersion, updatedAt: nowIso, lastReminderAt: previous?.lastReminderAt || null };
         const writes = [
           { update: phase4aDoc("client_versions", uid, record), updateMask: { fieldPaths: Object.keys(record) }, currentDocument: versionSnapshot ? { updateTime: versionSnapshot.updateTime } : { exists: false } },
@@ -2605,17 +2614,19 @@
     function releaseIntelligenceForUsers(users, versions) {
       const versionByUid = new Map((versions || []).map((record) => [record._id || record.uid, record]));
       const counts = { CURRENT: 0, UPDATE_REQUIRED: 0, UNKNOWN: 0 };
+      const displayCounts = { TEST_RELEASE: 0, PUBLIC_RELEASE: 0, OLDER: 0, UNKNOWN: 0, OTHER_REPORTED: 0 };
       const distribution = {};
       const enrichedUsers = (users || []).map((user) => {
         const release = summarizeClientVersion(versionByUid.get(user._id));
         counts[release.classification]++;
+        displayCounts[release.displayCategory]++;
         const distributionKey = release.appVersion || "غير معروف";
         distribution[distributionKey] = (distribution[distributionKey] || 0) + 1;
         return { ...user, releaseIntelligence: release };
       });
       const totalUsers = (users || []).length;
       const adoptionPercent = totalUsers ? Math.round(counts.CURRENT * 1e4 / totalUsers) / 100 : 0;
-      return { users: enrichedUsers, counts, distribution, totalUsers, currentVersion: RELEASE_CURRENT_VERSION, adoptionPercent };
+      return { users: enrichedUsers, counts, displayCounts, distribution, totalUsers, currentVersion: RELEASE_CURRENT_VERSION, testVersion: RELEASE_TEST_VERSION, adoptionPercent };
     }
     function releaseReminderCandidate(user, release, nowMs = Date.now()) {
       if (!user || !release || release.classification !== "UPDATE_REQUIRED") return false;
@@ -6526,10 +6537,10 @@ function updateStaticLabels(){
 var TOKEN=sessionStorage.getItem("tbk_admin_token");
 var currentPage="dashboard";
 var allUsers=[];
-var releaseIntelligence={counts:{CURRENT:0,UPDATE_REQUIRED:0,UNKNOWN:0},distribution:{},totalUsers:0,currentVersion:"1.0.6",adoptionPercent:0};
+var releaseIntelligence={counts:{CURRENT:0,UPDATE_REQUIRED:0,UNKNOWN:0},displayCounts:{TEST_RELEASE:0,PUBLIC_RELEASE:0,OLDER:0,UNKNOWN:0,OTHER_REPORTED:0},distribution:{},totalUsers:0,currentVersion:"1.0.6",testVersion:"1.0.7",adoptionPercent:0};
 var releasePolling={timer:null,ageTimer:null,inFlight:false,controller:null,epoch:0,lastSignature:"",lastUpdatedAt:0,visibilityBound:false};
 function releaseDataSignature(data){
-  return JSON.stringify({counts:data&&data.counts||{},distribution:data&&data.distribution||{},totalUsers:data&&data.totalUsers||0,currentVersion:data&&data.currentVersion||"",users:(data&&data.users||[]).map(function(u){var r=u.releaseIntelligence||{};return [u._id||"",r.appVersion||"",r.classification||"UNKNOWN"];})});
+  return JSON.stringify({counts:data&&data.counts||{},displayCounts:data&&data.displayCounts||{},distribution:data&&data.distribution||{},totalUsers:data&&data.totalUsers||0,currentVersion:data&&data.currentVersion||"",users:(data&&data.users||[]).map(function(u){var r=u.releaseIntelligence||{};return [u._id||"",u.displayName||"",u.email||"",u.phone||"",u.role||"",u.accountStatus||"",r.appVersion||"",r.displayCategory||"UNKNOWN"];})});
 }
 function releaseLiveIndicator(){
   var el=document.getElementById("release-live-indicator");
@@ -6595,7 +6606,7 @@ function startReleasePolling(){
     });
     releasePolling.visibilityBound=true;
   }
-  releasePolling.lastSignature=releaseDataSignature({counts:releaseIntelligence.counts,distribution:releaseIntelligence.distribution,totalUsers:releaseIntelligence.totalUsers,currentVersion:releaseIntelligence.currentVersion,users:allUsers});
+  releasePolling.lastSignature=releaseDataSignature({counts:releaseIntelligence.counts,displayCounts:releaseIntelligence.displayCounts,distribution:releaseIntelligence.distribution,totalUsers:releaseIntelligence.totalUsers,currentVersion:releaseIntelligence.currentVersion,users:allUsers});
   releasePolling.lastUpdatedAt=Date.now();
   releaseLiveIndicator();
   scheduleReleaseLiveAge(releasePolling.epoch);
@@ -6924,7 +6935,7 @@ async function renderDashboard(c){
     '<div id="live-stat-verifiedAccounts" class="stat-card blue"><div class="label">'+(lang==="ar"?"الحسابات الموثقة":"Verified accounts")+'</div><div class="value">'+(s.verifiedAccounts||0)+'</div></div>'+
     '</div>'+
     '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"حالة إصدارات التطبيق":"App release health")+'</h2><p>'+(lang==="ar"?"ملخص المستخدمين حسب إصدار التطبيق المسجل لكل مستخدم.":"Users classified by their recorded app version.")+'</p></div><button class="btn btn-sm btn-secondary" onclick="navigate(\\'releases\\')">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button></div>'+
-    '<div class="release-grid"><div><div class="metric-label">على أحدث إصدار</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">يحتاجون تحديث</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">غير معروف</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
+    '<div class="release-grid"><div><div class="metric-label">على 1.0.6 أو أحدث</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">يحتاجون تحديث</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">غير معروف</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
     '<div id="drill-down"></div>';
 }
 
@@ -6997,17 +7008,25 @@ async function renderUsers(c){
   startReleasePolling();
 }
 
-function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",adoptionPercent:data.adoptionPercent||0};}
-function releaseStatusText(value){return value==="CURRENT"?"محدّث":value==="UPDATE_REQUIRED"?"يحتاج تحديث":"غير معروف";}
-function releaseStatusBadge(value){var cls=value==="CURRENT"?"status-current":value==="UPDATE_REQUIRED"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
-function releaseMetric(key,value,note){var labels={TOTAL:"إجمالي المستخدمين",CURRENT:"على أحدث إصدار",UPDATE_REQUIRED:"يحتاجون تحديث",UNKNOWN:"غير معروف",ADOPTION:"نسبة التحديث"};var cls=key==="CURRENT"?"current":key==="UPDATE_REQUIRED"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
-function knownReleaseVersions(){var values={};allUsers.forEach(function(u){var version=u.releaseIntelligence&&u.releaseIntelligence.appVersion;if(version)values[version]=true;});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
+function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},displayCounts:data.displayCounts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",testVersion:data.testVersion||"1.0.7",adoptionPercent:data.adoptionPercent||0};}
+function releaseStatusText(value){var labels={CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاج تحديث",TEST_RELEASE:"1.0.7 · جديد / تجريبي",PUBLIC_RELEASE:"1.0.6 · الإصدار العام",OLDER:"إصدار أقدم",OTHER_REPORTED:"إصدار آخر مُبلّغ عنه",UNKNOWN:"لم يُبلّغ عن إصدار"};return labels[value]||labels.UNKNOWN;}
+function releaseStatusBadge(value){var cls=value==="CURRENT"||value==="PUBLIC_RELEASE"?"status-current":value==="TEST_RELEASE"?"status-supported":value==="UPDATE_REQUIRED"||value==="OLDER"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
+function releaseMetric(key,value,note){var labels={TOTAL:"إجمالي المستخدمين",CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاجون تحديث",TEST_RELEASE:"1.0.7 · جديد / TestFlight / Internal Testing",PUBLIC_RELEASE:"1.0.6 · الإصدار العام الحالي",OLDER:"أقل من 1.0.6",OTHER_REPORTED:"إصدارات أخرى مُبلّغ عنها",UNKNOWN:"لم يُبلّغ عن إصدار",ADOPTION:"نسبة التحديث"};var cls=key==="CURRENT"||key==="PUBLIC_RELEASE"?"current":key==="TEST_RELEASE"?"supported":key==="UPDATE_REQUIRED"||key==="OLDER"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
+function knownReleaseVersions(){var values={"1.0.7":true,"1.0.6":true};allUsers.forEach(function(u){var version=u.releaseIntelligence&&u.releaseIntelligence.appVersion;if(version)values[version]=true;});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
+function refreshReleaseVersionFilter(){var select=document.getElementById("f-version");if(!select)return;var selected=select.value;select.innerHTML='<option value="">الإصدار: الكل</option>'+knownReleaseVersions().map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");select.value=selected;}
+function releaseCategoryMetric(key){var count=(releaseIntelligence.displayCounts||{})[key]||0,total=releaseIntelligence.totalUsers||0,pct=total?Math.round(count*1000/total)/10:0;return releaseMetric(key,count,pct+"% من إجمالي الحسابات");}
 
 async function renderReleaseIntelligence(c){
   var data=await api("/users");if(!data)return;allUsers=data.users||[];setReleaseIntelligence(data);
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">ملخص بسيط لإصدار التطبيق المسجل لكل مستخدم. الإصدار الحالي: <span id="release-current-version">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span></p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
-    '<div class="release-grid"><div id="release-metric-total">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+'</div><div id="release-metric-current">'+releaseMetric("CURRENT",(releaseIntelligence.counts||{}).CURRENT||0)+'</div><div id="release-metric-required">'+releaseMetric("UPDATE_REQUIRED",(releaseIntelligence.counts||{}).UPDATE_REQUIRED||0)+'</div><div id="release-metric-unknown">'+releaseMetric("UNKNOWN",(releaseIntelligence.counts||{}).UNKNOWN||0)+'</div><div id="release-metric-adoption">'+releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%")+'</div></div>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد المستخدمين المسجل لكل إصدار من التطبيق.</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>';
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">آخر إصدار أبلغ عنه كل حساب، وليس إصدار كل جهاز. الإصدار العام الحالي: <span id="release-current-version">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span> · 1.0.7 إصدار تجريبي ولا يغيّر أهلية تذكير مستخدمي 1.0.6.</p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
+    '<div class="release-grid"><div id="release-metric-total">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+'</div><div id="release-metric-test">'+releaseCategoryMetric("TEST_RELEASE")+'</div><div id="release-metric-public">'+releaseCategoryMetric("PUBLIC_RELEASE")+'</div><div id="release-metric-older">'+releaseCategoryMetric("OLDER")+'</div><div id="release-metric-unknown">'+releaseCategoryMetric("UNKNOWN")+'</div><div id="release-metric-other">'+releaseCategoryMetric("OTHER_REPORTED")+'</div></div>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد ونسبة الحسابات حسب آخر إصدار مُبلّغ عنه؛ غير المعروف لا يعني إصدارًا قديمًا.</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>إصدارات الحسابات</h2><p>تصفية حسب الإصدار الدقيق والدور والحساب؛ البيانات تخص الحساب لا التثبيت الفعلي.</p></div></div><div class="filters">'+
+    '<select id="f-role" aria-label="تصفية الدور" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
+    '<select id="f-release" aria-label="تصفية فئة الإصدار" onchange="filterUsers()"><option value="">فئة الإصدار: الكل</option><option value="TEST_RELEASE">1.0.7 · تجريبي</option><option value="PUBLIC_RELEASE">1.0.6 · عام</option><option value="OLDER">أقدم من 1.0.6</option><option value="UNKNOWN">لم يُبلّغ</option><option value="OTHER_REPORTED">إصدار آخر</option></select>'+
+    '<select id="f-version" aria-label="تصفية الإصدار الدقيق" onchange="filterUsers()"></select><input type="text" id="f-search" aria-label="تصفية الحساب بالاسم أو المعرّف" placeholder="ابحث باسم الحساب أو معرّفه" oninput="filterUsers()"></div>'+
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>آخر إصدار أبلغ عنه الحساب</th><th>فئة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>';
+  refreshReleaseVersionFilter();
   paintReleaseIntelligence();
   startReleasePolling();
 }
@@ -7016,17 +7035,21 @@ function paintReleaseIntelligence(){
   var set=function(id,html){var el=document.getElementById(id);if(el)el.innerHTML=html;};
   set("release-current-version",esc(releaseIntelligence.currentVersion||"1.0.6"));
   set("release-metric-total",releaseMetric("TOTAL",releaseIntelligence.totalUsers||0));
-  set("release-metric-current",releaseMetric("CURRENT",rc.CURRENT||0));
-  set("release-metric-required",releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0));
-  set("release-metric-unknown",releaseMetric("UNKNOWN",rc.UNKNOWN||0));
-  set("release-metric-adoption",releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%"));
+  set("release-metric-test",releaseCategoryMetric("TEST_RELEASE"));
+  set("release-metric-public",releaseCategoryMetric("PUBLIC_RELEASE"));
+  set("release-metric-older",releaseCategoryMetric("OLDER"));
+  set("release-metric-unknown",releaseCategoryMetric("UNKNOWN"));
+  set("release-metric-other",releaseCategoryMetric("OTHER_REPORTED"));
   var action=document.getElementById("release-reminder-action");
   if(action)action.innerHTML=(rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">إرسال تنبيه جماعي</button>':"";
   set("release-distribution",releaseDistributionHtml());
+  refreshReleaseVersionFilter();
+  filterUsers();
   releaseLiveIndicator();
 }
 function paintUsersTable(){
   var count=document.getElementById("users-count");if(count)count.textContent=allUsers.length;
+  refreshReleaseVersionFilter();
   filterUsers();
 }
 
@@ -7076,7 +7099,7 @@ function startAdminLivePolling(){
   refreshAdminLive(true,adminLiveState.epoch);scheduleAdminLivePolling(adminLiveState.epoch);
 }
 
-function releaseDistributionHtml(){var distribution=releaseIntelligence.distribution||{},grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(rows||'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
+function releaseDistributionHtml(){var distribution=Object.assign({"1.0.7":0,"1.0.6":0},releaseIntelligence.distribution||{}),grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(grand?rows:'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
 
 function filterUsers(){
   var role=document.getElementById("f-role")?document.getElementById("f-role").value:"";
@@ -7087,10 +7110,10 @@ function filterUsers(){
   var filtered=allUsers;
   if(role)filtered=filtered.filter(function(u){return u.role===role;});
   if(status)filtered=filtered.filter(function(u){return u.accountStatus===status;});
-  if(release)filtered=filtered.filter(function(u){return (u.releaseIntelligence&&u.releaseIntelligence.classification||"UNKNOWN")===release;});
+  if(release)filtered=filtered.filter(function(u){var r=u.releaseIntelligence||{};return (currentPage==="releases"?r.displayCategory:r.classification||"UNKNOWN")===release;});
   if(version)filtered=filtered.filter(function(u){return (u.releaseIntelligence&&u.releaseIntelligence.appVersion||"")===version;});
   if(search)filtered=filtered.filter(function(u){
-    return(u.displayName||"").toLowerCase().indexOf(search)>=0||(u.email||"").toLowerCase().indexOf(search)>=0||(u.phone||"").indexOf(search)>=0;
+    return(u._id||"").toLowerCase().indexOf(search)>=0||(u.displayName||"").toLowerCase().indexOf(search)>=0||(u.email||"").toLowerCase().indexOf(search)>=0||(u.phone||"").indexOf(search)>=0;
   });
   var tbody=document.getElementById("users-tbody");
   if(!tbody)return;
@@ -7102,7 +7125,7 @@ function filterUsers(){
       "<td>"+roleBadge(u.role)+"</td>"+
       "<td>"+statusBadge(u.accountStatus)+"</td>"+
       "<td><strong>"+esc(r.appVersion||"—")+"</strong></td>"+
-      "<td>"+releaseStatusBadge(r.classification)+"</td>"+
+      "<td>"+releaseStatusBadge(currentPage==="releases"?r.displayCategory:r.classification)+"</td>"+
       "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(r.classification==="UPDATE_REQUIRED"?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">طلب تحديث</button>":"")+"</div></td>"+
     "</tr>";
   }).join("");
@@ -9403,6 +9426,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         recordClientVersion,
         compareReleaseSemver,
         classifyClientVersion,
+        classifyReleaseDisplay,
         summarizeClientVersion,
         releaseIntelligenceForUsers,
         releaseReminderCandidate,

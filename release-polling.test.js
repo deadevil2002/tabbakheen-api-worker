@@ -19,10 +19,13 @@ assert(!refreshBody.includes("renderPage()"), "polling never performs a full pag
 assert(source.includes("paintReleaseIntelligence()") && source.includes("paintUsersTable()"), "only release fragments are repainted");
 assert(source.includes("ageTimer") && source.includes("scheduleReleaseLiveAge"), "live indicator ages without another request");
 
-// Mock the server changing one user's release classification: the polling
-// signature must change so the existing fragment painters run on the next cycle.
-const user = (version, classification) => ({_id: "u1", releaseIntelligence: {appVersion: version, classification}});
-const signature = users => JSON.stringify(users.map(u => [u._id, u.releaseIntelligence.appVersion, u.releaseIntelligence.classification]));
-assert.notStrictEqual(signature([user("1.0.5", "UPDATE_REQUIRED")]), signature([user("1.0.6", "CURRENT")]), "version changes trigger a silent repaint");
+// Evaluate the actual Admin polling signature, including the new test-release
+// category and account labels used by the App Releases table.
+const signatureSource = source.slice(source.indexOf("function releaseDataSignature("), source.indexOf("function releaseLiveIndicator(", source.indexOf("function releaseDataSignature(")));
+const signature = new Function(signatureSource + ";return releaseDataSignature;")();
+const user = (version, category, name = "Account") => ({_id: "u1", displayName: name, role: "customer", releaseIntelligence: {appVersion: version, displayCategory: category}});
+const payload = users => ({counts: {}, displayCounts: {}, distribution: {}, totalUsers: users.length, currentVersion: "1.0.6", users});
+assert.notStrictEqual(signature(payload([user("1.0.6", "PUBLIC_RELEASE")])), signature(payload([user("1.0.7", "TEST_RELEASE")])), "test-release version changes repaint without a full-page reload");
+assert.notStrictEqual(signature(payload([user("1.0.7", "TEST_RELEASE")])), signature(payload([user("1.0.7", "TEST_RELEASE", "Renamed account")])), "account-name changes refresh the table");
 
 console.log("release polling structural tests: PASS");
