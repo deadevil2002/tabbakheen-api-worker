@@ -1478,6 +1478,7 @@
       const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
       let fields;
       let notificationEvent = null;
+      let deletionFences = [];
       if (action === "cancel_driver_search") {
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
           return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
