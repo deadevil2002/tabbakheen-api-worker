@@ -903,8 +903,10 @@
       return normalized && normalized.length <= maximum ? normalized : null;
     }
     function validateCustomerDropoff(value, requireLabel = false) {
-      const expected = requireLabel ? ["lat", "lng", "addressLine", "city", "district", "label"] : ["lat", "lng", "addressLine", "city", "district"];
+      const hasShortAddress = requireLabel && value && Object.prototype.hasOwnProperty.call(value, "shortAddress");
+      const expected = requireLabel ? ["lat", "lng", "addressLine", "city", "district", "label", ...(hasShortAddress ? ["shortAddress"] : [])] : ["lat", "lng", "addressLine", "city", "district"];
       if (!exactObjectKeys(value, expected)) return { ok: false, code: value == null ? "CUSTOMER_DROPOFF_REQUIRED" : "CUSTOMER_DROPOFF_INVALID" };
+      if (hasShortAddress && (typeof value.shortAddress !== "string" || !/^[A-Z]{4}[0-9]{4}$/.test(value.shortAddress))) return { ok: false, code: "CUSTOMER_DROPOFF_INVALID" };
       if (!validSaudiCoordinatePair(value.lat, value.lng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
       const addressLine = boundedRequiredString(value.addressLine, 300);
       const city = boundedRequiredString(value.city, 120);
@@ -915,7 +917,7 @@
         if (typeof value.label !== "string" || value.label.trim().length > 80) return { ok: false, code: "CUSTOMER_DROPOFF_INVALID" };
         label = value.label.trim();
       }
-      return { ok: true, value: { lat: value.lat, lng: value.lng, addressLine, city, district, ...(requireLabel ? { label } : {}) } };
+      return { ok: true, value: { lat: value.lat, lng: value.lng, addressLine, city, district, ...(requireLabel ? { label } : {}), ...(hasShortAddress ? { shortAddress: value.shortAddress } : {}) } };
     }
     function customerDeliveryPreferenceDto(value) {
       if (!value) return null;
@@ -926,6 +928,7 @@
         city: typeof value.city === "string" ? value.city : "",
         district: typeof value.district === "string" ? value.district : "",
         label: typeof value.label === "string" ? value.label : "",
+        ...(typeof value.shortAddress === "string" && /^[A-Z]{4}[0-9]{4}$/.test(value.shortAddress) ? { shortAddress: value.shortAddress } : {}),
         updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : "",
         schemaVersion: Number.isInteger(value.schemaVersion) ? value.schemaVersion : 1
       };
@@ -3363,7 +3366,10 @@
         let preferenceFields = null;
         if (saveAsDefault) {
           const preference = read.get(preferenceName);
-          preferenceFields = { ...dropoff, label: typeof preference?.data?.label === "string" ? preference.data.label.slice(0, 80) : "", schemaVersion: 1 };
+          const saved = preference?.data;
+          const sameAddress = saved && ["lat", "lng", "addressLine", "city", "district"].every((field) => saved[field] === dropoff[field]);
+          preferenceFields = { ...dropoff, label: typeof saved?.label === "string" ? saved.label.slice(0, 80) : "",
+            ...(sameAddress && typeof saved.shortAddress === "string" && /^[A-Z]{4}[0-9]{4}$/.test(saved.shortAddress) ? { shortAddress: saved.shortAddress } : {}), schemaVersion: 1 };
           writes.push({ update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, preferenceFields),
             updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
             currentDocument: preference ? { updateTime: preference.updateTime } : { exists: false } });
@@ -9871,6 +9877,42 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(handleScheduledOutbox, "handleScheduledOutbox");
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
+    function complaintEmailContent(alert) {
+      const categoryLabels = {
+        customer_complaint: "بلاغ متعلق بالعميل",
+        provider_complaint: "بلاغ متعلق بمقدم الخدمة",
+        delivery_not_confirmed: "تعذر تأكيد التسليم",
+        customer_rejected_receipt: "اعتراض على استلام الطلب",
+        participant_safety: "بلاغ سلامة المشاركين",
+        order_chat_report: "بلاغ محادثة الطلب",
+        cash_funding_issue: "بلاغ تمويل التوصيل النقدي"
+      };
+      const compactReference = (value) => value.length <= 28 ? value : value.slice(0, 12) + "…" + value.slice(-6);
+      const complaintRef = escapeHtml(compactReference(alert.complaintId));
+      const orderRef = escapeHtml(compactReference(alert.orderId));
+      const category = escapeHtml(categoryLabels[alert.category]);
+      const submittedAt = escapeHtml(new Intl.DateTimeFormat("ar-SA-u-ca-gregory", {
+        timeZone: "Asia/Riyadh", year: "numeric", month: "long", day: "numeric",
+        hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+      }).format(new Date(alert.submittedAt)));
+      const adminUrl = "https://tabbakheen-api.tabbakheen.workers.dev/admin#complaints";
+      return {
+        subject: "طباخين | بلاغ جديد بانتظار المراجعة",
+        html: `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body dir="rtl" style="margin:0;padding:0;background:#fff7ed;color:#292524;font-family:Tahoma,Arial,sans-serif;text-align:right">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#fff7ed"><tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border:1px solid #fed7aa;border-radius:12px">
+<tr><td style="background:#ea580c;color:#ffffff;padding:22px 24px;font-size:22px;font-weight:bold">طباخين</td></tr>
+<tr><td style="padding:24px;font-size:15px;line-height:1.9">
+<h1 style="margin:0 0 12px;font-size:21px;line-height:1.5;color:#7c2d12">بلاغ جديد بانتظار المراجعة</h1>
+<p style="margin:0 0 18px">وصل بلاغ جديد إلى لوحة الإدارة. يُرجى فتح صفحة البلاغات للاطلاع عليه بعد تسجيل الدخول.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#fff7ed;border-radius:8px;font-size:14px;line-height:1.8">
+<tr><td style="padding:14px 16px">مرجع البلاغ: <b dir="ltr">${complaintRef}</b><br>مرجع الطلب: <b dir="ltr">${orderRef}</b><br>التصنيف: ${category}<br>وقت التقديم: ${submittedAt} (بتوقيت الرياض)</td></tr></table>
+<p style="margin:24px 0"><a href="${adminUrl}" style="display:inline-block;background:#ea580c;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:bold">فتح بلاغات الإدارة</a></p>
+<p style="margin:0;color:#78716c;font-size:12px">هذا التنبيه موجز ولا يحتوي على تفاصيل البلاغ الخاصة.</p>
+</td></tr></table></td></tr></table></body></html>`
+      };
+    }
     async function handleScheduledComplaintEmailAlert(env, accessToken) {
       // One durable complaint alert per invocation. The existing rotating Cron
       // cursor prevents a missing recipient or leased alert from hiding others.
@@ -9899,11 +9941,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             typeof alert.submittedAt !== "string" || !Number.isFinite(Date.parse(alert.submittedAt)))
           return (await update({ status: "needs_review", lastErrorCode: "invalid_alert_record" })).ok;
         from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
-        subject = "New Tabbakheen complaint";
-        html = "<p>A new complaint is available in Tabbakheen Admin.</p>" +
-          "<p>Complaint reference: " + escapeHtml(alert.complaintId) + "<br>Order reference: " + escapeHtml(alert.orderId) +
-          "<br>Category: " + escapeHtml(alert.category) + "<br>Submitted: " + escapeHtml(alert.submittedAt) + "</p>" +
-          '<p><a href="https://tabbakheen-api.tabbakheen.workers.dev/admin#complaints">Open authenticated Admin complaints</a></p>';
+        ({ subject, html } = complaintEmailContent(alert));
       } else if (publicAppSettingsDto({ supportEmail: recipient }).supportEmail !== recipient ||
           typeof subject !== "string" || typeof html !== "string" || typeof from !== "string")
         return (await update({ status: "needs_review", lastErrorCode: "invalid_frozen_alert" })).ok;
@@ -10020,6 +10058,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         resumeAccountDeletionsWithAccessToken,
         cronQueueNext,
         handleScheduledOutbox,
+        complaintEmailContent,
         handleScheduledComplaintEmailAlert,
         handleScheduledMaintenance,
         handleScheduledMaintenanceWithAccessToken,

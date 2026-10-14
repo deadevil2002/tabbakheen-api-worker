@@ -122,6 +122,31 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   put('users/provider-2', { role: 'provider', accountStatus: 'active', displayName: 'Other provider' });
   put('users/customer-1', { role: 'customer', accountStatus: 'active', displayName: 'Customer', phone: 'PRIVATE', email: 'PRIVATE', photoUrl: 'https://private.invalid/customer' });
   put('users/driver-1', { role: 'driver', accountStatus: 'active', displayName: 'Driver', phone: 'PRIVATE' });
+  const privateLocation = { lat: 24.7, lng: 46.7, addressLine: 'Synthetic street', city: 'Riyadh', district: 'Olaya', label: 'Home', shortAddress: 'ENAB2500' };
+  assert.equal((await run(req('/customers/delivery-location', '', privateLocation))).status, 401);
+  assert.equal((await run(req('/customers/delivery-location', 'driver-1', privateLocation))).status, 403);
+  assert.equal((await run(req('/customers/delivery-location', 'customer-1', { ...privateLocation, shortAddress: 'enab2500' }))).status, 422);
+  const savedPrivate = await run(req('/customers/delivery-location', 'customer-1', privateLocation));
+  assert.equal(savedPrivate.status, 200, 'customer may save a valid optional short address');
+  assert.equal((await savedPrivate.json()).location.shortAddress, 'ENAB2500');
+  assert.equal(docs.get('customer_delivery_preferences/customer-1')?.data.shortAddress, 'ENAB2500', 'short address is persisted in the private preference only');
+  assert.equal((await (await run(req('/customers/delivery-location', 'customer-1'))).json()).location.shortAddress, 'ENAB2500');
+  assert.equal((await run(req('/customers/delivery-location', 'driver-1'))).status, 403, 'other roles cannot read the private preference');
+  assert(!docs.get('public_profiles/customer-1')?.data?.shortAddress, 'not projected into public profile');
+  put('app_settings/main', { deliveryPricing: { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 } });
+  put('orders/location-quote-a', { customerUid: 'customer-1', providerUid: 'provider-1', status: 'ready_for_pickup', driverUid: null, providerLat: 24.7, providerLng: 46.7 });
+  const quoteDropoff = { lat: privateLocation.lat, lng: privateLocation.lng, addressLine: privateLocation.addressLine, city: privateLocation.city, district: privateLocation.district };
+  assert.equal((await run(req('/delivery-quote-v2', 'customer-1', { orderId: 'location-quote-a', dropoff: quoteDropoff, saveAsDefault: true }))).status, 200);
+  assert.equal(docs.get('customer_delivery_preferences/customer-1').data.shortAddress, 'ENAB2500', 'same-address quote preserves the saved code');
+  put('orders/location-quote-b', { customerUid: 'customer-1', providerUid: 'provider-1', status: 'ready_for_pickup', driverUid: null, providerLat: 24.7, providerLng: 46.7 });
+  assert.equal((await run(req('/delivery-quote-v2', 'customer-1', { orderId: 'location-quote-b', dropoff: { ...quoteDropoff, addressLine: 'Another synthetic street' }, saveAsDefault: true }))).status, 200);
+  assert(!('shortAddress' in docs.get('customer_delivery_preferences/customer-1').data), 'changing address clears a stale short address');
+  assert([...docs.entries()].filter(([path]) => path.startsWith('delivery_quotes/')).every(([, item]) => !('shortAddress' in item.data)), 'quotes stay free of the short address');
+  docs.delete('app_settings/main');
+  const legacyLocation = { lat: 24.7, lng: 46.7, addressLine: 'Synthetic street', city: 'Riyadh', district: 'Olaya', label: 'Home' };
+  assert.equal((await run(req('/customers/delivery-location', 'customer-1', legacyLocation))).status, 200, '1.0.6 request shape still saves');
+  assert(!('shortAddress' in (await (await run(req('/customers/delivery-location', 'customer-1'))).json()).location), 'omitting the optional field retains the legacy response shape');
+  const writesBeforeComplaintFlow = writes;
   put('orders/order-1', { providerUid: 'provider-1', customerUid: 'customer-1', status: 'pending', customerLat: 25, customerLng: 46, dropoffAddress: 'PRIVATE' });
   const summaryPath = '/orders/order-1/participant-summary';
   assert.equal((await run(req(summaryPath, ''))).status, 401);
@@ -224,7 +249,7 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
     { type: 'participant_safety', reviewFinding: 'substantiated', targetAccountUid: 'customer-1', orderId: 'two' }
   ]).repeatedSubstantiatedAccountsForManualReview, 1, 'manual pattern flag needs distinct orders');
   assert(!JSON.stringify((await (await run(req('/complaints/mine', 'provider-1'))).json())).includes('substantiated'));
-  assert(writes <= 5, 'bounded writes for report, one durable email alert, response and review');
+  assert(writes - writesBeforeComplaintFlow <= 5, 'bounded writes for report, one durable email alert, response and review');
   const legacy = { orderId: 'order-1', type: 'customer_complaint', target: 'provider', note: 'Existing client complaint' };
   const legacyResponse = await run(req('/complaints/create', 'customer-1', legacy));
   assert.equal(legacyResponse.status, 200, 'legacy complaint request preserved');
@@ -547,6 +572,25 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
     assert.deepEqual(Object.keys(item.data).sort(), ['attempts', 'category', 'complaintId', 'createdAt', 'orderId', 'status', 'submittedAt', 'updatedAt'].sort(), 'alert stores metadata, not narrative or private data');
   }
   const emailEnv = { EMAIL_API_KEY: 'offline-resend-key', EMAIL_FROM: 'Tabbakheen <offline@example.invalid>' };
+  const arabicCategories = {
+    customer_complaint: 'بلاغ متعلق بالعميل', provider_complaint: 'بلاغ متعلق بمقدم الخدمة',
+    delivery_not_confirmed: 'تعذر تأكيد التسليم', customer_rejected_receipt: 'اعتراض على استلام الطلب',
+    participant_safety: 'بلاغ سلامة المشاركين', order_chat_report: 'بلاغ محادثة الطلب',
+    cash_funding_issue: 'بلاغ تمويل التوصيل النقدي'
+  };
+  for (const [category, label] of Object.entries(arabicCategories)) {
+    const content = hooks.complaintEmailContent({ complaintId: 'case-1', orderId: 'order-1', category, submittedAt: '2026-10-14T12:00:00Z' });
+    assert.equal(content.subject, 'طباخين | بلاغ جديد بانتظار المراجعة');
+    assert(content.html.includes('lang="ar" dir="rtl"') && content.html.includes('name="viewport"'));
+    assert(content.html.includes(label) && content.html.includes('بتوقيت الرياض'));
+    assert(content.html.includes(new Intl.DateTimeFormat('ar-SA-u-ca-gregory', {
+      timeZone: 'Asia/Riyadh', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+    }).format(new Date('2026-10-14T12:00:00Z'))));
+    assert(content.html.includes('/admin#complaints'));
+  }
+  const safeContent = hooks.complaintEmailContent({ complaintId: '<img src=x onerror=1>' + 'x'.repeat(50),
+    orderId: '<script>alert(1)</script>', category: 'customer_complaint', submittedAt: '2026-10-14T12:00:00Z' });
+  assert(!safeContent.html.includes('<script>') && !safeContent.html.includes('<img') && !safeContent.html.includes('x'.repeat(50)), 'dynamic references are escaped and compact');
   requests = 0;
   assert.equal(await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth'), true);
   assert(requests <= 12, 'missing-recipient alert attempt is bounded');
@@ -582,5 +626,16 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert(emails.some((item) => item.payload.to[0] === 'first@example.invalid'), 'first delivery uses the then-current configured address');
   assert(emails.some((item) => item.payload.to[0] === 'second@example.invalid'), 'subsequent unfrozen alerts use the changed Admin Support Email');
   assert(emails.every((item) => item.payload.html.includes('/admin#complaints') && !item.payload.html.includes('PRIVATE')), 'email links to authenticated Admin without narrative');
+  assert(emails.every((item) => item.payload.subject === 'طباخين | بلاغ جديد بانتظار المراجعة' && item.payload.html.includes('dir="rtl"')), 'new alerts use Arabic RTL template');
+  const frozenId = 'a_' + 'f'.repeat(48), frozenHtml = '<p>Previously frozen notification</p><a href="https://tabbakheen-api.tabbakheen.workers.dev/admin#complaints">Admin</a>';
+  put('complaint_email_alerts/' + frozenId, { status: 'pending', complaintId: 'case-frozen', orderId: 'order-frozen',
+    category: 'customer_complaint', submittedAt: '2026-10-14T12:00:00Z', attempts: 1, firstAttemptAt: new Date().toISOString(),
+    recipient: 'first@example.invalid', subject: 'Previously frozen subject', html: frozenHtml, from: emailEnv.EMAIL_FROM });
+  assert.equal(await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth'), true);
+  assert.equal(emails.at(-1).payload.subject, 'Previously frozen subject', 'frozen subject is not rewritten');
+  assert.equal(emails.at(-1).payload.html, frozenHtml, 'frozen HTML is not rewritten');
+  const sentCount = emails.length;
+  await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth');
+  assert.equal(emails.length, sentCount, 'sent alerts are not resent');
   console.log('participant-safety + cash-funding V1 + complaint alerts offline: PASS (Admin routing, dynamic recipient, bounded retries, provider failure/lost response, privacy, legacy, strict REST Writes)');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
