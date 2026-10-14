@@ -2004,7 +2004,7 @@
         source: complaint.source,
         target: typeof complaint.target === "string" ? complaint.target : "",
         type: typeof complaint.type === "string" ? complaint.type : "",
-        reasonCode: complaint.type === 'participant_safety' && typeof complaint.reasonCode === 'string' ? complaint.reasonCode : '',
+        ...(complaint.type === 'participant_safety' ? { reasonCode: typeof complaint.reasonCode === 'string' ? complaint.reasonCode : '' } : {}),
         complaintStatus: complaint.complaintStatus,
         note: typeof complaint.note === "string" ? complaint.note : "",
         adminNote: typeof complaint.adminNote === "string" ? complaint.adminNote : "",

@@ -165,7 +165,9 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert(!JSON.stringify((await (await run(req('/complaints/mine', 'provider-1'))).json())).includes('substantiated'));
   assert(writes <= 4, 'bounded writes for report, response and review');
   const legacy = { orderId: 'order-1', type: 'customer_complaint', target: 'provider', note: 'Existing client complaint' };
-  assert.equal((await run(req('/complaints/create', 'customer-1', legacy))).status, 200, 'legacy complaint request preserved');
+  const legacyResponse = await run(req('/complaints/create', 'customer-1', legacy));
+  assert.equal(legacyResponse.status, 200, 'legacy complaint request preserved');
+  assert(!('reasonCode' in (await legacyResponse.json()).complaint), 'legacy complaint DTO shape preserved');
   const rating = { orderId: 'order-1', type: 'provider', stars: 5, comment: 'Good service' };
   failPublicProfileRead = true;
   const rated = await run(req('/ratings/submit', 'customer-1', rating)); assert.equal(rated.status, 200, 'committed rating is not reported failed when projection read fails');
