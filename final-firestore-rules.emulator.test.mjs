@@ -117,6 +117,9 @@ async function seed() {
       setDoc(doc(admin, 'verifications', 'P1'), { crNumber: 'private', status: 'verified' }),
       setDoc(doc(admin, 'provider_ratings', 'P1', 'ratings', 'O1'), { customerUid: 'C1', stars: 5 }),
       setDoc(doc(admin, 'delivery_complaints', 'K1'), { orderId: 'O1', note: 'private' }),
+      setDoc(doc(admin, 'order_cash_funding_events', 'O1_driver_consent_1'), { orderId: 'O1', actorUid: 'D1', amountSar: 25 }),
+      setDoc(doc(admin, 'order_delivery_private', 'O1'), { addressLine: 'private address', dropoffLat: 24.7 }),
+      setDoc(doc(admin, 'order_transition_events', 'O1_driver_assigned_1'), { orderId: 'O1', status: 'pending' }),
       setDoc(doc(admin, 'app_settings', 'main'), { adminSecret: 'not-public' }),
       setDoc(doc(admin, 'app_settings', 'public'), { bannerEnabled: true, supportEmail: 'help@example.test' }),
     ]);
@@ -188,6 +191,16 @@ try {
     ['J raw provider rating', () => getDoc(doc(db('C1'), 'provider_ratings', 'P1', 'ratings', 'O1'))],
     ['J raw delivery complaint', () => getDoc(doc(db('C1'), 'delivery_complaints', 'K1'))],
   ]) await check(id, assertFails(action()));
+
+  // New funded-delivery records are Worker-only, including for order participants.
+  for (const [path, value] of [
+    ['order_cash_funding_events/O1_driver_consent_1', { orderId: 'O1', actorUid: 'D1' }],
+    ['order_delivery_private/O1', { addressLine: 'forged address' }],
+    ['order_transition_events/O1_driver_assigned_1', { status: 'sent' }],
+  ]) {
+    await check(`K participant cannot read ${path}`, assertFails(getDoc(doc(db('C1'), path))));
+    await check(`K participant cannot write ${path}`, assertFails(setDoc(doc(db('C1'), path), value)));
+  }
 
   // M–N: participant-only reads, constrained queries, and all direct writes denied.
   for (const uid of ['C1', 'P1', 'D1']) {
