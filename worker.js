@@ -2004,12 +2004,84 @@
         source: complaint.source,
         target: typeof complaint.target === "string" ? complaint.target : "",
         type: typeof complaint.type === "string" ? complaint.type : "",
+        reasonCode: complaint.type === 'participant_safety' && typeof complaint.reasonCode === 'string' ? complaint.reasonCode : '',
         complaintStatus: complaint.complaintStatus,
         note: typeof complaint.note === "string" ? complaint.note : "",
         adminNote: typeof complaint.adminNote === "string" ? complaint.adminNote : "",
         createdAt: typeof complaint.createdAt === "string" ? complaint.createdAt : "",
         updatedAt: typeof complaint.updatedAt === "string" ? complaint.updatedAt : ""
       };
+    }
+    function complaintSafetySummary(complaints, nowMs = Date.now()) {
+      const items = Array.isArray(complaints) ? complaints : [];
+      const substantiatedByTarget = new Map();
+      for (const item of items) {
+        if (item.type !== 'participant_safety' || item.reviewFinding !== 'substantiated' || !phase4aSafeSegment(item.targetAccountUid)) continue;
+        if (!substantiatedByTarget.has(item.targetAccountUid)) substantiatedByTarget.set(item.targetAccountUid, new Set());
+        substantiatedByTarget.get(item.targetAccountUid).add(item.orderId);
+      }
+      return {
+        total: items.length,
+        pending: items.filter((item) => item.complaintStatus === 'pending').length,
+        substantiated: items.filter((item) => item.type === 'participant_safety' && item.reviewFinding === 'substantiated').length,
+        unsubstantiated: items.filter((item) => item.type === 'participant_safety' && item.reviewFinding === 'unsubstantiated').length,
+        distinctOrders: new Set(items.map((item) => item.orderId).filter(Boolean)).size,
+        last7Days: items.filter((item) => Number.isFinite(Date.parse(item.createdAt)) && Date.parse(item.createdAt) >= nowMs - 7 * 864e5 && Date.parse(item.createdAt) <= nowMs).length,
+        last30Days: items.filter((item) => Number.isFinite(Date.parse(item.createdAt)) && Date.parse(item.createdAt) >= nowMs - 30 * 864e5 && Date.parse(item.createdAt) <= nowMs).length,
+        repeatedSubstantiatedAccountsForManualReview: [...substantiatedByTarget.values()].filter((orders) => orders.size >= 2).length,
+        seriousPendingForManualReview: items.filter((item) => item.type === 'participant_safety' && item.reviewFinding === 'pending' && ['abuse_or_threats', 'suspected_fraud'].includes(item.reasonCode)).length
+      };
+    }
+    function participantSafetyTarget(role, target, reason) {
+      if (!['customer', 'provider', 'driver'].includes(role) || !['customer', 'provider', 'driver'].includes(target) || role === target) return false;
+      if (reason === 'customer_received_unpaid') return role === 'provider' && target === 'customer';
+      if (reason === 'customer_no_show') return ['provider', 'driver'].includes(role) && target === 'customer';
+      if (reason === 'assigned_driver_problem') return ['customer', 'provider'].includes(role) && target === 'driver';
+      return ['abuse_or_threats', 'suspected_fraud', 'other'].includes(reason);
+    }
+    function orderAssignedDriverUid(order) {
+      return phase4aSafeSegment(order?.driverUid) && ['driver_assigned', 'picked_up', 'arrived', 'delivered_pending_confirmation', 'delivered'].includes(order.deliveryStatus) ? order.driverUid : null;
+    }
+    async function participantAccountAvailable(uid, role, accessToken) {
+      if (!phase4aSafeSegment(uid)) return null;
+      const [user, deletion, marker] = await Promise.all([
+        getFirestoreDoc('users', uid, accessToken),
+        getFirestoreDoc('account_deletion_requests', uid, accessToken),
+        getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken)
+      ]);
+      if (!user || user.role !== role || user.accountStatus === 'suspended' || user.accountStatus === 'disabled' || marker || deletion) return null;
+      return user;
+    }
+    async function handleOrderParticipantSummary(request, orderId, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      if (auth.user.role !== 'provider' || !phase4aSafeSegment(orderId)) return phase4aError('forbidden', 'Participant summary unavailable', 403);
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+      const order = await getFirestoreDoc('orders', orderId, accessToken);
+      if (!order || order.providerUid !== auth.uid) return phase4aError('not_found', 'Participant summary unavailable', 404);
+      const customer = await participantAccountAvailable(order.customerUid, 'customer', accessToken);
+      if (!customer) return phase4aError('participant_unavailable', 'Participant unavailable', 409);
+      const result = {
+        success: true, orderId,
+        customer: { displayName: String(customer.displayName || '').trim().slice(0, 120), avatarUrl: null },
+        driver: null
+      };
+      // A driver is disclosed only after an authoritative order assignment.
+      const assignedDriverUid = orderAssignedDriverUid(order);
+      if (assignedDriverUid) {
+        const driver = await participantAccountAvailable(assignedDriverUid, 'driver', accessToken);
+        if (driver) {
+          const publicDriver = await getFirestoreDoc('public_profiles', assignedDriverUid, accessToken);
+          result.driver = {
+            displayName: String(driver.displayName || '').trim().slice(0, 120),
+            // A public photo is not proof of avatar-specific approval.
+            avatarUrl: null,
+            ratingAverage: publicDriver?.role === 'driver' && Number.isFinite(publicDriver.ratingAverage) ? Math.max(0, Math.min(5, publicDriver.ratingAverage)) : 0,
+            ratingCount: publicDriver?.role === 'driver' && Number.isInteger(publicDriver.ratingCount) ? Math.max(0, publicDriver.ratingCount) : 0
+          };
+        }
+      }
+      return jsonResponse(result);
     }
     async function handleMyComplaints(request, accessToken) {
       const auth = await phase4aAuth(request, accessToken);
@@ -2030,6 +2102,33 @@
       const auth = await phase4aAuth(request, accessToken);
       if (auth.response) return auth.response;
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid complaint"); }
+      if (body?.type === 'participant_safety') {
+        if (!phase4aKeysOnly(body, ['orderId', 'type', 'reasonCode', 'target', 'note']) || !phase4aSafeSegment(body.orderId) || !participantSafetyTarget(auth.user.role, body.target, body.reasonCode) || typeof body.note !== 'string' || Array.from(body.note.trim()).length < 10 || Array.from(body.note).length > 500) return phase4aError('invalid_request', 'Invalid safety report');
+        const orderSnapshot = await getFirestoreSnapshot('orders', body.orderId, accessToken);
+        const order = orderSnapshot?.data;
+        const role = auth.user.role;
+        if (!order || order[role + 'Uid'] !== auth.uid) return phase4aError('forbidden', 'Report unavailable', 403);
+        if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+        const targetUid = order[body.target + 'Uid'];
+        if (!phase4aSafeSegment(targetUid) || targetUid === auth.uid || body.target === 'driver' && orderAssignedDriverUid(order) !== targetUid) return phase4aError('forbidden', 'Report target unavailable', 403);
+        const id = 'safety_' + body.orderId + '_' + auth.uid + '_' + body.target;
+        const report = {
+          orderId: body.orderId, reporterUid: auth.uid, targetAccountUid: targetUid,
+          source: role, target: body.target, type: 'participant_safety', reasonCode: body.reasonCode,
+          note: body.note.trim(), complaintStatus: 'pending', reviewFinding: 'pending',
+          createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+        };
+        const existing = await getFirestoreDoc('delivery_complaints', id, accessToken);
+        if (existing) return existing.reporterUid === auth.uid && existing.orderId === body.orderId && existing.targetAccountUid === targetUid && existing.reasonCode === report.reasonCode && existing.note === report.note ? jsonResponse({ success: true, idempotent: true, complaint: complaintRefDto(existing) }) : phase4aError('idempotency_conflict', 'Safety report already exists', 409);
+        const created = await phase4aCommit([
+          { update: phase4aDoc('delivery_complaints', id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } },
+          { verify: 'projects/tabbakheen-99883/databases/(default)/documents/orders/' + body.orderId, currentDocument: { updateTime: orderSnapshot.updateTime } },
+          { verify: 'projects/tabbakheen-99883/databases/(default)/documents/' + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + '/' + auth.uid, currentDocument: { exists: false } },
+          auth.deletionFence
+        ], accessToken);
+        if (!created) return phase4aError('state_conflict', 'Report changed; retry', 409);
+        return jsonResponse({ success: true, complaint: complaintRefDto({ ...report, _id: id }) });
+      }
       if (!phase4aKeysOnly(body, ["orderId", "type", "note", "target"]) || !phase4aSafeSegment(body?.orderId) || !["customer_rejected_receipt", "delivery_not_confirmed", "customer_complaint", "provider_complaint"].includes(body?.type) || typeof body?.note !== "string" || Array.from(body.note).length > 500 || (body.target !== undefined && !["customer", "provider", "driver"].includes(body.target))) return phase4aError("invalid_request", "Invalid complaint");
       const order = await getFirestoreDoc("orders", body.orderId, accessToken);
       const role = auth.user.role;
@@ -2042,6 +2141,30 @@
       if (existing) return existing.source === role && existing.orderId === body.orderId ? jsonResponse({ success: true, idempotent: true, complaint: complaintRefDto(existing) }) : phase4aError("idempotency_conflict", "Complaint already exists", 409);
       const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, auth.deletionFence], accessToken);
       return created ? jsonResponse({ success: true, complaint: complaintRefDto({ ...report, _id: id }) }) : phase4aError("state_conflict", "Complaint changed; retry", 409);
+    }
+    async function handleSafetyReportResponse(request, complaintId, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      if (!phase4aSafeSegment(complaintId)) return phase4aError('invalid_request', 'Invalid safety report');
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+      let body; try { body = await request.json(); } catch { return phase4aError('invalid_request', 'Invalid response'); }
+      if (!phase4aKeysOnly(body, ['response']) || typeof body.response !== 'string' || Array.from(body.response.trim()).length < 10 || Array.from(body.response).length > 1000) return phase4aError('invalid_request', 'Invalid response');
+      const snapshot = await getFirestoreSnapshot('delivery_complaints', complaintId, accessToken);
+      const report = snapshot?.data;
+      if (!report || report.type !== 'participant_safety' || report.target !== auth.user.role || report.targetAccountUid !== auth.uid) return phase4aError('not_found', 'Safety report unavailable', 404);
+      const orderSnapshot = await getFirestoreSnapshot('orders', report.orderId, accessToken);
+      const order = orderSnapshot?.data;
+      if (!order || order[report.target + 'Uid'] !== auth.uid || order[report.source + 'Uid'] !== report.reporterUid) return phase4aError('not_found', 'Safety report unavailable', 404);
+      const response = body.response.trim();
+      if (report.targetResponse) return report.targetResponse === response ? jsonResponse({ success: true, idempotent: true }) : phase4aError('response_exists', 'Response already recorded', 409);
+      const fields = { targetResponse: response, targetRespondedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      const committed = await phase4aCommit([
+        { update: phase4aDoc('delivery_complaints', complaintId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snapshot.updateTime } },
+        { verify: 'projects/tabbakheen-99883/databases/(default)/documents/orders/' + report.orderId, currentDocument: { updateTime: orderSnapshot.updateTime } },
+        { verify: 'projects/tabbakheen-99883/databases/(default)/documents/' + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + '/' + auth.uid, currentDocument: { exists: false } },
+        auth.deletionFence
+      ], accessToken);
+      return committed ? jsonResponse({ success: true }) : phase4aError('state_conflict', 'Report changed; retry', 409);
     }
     async function createFirestoreDocument(collectionPath, docId, fields, accessToken) {
       const url = docId ? `${FIRESTORE_BASE}/${collectionPath}/${docId}` : `${FIRESTORE_BASE}/${collectionPath}`;
@@ -6753,6 +6876,7 @@ function complaintStatusBadge(status){
 function complaintStatusLabel(status){return ct(status==="pending"?"pending":status==="resolved"?"resolved":status==="closed"?"closed":"unknown");}
 function complaintTypeLabel(type){
   if(type==="order_chat_report")return lang==="ar"?"بلاغ محادثة الطلب":"Order chat report";
+  if(type==="participant_safety")return lang==="ar"?"بلاغ سلامة مشارك":"Participant safety report";
   var m={customer_complaint:"customerComplaint",provider_complaint:"providerComplaint",delivery_not_confirmed:"deliveryNotConfirmed",customer_rejected_receipt:"customerRejectedReceipt"};
   return ct(m[type]||"unknown");
 }
@@ -6776,8 +6900,13 @@ async function renderComplaints(c){
   var cards=["all","pending","resolved","closed"].map(function(s){
     return '<button class="stat-card '+(complaintFilter.status===s?"selected":"")+'" data-status="'+s+'" onclick="setComplaintStatusFilter(this.dataset.status)" style="text-align:inherit;cursor:pointer"><div class="stat-label">'+ct(s)+'</div><div class="stat-value">'+counts[s]+'</div></button>';
   }).join("");
+  var safety=data.safetySummary||{};
+  var safetyLabels=lang==="ar"?["مثبتة","غير مثبتة","طلبات مختلفة","آخر 7 أيام","آخر 30 يومًا","حسابات للمراجعة اليدوية","بلاغات خطيرة قيد المراجعة"]:["Substantiated","Unsubstantiated","Distinct orders","Last 7 days","Last 30 days","Accounts for manual review","Serious reports for manual review"];
+  var safetyValues=[safety.substantiated,safety.unsubstantiated,safety.distinctOrders,safety.last7Days,safety.last30Days,safety.repeatedSubstantiatedAccountsForManualReview,safety.seriousPendingForManualReview];
+  var safetyCards=safetyLabels.map(function(label,i){return '<div class="stat-card"><div class="stat-label">'+esc(label)+'</div><div class="stat-value">'+esc(String(Number(safetyValues[i])||0))+'</div></div>';}).join("");
   c.innerHTML='<h1 class="page-title">'+ct("title")+'</h1>'+
     '<div class="stats-grid complaint-stats">'+cards+'</div>'+
+    '<div class="stats-grid complaint-stats">'+safetyCards+'</div>'+
     '<div class="settings-section">'+
     '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">'+
     '<input id="complaint-search" type="search" value="'+esc(complaintFilter.search)+'" placeholder="'+ct("search")+'" style="flex:1;min-width:220px;padding:9px;border:1px solid var(--border);border-radius:6px" oninput="filterComplaints(this.value)">'+
@@ -6827,6 +6956,7 @@ async function viewComplaint(id){
   if(!data||!data.complaint){closeModal();toast((data&&data.error)||ct("saveFailed"),"error");return;}
   var x=data.complaint;
   var chatContext=x.type==="order_chat_report"?'<div class="form-group"><label>'+(lang==="ar"?"الرسالة المُبلّغ عنها":"Reported chat message")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+((x.reportedChatContext||[]).map(function(m){return '<div><strong>'+esc(complaintRoleLabel(m.senderRole))+'</strong><div>'+esc(m.text||"")+'</div><small>'+complaintDate(m.createdAt)+'</small></div>';}).join("")||(lang==="ar"?"لا توجد رسالة مرتبطة بهذا البلاغ":"No message is attached to this report"))+'</div></div>':"";
+  var safetyReview=x.type==="participant_safety"?'<div class="form-group"><label>'+(lang==="ar"?"سبب البلاغ":"Report reason")+'</label><strong>'+esc(x.reasonCode||"")+'</strong></div><div class="form-group"><label>'+(lang==="ar"?"رد الطرف المعني":"Reported participant response")+'</label><div style="white-space:pre-wrap">'+esc(x.targetResponse||"-")+'</div></div><div class="form-group"><label for="safety-finding">'+(lang==="ar"?"نتيجة المراجعة الخاصة بالإدارة":"Private review finding")+'</label><select id="safety-finding" style="width:100%">'+["pending","substantiated","unsubstantiated"].map(function(s){return '<option value="'+s+'" '+(x.reviewFinding===s?"selected":"")+'>'+esc(s)+'</option>';}).join("")+'</select></div><div class="form-group"><label for="safety-review-note">'+(lang==="ar"?"مبرر المراجعة":"Review rationale")+'</label><textarea id="safety-review-note" rows="3" maxlength="2000" style="width:100%">'+esc(x.reviewNote||"")+'</textarea></div><button class="btn btn-secondary" data-id="'+esc(x.id)+'" onclick="saveSafetyReview(this.dataset.id)">'+(lang==="ar"?"حفظ المراجعة الخاصة":"Save private review")+'</button>':"";
   openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span style="font-size:13px;color:var(--text2)">#'+esc(x.orderNumber||x.orderId||x.id)+'</span></h3>'+
     '<div class="detail-grid">'+
     '<div><label>'+ct("orderNumber")+'</label><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong></div>'+
@@ -6838,11 +6968,17 @@ async function viewComplaint(id){
     '<div><label>'+ct("driver")+'</label>'+complaintPerson(x,"driver")+'</div>'+
     '<div><label>'+ct("created")+'</label><strong>'+complaintDate(x.createdAt)+'</strong></div>'+
     '</div>'+
-    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+
+    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+safetyReview+
     '<div class="form-group"><label for="complaint-status">'+ct("status")+'</label><select id="complaint-status" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px">'+["pending","resolved","closed"].map(function(s){return'<option value="'+s+'" '+(x.complaintStatus===s?"selected":"")+'>'+ct(s)+'</option>';}).join("")+'</select></div>'+
     '<div class="form-group"><label for="complaint-admin-note">'+ct("adminReply")+'</label><textarea id="complaint-admin-note" rows="4" maxlength="4000" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;resize:vertical">'+esc(x.adminNote||"")+'</textarea></div>'+
     '<div style="font-size:12px;color:var(--text2);margin-bottom:12px">'+ct("updated")+': '+complaintDate(x.updatedAt)+'</div>'+
     '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-orange" data-id="'+esc(x.id)+'" onclick="saveComplaint(this.dataset.id)">'+ct("save")+'</button></div>');
+}
+async function saveSafetyReview(id){
+  var finding=document.getElementById("safety-finding");
+  var note=document.getElementById("safety-review-note");
+  var data=await api("/complaints/"+encodeURIComponent(id)+"/review",{method:"POST",body:JSON.stringify({finding:finding?finding.value:"pending",reviewNote:note?note.value:""})});
+  if(data&&data.success){toast(ct("saved"));viewComplaint(id);}else toast((data&&data.error)||ct("saveFailed"),"error");
 }
 async function saveComplaint(id){
   var statusEl=document.getElementById("complaint-status");
@@ -9347,6 +9483,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         classifyPublicProfileProjection,
         canRequestOrderContact,
         handleOrderContact,
+        handleOrderParticipantSummary,
+        handleSafetyReportResponse,
+        complaintSafetySummary,
         handleOrderPaymentInstructions,
         handlePublicRatings,
         syncPublicProfile,
@@ -9939,7 +10078,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const existing = await getFirestoreDoc(ratingCollection, ratingId, accessToken);
         if (existing) {
           const sameRating = existing.customerUid === rating.customerUid && existing.targetUid === rating.targetUid && existing.stars === rating.stars && existing.comment === rating.comment;
-          return sameRating ? jsonResponse({ success: true, idempotent: true, rating: existing }) : phase4aError("IDEMPOTENCY_CONFLICT", "Rating already exists", 409);
+          if (!sameRating) return phase4aError("IDEMPOTENCY_CONFLICT", "Rating already exists", 409);
+          // A prior response can be lost after the atomic rating commit but
+          // before the public projection sync. A safe retry repairs it.
+          await syncPublicProfileBestEffort(targetUid, accessToken);
+          return jsonResponse({ success: true, idempotent: true, rating: existing });
         }
         const targetSnap = await getFirestoreSnapshot("users", targetUid, accessToken);
         const targetDeletion = await getFirestoreSnapshot("account_deletion_requests", targetUid, accessToken);
@@ -9949,7 +10092,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const aggregateFields = { ratingCount: oldCount + 1, ratingAverage: (oldAverage * oldCount + body.stars) / (oldCount + 1) };
         const fields = body.type === "provider" ? { providerHasRating: true, ratingSubmitted: true, providerRatingStars: body.stars, providerRatingComment: rating.comment, updatedAt: new Date().toISOString() } : { driverHasRating: true, driverRatingSubmitted: true, driverRatingStars: body.stars, driverRatingComment: rating.comment, updatedAt: new Date().toISOString() };
         if (!(await phase4aCommit([{ update: phase4aDoc(ratingCollection, ratingId, rating), updateMask: { fieldPaths: Object.keys(rating) }, currentDocument: { exists: false } }, { update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, { update: phase4aDoc("users", targetUid, aggregateFields), updateMask: { fieldPaths: Object.keys(aggregateFields) }, currentDocument: { updateTime: targetSnap.updateTime } }, auth.deletionFence, phase4aDeletionFence(targetUid, targetDeletion)], accessToken))) return phase4aError("state_conflict", "Rating changed; retry", 409);
-         await syncPublicProfile(targetUid, { ...targetSnap.data, ...aggregateFields }, accessToken);
+        await syncPublicProfileBestEffort(targetUid, accessToken);
         return jsonResponse({ success: true, ratingId, rating });
       }
       // Canonical offer mutations for the new mobile client. The legacy POST
@@ -10290,13 +10433,37 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
               return {
                 ...complaint,
-                customer: person(complaint.customerUid),
-                provider: person(complaint.providerUid),
-                driver: person(complaint.driverUid),
+                customer: person(complaint.customerUid || (complaint.source === 'customer' ? complaint.reporterUid : complaint.target === 'customer' ? complaint.targetAccountUid : '')),
+                provider: person(complaint.providerUid || (complaint.source === 'provider' ? complaint.reporterUid : complaint.target === 'provider' ? complaint.targetAccountUid : '')),
+                driver: person(complaint.driverUid || (complaint.source === 'driver' ? complaint.reporterUid : complaint.target === 'driver' ? complaint.targetAccountUid : '')),
                 id: complaint._id || complaint.id
               };
             }).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
-            return jsonResponse({ success: true, complaints: enriched });
+            return jsonResponse({ success: true, complaints: enriched, safetySummary: complaintSafetySummary(complaints) });
+          }
+          const complaintReviewMatch = path.match(/^\/admin\/api\/complaints\/([^/]+)\/review$/);
+          if (complaintReviewMatch && request.method === 'POST') {
+            const complaintId = decodeURIComponent(complaintReviewMatch[1]);
+            if (!phase4aSafeSegment(complaintId)) return jsonResponse({ error: 'Invalid complaint' }, 400);
+            let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid review' }, 400); }
+            if (!phase4aKeysOnly(body, ['finding', 'reviewNote']) || !['pending', 'substantiated', 'unsubstantiated'].includes(body.finding) || typeof body.reviewNote !== 'string' || body.reviewNote.length > 2000 || body.finding !== 'pending' && body.reviewNote.trim().length < 10) return jsonResponse({ error: 'Invalid review' }, 400);
+            for (let attempt = 0; attempt < 3; attempt++) {
+              const snapshot = await getFirestoreSnapshot('delivery_complaints', complaintId, accessToken);
+              if (!snapshot || snapshot.data.type !== 'participant_safety') return jsonResponse({ error: 'Safety report not found' }, 404);
+              const previous = snapshot.data;
+              const reviewNote = body.reviewNote.trim();
+              if (previous.reviewFinding === body.finding && (previous.reviewNote || '') === reviewNote) return jsonResponse({ success: true, idempotent: true });
+              const now = new Date().toISOString();
+              const fields = { reviewFinding: body.finding, reviewNote, reviewedAt: now, updatedAt: now };
+              const auditId = 'complaint_review_' + crypto.randomUUID();
+              const audit = { action: 'complaint_safety_review', complaintId, priorFinding: previous.reviewFinding || 'pending', finding: body.finding, reviewNote, changedBy: adminIdentity, changedAt: now };
+              const committed = await phase4aCommit([
+                { update: phase4aDoc('delivery_complaints', complaintId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snapshot.updateTime } },
+                { update: phase4aDoc('admin_audit_logs', auditId, audit), updateMask: { fieldPaths: Object.keys(audit) }, currentDocument: { exists: false } }
+              ], accessToken);
+              if (committed) return jsonResponse({ success: true, finding: body.finding });
+            }
+            return jsonResponse({ error: 'Report changed; retry' }, 409);
           }
           const complaintDetailMatch = path.match(/^\/admin\/api\/complaints\/([^/]+)$/);
           if (complaintDetailMatch && request.method === "GET") {
@@ -10312,9 +10479,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const detail = {
               ...complaint,
               id: complaint._id || complaint.id || complaintId,
-              customer: person(complaint.customerUid),
-              provider: person(complaint.providerUid),
-              driver: person(complaint.driverUid)
+              customer: person(complaint.customerUid || (complaint.source === 'customer' ? complaint.reporterUid : complaint.target === 'customer' ? complaint.targetAccountUid : '')),
+              provider: person(complaint.providerUid || (complaint.source === 'provider' ? complaint.reporterUid : complaint.target === 'provider' ? complaint.targetAccountUid : '')),
+              driver: person(complaint.driverUid || (complaint.source === 'driver' ? complaint.reporterUid : complaint.target === 'driver' ? complaint.targetAccountUid : ''))
             };
             // Chat text is never an admin-wide browsing feed.  It is supplied
             // only when inspecting a specific authenticated chat-abuse report.
@@ -10971,6 +11138,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to retrieve order contact" }, 500);
         }
       }
+      const participantSummaryMatch = path.match(/^\/orders\/([^/]+)\/participant-summary$/);
+      if (participantSummaryMatch && request.method === 'GET') {
+        if (hasServiceKey) return phase4aError('forbidden', 'User authentication required', 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderParticipantSummary(request, decodeURIComponent(participantSummaryMatch[1]), accessToken);
+        } catch {
+          console.error('[ParticipantSummary] Read failed');
+          return phase4aError('internal_error', 'Unable to load participant summary', 500);
+        }
+      }
       if (path === "/order-payment-instructions" && request.method === "POST") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
@@ -11033,6 +11211,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch {
           console.error("[Complaints] Create failed");
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to create complaint" }, 500);
+        }
+      }
+      const safetyResponseMatch = path.match(/^\/complaints\/([^/]+)\/respond$/);
+      if (safetyResponseMatch && request.method === 'POST') {
+        if (hasServiceKey) return phase4aError('forbidden', 'User authentication required', 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleSafetyReportResponse(request, decodeURIComponent(safetyResponseMatch[1]), accessToken);
+        } catch {
+          console.error('[Complaints] Response failed');
+          return phase4aError('internal_error', 'Unable to record response', 500);
         }
       }
       if (path === "/notifications/summary" && request.method === "GET") {
