@@ -108,7 +108,8 @@ test("27 matching and fee distances remain distinct", () => {
 test("28 legacy pricing adapter is isolated from strict V2 pricing", () => {
   assert(finalizeRoute.includes('calculateLegacyDeliveryPricing(order, accessToken, "finalize")'));
   assert(quoteRoute.includes('calculateLegacyDeliveryPricing(order, accessToken, "quote")'));
-  assert(quoteV2Route.includes("calculateDeliveryPricing("));
+  assert(quoteV2Route.includes("createDeliveryQuoteV2Transaction("));
+  assert(sourceBetween("async function createDeliveryQuoteV2Transaction", "function deliveryFinalizationV2IsIdempotent").includes("calculateDeliveryPricing("));
   assert(!quoteV2Route.includes("calculateLegacyDeliveryPricing("));
   assert(!finalizeV2Route.includes("calculateLegacyDeliveryPricing("));
 });

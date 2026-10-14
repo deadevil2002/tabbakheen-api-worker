@@ -114,7 +114,11 @@ const adminToken = async () => {
   let result = await hooks.handleRequest(request("/app-settings/auth"));
   assert.deepEqual(await result.json(), { success: true, settings: { requirePhoneAtSignup: true } }, "missing field defaults to true and public settings are allowlisted");
   result = await hooks.handleRequest(request("/admin/api/settings", undefined, adminHeaders));
-  assert.deepEqual((await result.json()).settings, { requirePhoneAtSignup: true, phonePasswordLoginEnabled: false }, "Admin sees true default and disabled phone login");
+  let adminSettingsResponse = await result.json();
+  assert.deepEqual(adminSettingsResponse.settings, { requirePhoneAtSignup: true, phonePasswordLoginEnabled: false }, "Admin sees true default and disabled phone login");
+  assert.equal(adminSettingsResponse.deliveryPricingPolicy.feeCapMode, "capped", "missing V2 policy is safely capped");
+  assert.equal(adminSettingsResponse.deliveryPricingPolicy.policySource, "default_capped", "Admin states the default source");
+  assert.deepEqual({ base: adminSettingsResponse.deliveryPricingPolicy.baseFee, rate: adminSettingsResponse.deliveryPricingPolicy.perKmInsideCity, minimum: adminSettingsResponse.deliveryPricingPolicy.minFee, cap: adminSettingsResponse.deliveryPricingPolicy.commercialMaxFee, source: adminSettingsResponse.deliveryPricingPolicy.rateSource }, { base: 5, rate: 2, minimum: 5, cap: 50, source: "defaults" }, "Admin derives the effective defaults when no settings document exists");
 
   result = await hooks.handleRequest(request("/admin/api/settings", { requirePhoneAtSignup: "false" }, adminHeaders));
   assert.equal(result.status, 400, "requirePhoneAtSignup rejects a non-boolean value");
@@ -136,6 +140,34 @@ const adminToken = async () => {
   assert.strictEqual(docs.get("app_settings/main").data.requirePhoneAtSignup, true, "ON persists as a boolean");
   result = await hooks.handleRequest(request("/admin/api/settings", { requirePhoneAtSignup: false }));
   assert.equal(result.status, 401, "unauthenticated and ordinary callers are denied");
+
+  put("app_settings/main", { deliveryPricing: { currency: "SAR", baseFee: 7, perKmInsideCity: 3, perKmOutsideCity: 4, minFee: 8, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped" }, unrelatedSetting: { retained: true } });
+  result = await hooks.handleRequest(request("/admin/api/settings", undefined, adminHeaders));
+  adminSettingsResponse = await result.json();
+  assert.deepEqual({ mode: adminSettingsResponse.deliveryPricingPolicy.feeCapMode, cap: adminSettingsResponse.deliveryPricingPolicy.commercialMaxFee, base: adminSettingsResponse.deliveryPricingPolicy.baseFee, rate: adminSettingsResponse.deliveryPricingPolicy.perKmInsideCity, minimum: adminSettingsResponse.deliveryPricingPolicy.minFee }, { mode: "uncapped", cap: null, base: 7, rate: 3, minimum: 8 }, "Admin reads actual effective V2 configuration");
+  result = await hooks.handleRequest(request("/admin/api/settings", { deliveryPricing: { currency: "SAR", baseFee: 9, perKmInsideCity: 3, minFee: 8, maxFee: 50 }, bannerEnabled: false }, adminHeaders));
+  assert.equal(result.status, 200, "normal Admin save succeeds");
+  assert.deepEqual(docs.get("app_settings/main").data.deliveryPricingV2, { feeCapMode: "uncapped" }, "normal Admin save preserves V2 policy");
+  assert.equal(docs.get("app_settings/main").data.deliveryPricing.perKmOutsideCity, 4, "normal Admin save preserves hidden Legacy rate");
+  assert.equal(docs.get("app_settings/main").data.deliveryPricing.maxFee, 50, "normal Admin save preserves Legacy maximum");
+  assert.deepEqual(docs.get("app_settings/main").data.unrelatedSetting, { retained: true }, "normal Admin save preserves unrelated settings");
+  result = await hooks.handleRequest(request("/admin/api/settings", { deliveryPricingV2: { feeCapMode: "capped" }, bannerEnabled: true }, adminHeaders));
+  assert.equal(result.status, 400, "Admin save cannot activate or change the read-only V2 policy");
+  result = await hooks.handleRequest(request("/admin/api/settings", { deliveryPricing: { baseFee: 10001 } }, adminHeaders));
+  assert.equal(result.status, 400, "Admin rejects pricing outside the Worker bound");
+  result = await hooks.handleRequest(request("/admin/api/settings"));
+  assert.equal(result.status, 401, "unauthenticated callers cannot read privileged policy");
+  result = await hooks.handleRequest(request("/app-settings/public"));
+  assert(!JSON.stringify(await result.json()).includes("deliveryPricingV2"), "public settings do not expose the privileged V2 policy");
+  put("app_settings/main", { deliveryPricing: { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped", extra: true } });
+  result = await hooks.handleRequest(request("/admin/api/settings", undefined, adminHeaders));
+  adminSettingsResponse = await result.json();
+  assert.equal(adminSettingsResponse.deliveryPricingPolicy.feeCapMode, "capped", "malformed policy fails safely to capped");
+  assert.equal(adminSettingsResponse.deliveryPricingPolicy.policySource, "safe_fallback_capped", "Admin identifies malformed policy fallback");
+  put("app_settings/main", { deliveryPricing: { baseFee: -1 }, deliveryPricingV2: { feeCapMode: "uncapped" } });
+  result = await hooks.handleRequest(request("/admin/api/settings", undefined, adminHeaders));
+  adminSettingsResponse = await result.json();
+  assert.equal(adminSettingsResponse.deliveryPricingPolicy.configurationValid, false, "Admin reports unavailable pricing when stored rates are invalid");
 
   put("app_settings/main", { requirePhoneAtSignup: true, phonePasswordLoginEnabled: true });
   result = await hooks.handlePhonePasswordLogin(request("/auth/phone-password", { phone: "+966534333256", password: "password" }), baseEnv(), "token");

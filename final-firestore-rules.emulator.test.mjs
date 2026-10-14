@@ -149,13 +149,16 @@ try {
   await check('E anonymous lists trusted public profiles', assertSucceeds(
     getDocs(collection(anon(), 'public_profiles')),
   ));
+  await check('E 1.0.6 and V2 role-filtered public discovery allowed', assertSucceeds(
+    getDocs(query(collection(db('C1'), 'public_profiles'), where('role', '==', 'provider'))),
+  ));
   await check('E direct safe offer get denied; Worker public catalogue required', assertFails(
     getDoc(doc(anon(), 'offers', 'SAFE1')),
   ));
   await check('E legacy mobile direct-offer shape denied', assertFails(
     getDoc(doc(anon(), 'offers', 'LEGACY-O')),
   ));
-  await check('E legacy broad offers subscription denied pending Worker catalogue DTO adoption', assertFails(
+  await check('E historical pre-1.0.6 broad offers subscription denied', assertFails(
     getDocs(collection(anon(), 'offers')),
   ));
   await check('F client cannot create public profile', assertFails(setDoc(doc(db('P1'), 'public_profiles', 'P3'), publicProfile('P3'))));

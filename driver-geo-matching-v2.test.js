@@ -30,6 +30,7 @@ const availabilityV2Route = sourceBetween('if (path === "/drivers/availability-v
 const customerGetRoute = sourceBetween('if (path === "/customers/delivery-location" && request.method === "GET")', 'if (path === "/customers/delivery-location" && request.method === "POST")');
 const customerPostRoute = sourceBetween('if (path === "/customers/delivery-location" && request.method === "POST")', 'if (path === "/drivers/location"');
 const quoteV2Route = sourceBetween('if (path === "/delivery-quote-v2"', 'if (path === "/finalize-delivery-v2"');
+const quoteV2Transaction = sourceBetween("async function createDeliveryQuoteV2Transaction", "// Legacy-only compatibility");
 const finalizeV2Route = sourceBetween('if (path === "/finalize-delivery-v2"', 'if (path === "/finalize-delivery"');
 const deliveryDetailsRoute = sourceBetween('if (path === "/order-delivery-details"', 'if (path === "/finalize-delivery"');
 const discoveryV2Route = sourceBetween('if (path === "/deliveries/available-v2"', 'if (path === "/drivers/availability"');
@@ -102,10 +103,10 @@ test("saved-location DTO allowlist", () => {
 
 test("14 valid quote contract", () => {
   assert(quoteV2Route.includes('exactObjectKeys(body, ["orderId", "dropoff", "saveAsDefault"])'));
-  assert(quoteV2Route.includes('status: "active"'));
-  assert(quoteV2Route.includes('currency: "SAR"'));
+  assert(quoteV2Transaction.includes('status: "active"'));
+  assert(quoteV2Transaction.includes('currency: "SAR"'));
 });
-test("15 provider coordinates required", () => assert(quoteV2Route.includes('phase4aError("PROVIDER_COORDINATES_REQUIRED"')));
+test("15 provider coordinates required", () => assert(quoteV2Transaction.includes('code: "PROVIDER_COORDINATES_REQUIRED"')));
 test("16 customer coordinates required", () => assert.equal(hooks.validateCustomerDropoff({ ...savedLocation, lat: 50 }, true).code, "CUSTOMER_COORDINATES_REQUIRED"));
 test("17 quote expires after ten minutes", () => {
   assert(source.includes("const DELIVERY_QUOTE_LIFETIME_MS = 10 * 60 * 1e3"));
@@ -118,9 +119,11 @@ test("19 quote is bound to customer and order", () => {
 });
 test("20 save as default is atomic and fenced", () => {
   assert(quoteV2Route.includes("body.saveAsDefault"));
-  assert(quoteV2Route.includes("updateTransforms"));
-  assert(quoteV2Route.includes("auth.deletionFence"));
-  assert(quoteV2Route.includes('verify: "projects/tabbakheen-99883/databases/(default)/documents/orders/"'));
+  assert(quoteV2Transaction.includes("updateTransforms"));
+  assert(quoteV2Transaction.includes("read.get(deletionName(auth.uid))"));
+  assert(quoteV2Transaction.includes("read.get(markerName(auth.uid))"));
+  assert(quoteV2Transaction.includes("await firestoreReadWriteTransaction"));
+  assert(!quoteV2Transaction.includes("verify:"));
 });
 test("21 fee uses provider to customer only", () => {
   const quote = hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat: 24.79, customerLng: 46.7 }, { baseFee: 0, perKmInsideCity: 1, minFee: 0, maxFee: 100 });
@@ -132,6 +135,71 @@ test("22 zero pricing preserved", () => assert.equal(hooks.calculateDeliveryPric
 test("23 minimum clamp", () => assert.equal(hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat: 24.7001, customerLng: 46.7 }, { baseFee: 0, perKmInsideCity: 0, minFee: 7, maxFee: 99 }).deliveryFee, 7));
 test("24 maximum clamp", () => assert.equal(hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat: 25.6, customerLng: 46.7 }, { baseFee: 0, perKmInsideCity: 10, minFee: 0, maxFee: 25 }).deliveryFee, 25));
 test("25 pricing version deterministic", () => assert.equal(hooks.deliveryPricingVersion({ baseFee: 0, perKmInsideCity: 3 }), hooks.deliveryPricingVersion({ perKmInsideCity: 3, baseFee: 0 })));
+test("V2 fee cap policy defaults safely and activates only with exact opt-in", () => {
+  const longOrder = { providerLat: 24.7, providerLng: 46.7, customerLat: 25.464, customerLng: 46.7 };
+  const deliveryPricing = { currency: "SAR", baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 };
+  const calculate = (policy) => hooks.calculateDeliveryPricing(longOrder, { deliveryPricing, ...(policy === undefined ? {} : { deliveryPricingV2: policy }) });
+  assert.equal(calculate().deliveryFee, 50);
+  for (const policy of [null, {}, { feeCapMode: "UNCAPPED" }, { feeCapMode: "uncapped", extra: true }, { feeCapMode: 1 }]) {
+    assert.equal(calculate(policy).deliveryFee, 50);
+  }
+  const uncapped = calculate({ feeCapMode: "uncapped" });
+  assert.equal(uncapped.deliveryDistanceKm, 85);
+  assert.equal(uncapped.deliveryFee, 175);
+  assert.equal(uncapped.currency, "SAR");
+  assert.match(uncapped.pricingVersion, /^delivery-v2u-[a-f0-9]{8}$/);
+  assert.notEqual(uncapped.pricingVersion, calculate().pricingVersion);
+  assert.equal(calculate({ feeCapMode: "capped" }).pricingVersion, calculate().pricingVersion);
+  assert.equal(hooks.deliveryPricingVersion(uncapped.pricing), uncapped.pricingVersion);
+  const oldSerialized = JSON.stringify(["SAR", 5, 2, 2, 5, 50]);
+  let oldHash = 2166136261;
+  for (const character of oldSerialized) { oldHash ^= character.charCodeAt(0); oldHash = Math.imul(oldHash, 16777619); }
+  assert.equal(calculate().pricingVersion, "delivery-v2-" + (oldHash >>> 0).toString(16).padStart(8, "0"), "existing capped quote versions stay valid");
+});
+test("V2 uncapped short, boundary, long and minimum fees", () => {
+  const source = { deliveryPricing: { baseFee: 5, perKmInsideCity: 2, minFee: 5, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped" } };
+  const quote = (customerLat, value = source) => hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat, customerLng: 46.7 }, value);
+  assert.equal(quote(24.709).deliveryFee, 7);
+  assert.equal(quote(24.902).deliveryFee, 50);
+  assert.equal(quote(25.464).deliveryFee, 175);
+  assert(quote(33).deliveryFee > 50);
+  const driverIndependent = hooks.calculateDeliveryPricing({ providerLat: 24.7, providerLng: 46.7, customerLat: 25.464, customerLng: 46.7, driverLat: 33, driverLng: 35 }, source);
+  assert.equal(driverIndependent.deliveryFee, 175, "driver-to-pickup distance must not price the customer");
+  assert.equal(quote(24.7001, { deliveryPricing: { baseFee: 0, perKmInsideCity: 0, minFee: 7, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped" } }).deliveryFee, 7);
+  assert.equal(quote(24.7001, { deliveryPricing: { baseFee: 0, perKmInsideCity: 0, minFee: 7.5, maxFee: 50 }, deliveryPricingV2: { feeCapMode: "uncapped" } }).deliveryFee, 7.5);
+});
+test("invalid V2 pricing and non-Saudi coordinates are rejected", () => {
+  const order = { providerLat: 24.7, providerLng: 46.7, customerLat: 25.464, customerLng: 46.7 };
+  for (const value of [-1, "2", NaN, Infinity, -Infinity, 10001]) {
+    assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: { perKmInsideCity: value }, deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "DELIVERY_PRICING_INVALID");
+  }
+  assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: "invalid", deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "DELIVERY_PRICING_INVALID");
+  assert.equal(hooks.calculateDeliveryPricing({ ...order, customerLat: 50 }, { deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "CUSTOMER_COORDINATES_REQUIRED");
+  assert.equal(hooks.calculateDeliveryPricing({ ...order, providerLat: 0 }, { deliveryPricingV2: { feeCapMode: "uncapped" } }).code, "PROVIDER_COORDINATES_REQUIRED");
+});
+test("V2 numeric and geographic boundaries have no commercial cap in explicit mode", () => {
+  const order = { providerLat: 24.7, providerLng: 46.7, customerLat: 24.7, customerLng: 46.7 };
+  const policy = { feeCapMode: "uncapped" };
+  for (const fee of [50, 51, 175, 500, 10000]) {
+    assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: { baseFee: fee, perKmInsideCity: 0, minFee: 0, maxFee: 50 }, deliveryPricingV2: policy }).deliveryFee, fee);
+  }
+  assert.equal(hooks.calculateDeliveryPricing(order, { deliveryPricing: { baseFee: 0, perKmInsideCity: 0, minFee: 100000, maxFee: 100000 }, deliveryPricingV2: policy }).deliveryFee, 100000);
+  const extreme = { providerLat: 12, providerLng: 34, customerLat: 34, customerLng: 61 };
+  const extremeConfig = { deliveryPricing: { baseFee: 10000, perKmInsideCity: 10000, minFee: 100000, maxFee: 100000 }, deliveryPricingV2: policy };
+  const maximum = hooks.calculateDeliveryPricing(extreme, extremeConfig);
+  assert.equal(maximum.deliveryDistanceKm, 3667.9);
+  assert.equal(maximum.deliveryFee, 36689000);
+  assert.equal(hooks.calculateDeliveryPricing({ ...extreme, customerLat: 34.000001 }, extremeConfig).code, "CUSTOMER_COORDINATES_REQUIRED");
+  assert.equal(hooks.calculateDeliveryPricing({ ...extreme, providerLng: 33.999999 }, extremeConfig).code, "PROVIDER_COORDINATES_REQUIRED");
+  assert.equal(hooks.calculateDeliveryPricing(extreme, { deliveryPricing: { ...extremeConfig.deliveryPricing, perKmInsideCity: 10000.000001 }, deliveryPricingV2: policy }).code, "DELIVERY_PRICING_INVALID");
+  assert.equal(hooks.calculateDeliveryPricing(extreme, { deliveryPricing: { ...extremeConfig.deliveryPricing, minFee: 100000.000001 }, deliveryPricingV2: policy }).code, "DELIVERY_PRICING_INVALID");
+  for (const invalid of [NaN, Infinity, -Infinity, -1, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(hooks.calculateDeliveryPricing(extreme, { deliveryPricing: { baseFee: invalid }, deliveryPricingV2: policy }).code, "DELIVERY_PRICING_INVALID");
+  }
+  assert.equal(hooks.orderDeliveryDistanceKm({ deliveryDistanceKm: 20015 }), 20015, "historical stored-distance validator accepts its own boundary");
+  assert.equal(hooks.orderDeliveryDistanceKm({ deliveryDistanceKm: 20015.1 }), null, "stored-distance validator rejects beyond 20015 km without coordinates");
+  assert(source.includes('return { integerValue: String(value) }'), "Firestore serializes integer fees as integerValue strings");
+});
 
 test("26 cod accepted", () => assert(finalizeV2Route.includes('["cod", "arrange_with_driver"].includes(body.deliveryPaymentMethod)')));
 test("27 arrange-with-driver accepted", () => assert(finalizeV2Route.includes('"arrange_with_driver"')));
@@ -146,7 +214,7 @@ test("32 food payment fields unchanged", () => {
   assert(!finalizeV2Route.includes("paymentStatus:"));
 });
 test("33 assigned destination change denied", () => {
-  assert(quoteV2Route.includes("if (order.driverUid"));
+  assert(quoteV2Transaction.includes("order.driverUid"));
   assert(finalizeV2Route.includes("if (order.driverUid"));
   assert(finalizeV2Route.includes('phase4aError("TRANSITION_NOT_ALLOWED"'));
 });
@@ -157,14 +225,23 @@ test("34 idempotent finalize retry", () => {
   assert(finalizeV2Route.includes("const latest = await getFirestoreDoc"));
 });
 test("finalization atomically writes order quote outbox and match job", () => {
-  assert(finalizeCommit.includes("orders/"));
+  assert(finalizeCommit.includes('phase4aDoc("orders", orderId'));
   assert(finalizeCommit.includes("ORDER_DELIVERY_PRIVATE_COLLECTION"));
   assert(finalizeCommit.includes("DELIVERY_QUOTES_COLLECTION"));
   assert(finalizeCommit.includes("order_transition_events"));
   assert(finalizeCommit.includes("DELIVERY_MATCH_JOBS_COLLECTION"));
-  assert(finalizeCommit.includes("currentDocument: { updateTime: orderSnapshot.updateTime }"));
-  assert(finalizeCommit.includes("currentDocument: { updateTime: quoteSnapshot.updateTime }"));
-  assert(finalizeCommit.includes("}, deletionFence]"));
+  assert(finalizeCommit.includes("currentDocument: { updateTime: orderRead.updateTime }"));
+  assert(finalizeCommit.includes("currentDocument: { updateTime: quoteRead.updateTime }"));
+  assert(finalizeCommit.includes("read.get(settingsName)"));
+  assert(finalizeCommit.includes("read.get(markerName(uid))"));
+  assert(finalizeCommit.includes("firestoreReadWriteTransaction"));
+  assert(!finalizeCommit.includes("verify:"));
+  assert(quoteV2Transaction.includes("read.get(settingsName)"));
+  assert(finalizeV2Route.includes("confirmed.pricingVersion !== quote.pricingVersion"));
+  assert(finalizeV2Route.includes("confirmed.deliveryFee !== quote.deliveryFee"));
+  assert(finalizeV2Route.includes("confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm"));
+  assert(finalizeV2Route.includes("newActiveWorkDeletionFences([auth.uid, order.providerUid]"));
+  assert(finalizeV2Route.includes("body.deliveryPaymentMethod, accessToken, pricing"));
 });
 test("pre-assignment order remains coarse-only", () => {
   for (const field of ["customerLat", "customerLng", "dropoffLat", "dropoffLng", "dropoffAddress", "addressLine", "deliveryNotes", "customerPhone", "phone"]) assert(!finalizeOrderFields.includes(field + ":"), field);
@@ -174,8 +251,9 @@ test("pre-assignment order remains coarse-only", () => {
 test("exact destination is Worker-private and quote-derived", () => {
   assert(finalizeV2Route.includes("privateDestination"));
   for (const field of ["quote.dropoffLat", "quote.dropoffLng", "quote.addressLine", "quote.city", "quote.district"]) assert(finalizeV2Route.includes(field), field);
-  for (const field of ["orderId", "customerUid", "providerUid", "lat", "lng", "addressLine", "city", "district", "deliveryNotes", "createdAt", "updatedAt", "schemaVersion"]) assert(finalizeCommit.includes(field), field);
-  for (const forbidden of ["expoPushToken", "paymentMethod", "paymentStatus", "email"]) assert(!finalizeCommit.includes(forbidden), forbidden);
+  const privateWrite = sourceBetween("const privateFields = {", "const eventId =", finalizeCommit);
+  for (const field of ["orderId", "customerUid", "providerUid", "lat", "lng", "addressLine", "city", "district", "deliveryNotes", "createdAt", "updatedAt", "schemaVersion"]) assert(privateWrite.includes(field), field);
+  for (const forbidden of ["expoPushToken", "paymentMethod", "paymentStatus", "email"]) assert(!privateWrite.includes(forbidden), forbidden);
 });
 
 const runtime = { lat: 24.7, lng: 46.7 };
@@ -287,7 +365,7 @@ test("56 assigned or cancelled order stops job", () => {
   assert(matchJob.includes('status: "stopped"'));
 });
 test("57 match history stores no location/contact/token data", () => {
-  const jobFields = sourceBetween("const jobFields = {", "const response = await fetch", finalizeCommit);
+  const jobFields = sourceBetween("const jobFields = {", "const writes = [", finalizeCommit);
   for (const secret of ["lat", "lng", "phone", "expoPushToken", "ticketId", "tokenHash"]) assert(!jobFields.includes(secret), secret);
   assert(source.includes("يوجد طلب جاهز للاستلام ضمن نطاقك"));
   assert(source.includes("A pickup-ready order is within your range"));
@@ -301,18 +379,18 @@ test("targeted job and push remain coarse-only", () => {
 });
 test("targeted outbox uses stored page event and bounded cleanup", () => {
   const outbox = sourceBetween("async function handleScheduledOutbox", "async function handleScheduledMaintenance");
-  assert(outbox.includes("retryableEvent._id"));
-  assert(outbox.includes("One outbox work item per invocation"));
+  assert(outbox.includes('cronQueueNext("order_transition_events", status, accessToken)'));
+  assert(outbox.includes("eventDoc._id"));
   assert(source.includes('event === "driver_match_available_v2" ? null : accessToken'));
 });
-test("targeted worst-case budget is 36 with 14 headroom", () => {
+test("targeted notification and receipt paths retain their individual bounds", () => {
   assert.equal(hooks.targetedNotificationWorstCaseSubrequests(), 36);
-  assert.equal(50 - hooks.targetedNotificationWorstCaseSubrequests(), 14);
   assert.equal(hooks.targetedReceiptWorstCaseSubrequests(), 21);
-  assert.equal(50 - hooks.targetedReceiptWorstCaseSubrequests(), 29);
   const maintenance = sourceBetween("async function handleScheduledMaintenance", "// Offline tests");
-  assert(maintenance.indexOf("resumeAccountDeletionsWithAccessToken") < maintenance.indexOf("handleScheduledOutbox"));
-  assert(maintenance.includes("if (deletionBusy) return"));
+  assert(maintenance.includes('const lane = ["fast", "fast", "deletion", "fast", "fast", "quotes"]'));
+  assert(maintenance.includes('await runQueue("outbox")'));
+  assert(maintenance.includes('await processDeliveryMatchJobs(env, accessToken)'));
+  assert(!maintenance.includes("if (deletionBusy) return"));
 });
 
 const activeDetailsOrder = { customerUid: "customer1", providerUid: "provider1", driverUid: "driver1", deliveryMethod: "driver", deliveryStatus: "driver_assigned", status: "assigned_to_driver" };
@@ -368,9 +446,9 @@ test("quote cleanup is bounded and active-safe", () => {
   assert(cleanup.includes('"status", "EQUAL", "used", 10'));
   assert(cleanup.includes("slice(0, 20)"));
   assert(!cleanup.includes("ORDER_DELIVERY_PRIVATE_COLLECTION"));
-  assert(source.includes("if (!await processDeliveryMatchJobs(env, accessToken)) await cleanupDeliveryQuotes(env, accessToken)"));
-  assert(source.includes("if (deletionBusy) return"));
-  assert(source.includes("if (outboxBusy) return"));
+  assert(source.includes('await processDeliveryMatchJobs(env, accessToken)'));
+  assert(source.includes('await cleanupDeliveryQuotes(env, accessToken)'));
+  assert(!source.includes("if (deletionBusy) return"));
 });
 test("private collections rely on repository default deny", () => {
   const rules = fs.readFileSync("FINAL_FIRESTORE_RULES_READY_FOR_MANUAL_DEPLOY.txt", "utf8");

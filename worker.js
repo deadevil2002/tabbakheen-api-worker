@@ -1328,24 +1328,39 @@
       const order = await getFirestoreDoc("orders", orderId, accessToken);
       if (!order) return null;
       const priorEvent = await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
-      const recipientUids = await getEventRecipientUids(transition, order, accessToken, priorEvent?.data);
-      const recipients = recipientUids.map((uid) => ({ uid, status: "pending", attempts: 0, receiptAttempts: 0 }));
-      const url = FIRESTORE_BASE + "/order_transition_events/" + eventId + "?currentDocument.exists=false";
-      let response = await fetch(url, {
-        method: "PATCH",
-        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ fields: {
-          orderId: toFirestoreValue(orderId),
-          transition: toFirestoreValue(transition),
-          stateVersion: toFirestoreValue(stateVersion),
-          status: toFirestoreValue("pending"),
-          createdAt: toFirestoreValue(new Date().toISOString())
-        } })
-      });
-      if (response.ok) await response.json();
+      if (!priorEvent) {
+        const url = FIRESTORE_BASE + "/order_transition_events/" + eventId + "?currentDocument.exists=false";
+        const response = await fetch(url, {
+          method: "PATCH",
+          headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+          body: JSON.stringify({ fields: {
+            orderId: toFirestoreValue(orderId),
+            transition: toFirestoreValue(transition),
+            stateVersion: toFirestoreValue(stateVersion),
+            status: toFirestoreValue("pending"),
+            createdAt: toFirestoreValue(new Date().toISOString())
+          } }),
+          signal: AbortSignal.timeout(8e3)
+        });
+        try {
+          // A concurrent creator may win. Read its durable event below; all
+          // other failures leave the event retryable instead of sending early.
+          if (!response.ok && response.status !== 409 && response.status !== 412) throw new Error("Notification event creation failed: " + response.status);
+        } finally {
+          // Neither a successful create nor an expected conflict needs its
+          // response payload. Cancel it before another Firestore request.
+          if (response.body) await response.body.cancel();
+        }
+      }
       let snapshot = priorEvent || await getFirestoreSnapshot("order_transition_events", eventId, accessToken);
       if (!snapshot || snapshot.data.status === "sent" || snapshot.data.status === "terminal") return null;
-      let current = snapshot.data.recipients || recipients;
+      // The first successful lease freezes the fan-out. Later batches use only
+      // this stored list, never a fresh all-driver discovery.
+      let current = snapshot.data.recipients;
+      if (!Array.isArray(current)) {
+        const recipientUids = await getEventRecipientUids(transition, order, accessToken, snapshot.data);
+        current = recipientUids.map((uid) => ({ uid, status: "pending", attempts: 0, receiptAttempts: 0 }));
+      }
       const now = Date.now();
       const owner = crypto.randomUUID();
       const candidates = current.filter((recipient) => (recipient.status === "pending" || recipient.status === "failed") && (!recipient.leaseUntil || new Date(recipient.leaseUntil).getTime() <= now)).slice(0, 10);
@@ -1463,6 +1478,7 @@
       const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
       let fields;
       let notificationEvent = null;
+      let deletionFences = [];
       if (action === "cancel_driver_search") {
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
           return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
@@ -1562,6 +1578,9 @@
           if (!isDriverDeliveryMethod(order.deliveryMethod) || order.deliveryStatus !== "ready_for_driver" || order.driverUid || !isFulfillmentEligible(order)) {
             return jsonResponse({ success: false, code: "already_assigned", error: "Delivery is no longer available" }, 409);
           }
+          const participants = await newActiveWorkDeletionFences([order.customerUid, order.providerUid, uid], accessToken);
+          if (participants.blocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
+          deletionFences = participants.fences;
           fields = { driverUid: uid, deliveryStatus: "driver_assigned", driverAssignedAt: now, deliveryStateVersion: nextVersion, updatedAt: now };
           notificationEvent = "driver_assigned";
         } else if (action === "reject") {
@@ -1602,8 +1621,10 @@
           notificationEvent = action === "delivered_pending_confirmation" ? "delivery_pending_confirmation" : action;
         }
       }
-      const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
+      const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken, deletionFences);
       if (!committed.ok) {
+        if (committed.uncertain) return jsonResponse({ success: false, code: "state_uncertain", error: "Order outcome is uncertain; refresh before retrying" }, 503);
+        if (committed.deletionBlocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
         const latest = await getFirestoreDoc("orders", orderId, accessToken);
         if (action === "accept" && latest && latest.driverUid === uid && latest.deliveryStatus === "driver_assigned") {
           return jsonResponse({ success: true, idempotent: true, deliveryMethod: latest.deliveryMethod, deliveryStatus: latest.deliveryStatus, driverUid: uid });
@@ -1628,7 +1649,7 @@
     __name(handleDeliveryTransition, "handleDeliveryTransition");
     __name2(handleDeliveryTransition, "handleDeliveryTransition");
     const PRIVATE_DELIVERY_TERMINAL_EVENTS = ["customer_cancelled", "order_cancelled", "order_rejected", "self_pickup_selected", "self_pickup_completed", "delivered"];
-    async function commitOrderAndOutbox(orderId, fields, serverTimestampFields, updateTime, event, stateVersion, accessToken) {
+    async function commitOrderAndOutbox(orderId, fields, serverTimestampFields, updateTime, event, stateVersion, accessToken, deletionFences = []) {
       const document = FIRESTORE_BASE + "/orders/" + orderId;
       const firestoreFields = {};
       for (const [key, value] of Object.entries(fields)) firestoreFields[key] = toFirestoreValue(value);
@@ -1640,10 +1661,40 @@
         status: toFirestoreValue("pending"),
         createdAt: toFirestoreValue(new Date().toISOString())
       };
-      const response = await fetch(FIRESTORE_BASE + ":commit", {
-        method: "POST",
-        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ writes: [{
+      if (deletionFences.length) {
+        const root = phase4aDoc("orders", orderId, {}).name.slice(0, -("orders/" + orderId).length);
+        const orderName = root + "orders/" + orderId;
+        const eventName = root + "order_transition_events/" + eventId;
+        const deletionName = (uid) => root + "account_deletion_requests/" + uid;
+        const markerName = (uid) => root + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + "/" + uid;
+        const names = [...new Set([orderName, eventName, ...deletionFences.flatMap((guard) => [deletionName(guard.deletionGuardUid), markerName(guard.deletionGuardUid)])])];
+        const terminal = PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event);
+        const transaction = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+          if (read.get(orderName)?.updateTime !== updateTime || read.get(eventName)) return { abort: "state_conflict" };
+          for (const guard of deletionFences) {
+            if (read.get(markerName(guard.deletionGuardUid)) ||
+                (read.get(deletionName(guard.deletionGuardUid))?.updateTime || null) !== guard.deletionUpdateTime) return { abort: "account_deletion_blocked" };
+          }
+          return { writes: [{
+            update: { name: orderName, fields: firestoreFields }, updateMask: { fieldPaths: Object.keys(fields) },
+            currentDocument: { updateTime },
+            updateTransforms: serverTimestampFields.map((fieldPath) => ({ fieldPath, setToServerValue: "REQUEST_TIME" }))
+          }, { update: { name: eventName, fields: eventFields }, currentDocument: { exists: false } },
+          ...(terminal ? [{ delete: root + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : []),
+          ...trackingJobWrite(orderId, eventId)] };
+        }, async () => {
+          const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + "/order_transition_events/" + eventId,
+            { headers: { Authorization: "Bearer " + accessToken } }, 5e3);
+          if (!response.ok) return false;
+          const recorded = parseFirestoreDoc(body);
+          return !!recorded && recorded.orderId === orderId && recorded.transition === event && recorded.stateVersion === stateVersion;
+        }, 2, {}, 12);
+        if (transaction.kind === "committed" || transaction.kind === "reconciled") return { ok: true };
+        if (transaction.kind === "aborted" || transaction.kind === "conflict") return { ok: false, conflict: true, deletionBlocked: transaction.value === "account_deletion_blocked" };
+        if (transaction.kind === "uncertain") return { ok: false, uncertain: true };
+        throw new Error("Firestore order transition transaction failed: " + transaction.kind);
+      }
+      const directWrites = [{
           update: { name: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + orderId, fields: firestoreFields },
           updateMask: { fieldPaths: Object.keys(fields) },
           currentDocument: { updateTime },
@@ -1651,7 +1702,12 @@
         }, {
           update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
           currentDocument: { exists: false }
-        }, ...(PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event) ? [{ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : [])] })
+        }, ...(PRIVATE_DELIVERY_TERMINAL_EVENTS.includes(event) ? [{ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId }] : []), ...deletionFences, ...trackingJobWrite(orderId, eventId)];
+      if (!directWrites.every(firestoreSupportedWrite)) throw new Error("Unsupported Firestore Write");
+      const response = await fetch(FIRESTORE_BASE + ":commit", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ writes: directWrites })
       });
       if (response.ok) return { ok: true };
       const text = await response.text();
@@ -1689,6 +1745,7 @@
       let fields;
       let timestamps = ["updatedAt"];
       let event;
+      let deletionFences = [];
       if (action === "cancel_customer_order") {
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
         if (order.status === "cancelled" && order.cancelledBy === "customer") {
@@ -1719,6 +1776,11 @@
           return jsonResponse({ success: true, idempotent: true, status: order.status });
         }
         if (order.status !== spec[0]) return jsonResponse({ success: false, code: "transition_not_allowed", error: "Illegal order transition" }, 409);
+        if (action === "provider_accept") {
+          const participants = await newActiveWorkDeletionFences([order.customerUid, order.providerUid], accessToken);
+          if (participants.blocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
+          deletionFences = participants.fences;
+        }
         fields = { status: target, stateVersion: nextVersion };
         if (action === "provider_reject" && body.reason != null) {
           const comment = String(body.reason).trim().slice(0, 500);
@@ -1729,8 +1791,10 @@
         }
         event = { provider_accept: "order_accepted", provider_reject: "order_rejected", provider_preparing: "order_preparing", provider_ready: "order_ready" }[action];
       }
-      const committed = await commitOrderAndOutbox(orderId, fields, timestamps, snapshot.updateTime, event, nextVersion, accessToken);
+      const committed = await commitOrderAndOutbox(orderId, fields, timestamps, snapshot.updateTime, event, nextVersion, accessToken, deletionFences);
       if (!committed.ok) {
+        if (committed.uncertain) return jsonResponse({ success: false, code: "state_uncertain", error: "Order outcome is uncertain; refresh before retrying" }, 503);
+        if (committed.deletionBlocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
         const latest = await getFirestoreDoc("orders", orderId, accessToken);
         if (latest && latest.status === (fields && fields.status) && (action !== "cancel_customer_order" || latest.cancelledBy === "customer")) {
           await sendTransitionNotification(event, orderId, accessToken, notificationStateVersion(latest, event));
@@ -2045,8 +2109,22 @@
       if (hasUid && hasId && offer.providerUid !== offer.providerId) return null;
       return hasUid ? offer.providerUid : offer.providerId;
     }
+    // Read-only marker fence for new business writes. Account deletion creates
+    // the marker only at its durable irreversible boundary.
+    const ACCOUNT_DELETION_IRREVERSIBLE_MARKERS = "account_deletion_irreversible_markers";
     function phase4aDeletionFence(uid, snapshot) {
       return { verify: "projects/tabbakheen-99883/databases/(default)/documents/account_deletion_requests/" + uid, currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
+    }
+    // New participation is permitted only when every participant has NO
+    // deletion request. A malformed/failed record is not proof of safety.
+    // The same snapshots and irreversible markers are read in the order's
+    // transaction, so a request created after these reads aborts new work.
+    async function newActiveWorkDeletionFences(uids, accessToken, knownSnapshots = new Map()) {
+      const unique = [...new Set(uids)];
+      if (unique.some((uid) => !phase4aSafeSegment(uid))) return { blocked: true, fences: [] };
+      const snapshots = await Promise.all(unique.map((uid) => knownSnapshots.has(uid) ? knownSnapshots.get(uid) : getFirestoreSnapshot("account_deletion_requests", uid, accessToken)));
+      if (snapshots.some((snapshot) => !!snapshot)) return { blocked: true, fences: [] };
+      return { blocked: false, fences: unique.map((uid, index) => ({ deletionGuardUid: uid, deletionUpdateTime: snapshots[index]?.updateTime || null })) };
     }
     function phase4aProviderAccess(user) {
       if (!user || user.role !== "provider") return { ok: false, code: "FORBIDDEN", entitlement: evaluateSubscriptionEntitlement(user) };
@@ -2172,9 +2250,48 @@
       const deletion = deletionSnapshot?.data;
       if (deletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(deletion.status)) return { response: phase4aError("account_deletion_blocked", "Account deletion is in progress", 403) };
       if (user.accountStatus === "suspended" || user.accountStatus === "disabled") return { response: phase4aError("account_suspended", "Account is not active", 403) };
-      return { uid, user, deletionFence: phase4aDeletionFence(uid, deletionSnapshot) };
+      return { uid, user, deletionSnapshot, deletionFence: phase4aDeletionFence(uid, deletionSnapshot) };
+    }
+    function firestoreSupportedWrite(write) {
+      if (!write || typeof write !== "object" || Array.isArray(write)) return false;
+      const keys = Object.keys(write);
+      return keys.every((key) => ["update", "delete", "transform", "updateMask", "updateTransforms", "currentDocument"].includes(key)) &&
+        ["update", "delete", "transform"].filter((key) => Object.hasOwn(write, key)).length === 1 &&
+        (!write.updateMask && !write.updateTransforms || !!write.update) &&
+        (!write.currentDocument || Object.keys(write.currentDocument).length === 1 &&
+          (typeof write.currentDocument.updateTime === "string" || typeof write.currentDocument.exists === "boolean"));
     }
     async function phase4aCommit(writes, accessToken) {
+      if (!Array.isArray(writes) || !writes.length) throw new Error("Invalid Firestore Writes");
+      const checks = writes.filter((write) => write && Object.hasOwn(write, "verify"));
+      const mutations = writes.filter((write) => !write || !Object.hasOwn(write, "verify"));
+      if (!mutations.every(firestoreSupportedWrite)) throw new Error("Unsupported Firestore Write");
+      if (checks.length) {
+        const root = FIRESTORE_BASE.replace("https://firestore.googleapis.com/v1/", "") + "/";
+        if (!checks.every((check) => check && Object.keys(check).length === 2 &&
+            typeof check.verify === "string" && check.verify.startsWith(root) &&
+            check.currentDocument && Object.keys(check.currentDocument).length === 1 &&
+            (typeof check.currentDocument.updateTime === "string" ||
+              typeof check.currentDocument.exists === "boolean")))
+          throw new Error("Unsupported Firestore verification");
+        const names = [...new Set(checks.map((check) => check.verify))];
+        // A read-only verification commits with no Writes: the same transaction
+        // still detects a document created or changed after batchGet.
+        const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+          for (const check of checks) {
+            const current = read.get(check.verify);
+            const condition = check.currentDocument;
+            if (condition.updateTime && current?.updateTime !== condition.updateTime ||
+                condition.exists === true && !current || condition.exists === false && !!current)
+              return { abort: "state_conflict" };
+          }
+          return { writes: mutations };
+        }, null, 2, {}, 12, 101);
+        if (result.kind === "committed" || result.kind === "reconciled") return true;
+        if (result.kind === "aborted" || result.kind === "conflict") return false;
+        // An unknown commit outcome must not be blindly retried by this helper.
+        throw new Error("Firestore Phase 4A transaction " + result.kind + (result.stage ? " at " + result.stage : ""));
+      }
       const response = await fetch(FIRESTORE_BASE + ":commit", {
         method: "POST", headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
         body: JSON.stringify({ writes })
@@ -2184,6 +2301,129 @@
       let status = ""; try { status = JSON.parse(text).error?.status || ""; } catch {}
       if ([409, 412].includes(response.status) || ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(status)) return false;
       throw new Error("Firestore Phase 4A commit failed: " + response.status);
+    }
+    // Firestore REST v1 has no standalone Verify Write. Read protected documents
+    // inside an explicit read-write transaction, then commit supported Writes
+    // with that same transaction ID. Callers must derive their decision from
+    // these snapshots, not from pre-transaction GETs.
+    // Bound bytes while they arrive, and keep the deadline alive until the
+    // response body has been consumed. A timeout after sending :commit is an
+    // uncertain outcome, even if the HTTP response was never received.
+    async function firestoreBoundedJsonRequest(url, init, deadlineMs = 1e4) {
+      const maxBytes = 4 * 1024 * 1024;
+      if (!Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 3e4) throw new Error("Invalid Firestore request deadline");
+      const controller = new AbortController();
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("Firestore request deadline exceeded"));
+        }, deadlineMs);
+      });
+      const operation = (async () => {
+        const response = await fetch(url, { ...init, signal: controller.signal });
+        const declared = response.headers.get("content-length");
+        if (declared && /^\d+$/.test(declared) && Number(declared) > maxBytes) throw new Error("Firestore transaction response too large");
+        if (!response.body) return { response, body: {} };
+        const reader = response.body.getReader();
+        const cancelReader = () => { reader.cancel().catch(() => {}); };
+        controller.signal.addEventListener("abort", cancelReader, { once: true });
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        let bytes = 0;
+        const parts = [];
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!(value instanceof Uint8Array)) throw new Error("Invalid Firestore response chunk");
+            bytes += value.byteLength;
+            if (bytes > maxBytes) throw new Error("Firestore transaction response too large");
+            parts.push(decoder.decode(value, { stream: true }));
+          }
+          parts.push(decoder.decode());
+        } catch (error) {
+          controller.abort();
+          throw error;
+        } finally {
+          controller.signal.removeEventListener("abort", cancelReader);
+        }
+        const text = parts.join("");
+        return { response, body: text ? JSON.parse(text) : {} };
+      })();
+      try { return await Promise.race([operation, timeout]); }
+      catch (error) { controller.abort(); throw error; }
+      finally { clearTimeout(timer); }
+    }
+    async function firestoreReadWriteTransaction(names, accessToken, plan, reconcile, maxAttempts = 2, deadlines = {}, maxReadDocuments = 8, maxWriteDocuments = 8) {
+      if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 2) throw new Error("Invalid transaction retry budget");
+      if (!Number.isInteger(maxReadDocuments) || maxReadDocuments < 1 || maxReadDocuments > 12) throw new Error("Invalid transaction read budget");
+      if (!Number.isInteger(maxWriteDocuments) || maxWriteDocuments < 1 || maxWriteDocuments > 101) throw new Error("Invalid transaction write budget");
+      const limits = { begin: 8e3, batchGet: 1e4, commit: 1e4, rollback: 3e3, ...deadlines };
+      if (!Object.values(limits).every((value) => Number.isInteger(value) && value >= 1 && value <= 3e4)) throw new Error("Invalid transaction deadlines");
+      const documentRoot = FIRESTORE_BASE.replace("https://firestore.googleapis.com/v1/", "") + "/";
+      if (!Array.isArray(names) || !names.length || names.length > maxReadDocuments || new Set(names).size !== names.length ||
+          !names.every((name) => typeof name === "string" && name.startsWith(documentRoot))) {
+        throw new Error("Invalid transaction read set");
+      }
+      const headers = { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" };
+      const post = (suffix, body, deadlineMs) => firestoreBoundedJsonRequest(FIRESTORE_BASE + suffix,
+        { method: "POST", headers, body: JSON.stringify(body) }, deadlineMs);
+      const conflict = (response, body) => response.status === 409 || response.status === 412 ||
+        ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(body?.error?.status);
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let transaction = null;
+        let commitStarted = false;
+        const rollback = async () => {
+          if (transaction && !commitStarted) {
+            try { await post(":rollback", { transaction }, limits.rollback); } catch { /* bounded best effort */ }
+          }
+        };
+        try {
+          const { response: start, body: begun } = await post(":beginTransaction", { options: { readWrite: {} } }, limits.begin);
+          if (!start.ok || typeof begun.transaction !== "string" || !begun.transaction) return { kind: "permanent", attempt, stage: "begin", httpStatus: start.status };
+          transaction = begun.transaction;
+          const { response: readResponse, body: batch } = await post(":batchGet", { documents: names, transaction }, limits.batchGet);
+          if (!readResponse.ok) {
+            await rollback();
+            if (conflict(readResponse, batch) && attempt < maxAttempts) continue;
+            return { kind: conflict(readResponse, batch) ? "conflict" : "permanent", attempt, stage: "batchGet", httpStatus: readResponse.status };
+          }
+          if (!Array.isArray(batch) || batch.length !== names.length) throw new Error("Invalid Firestore batchGet cardinality");
+          const read = new Map();
+          for (const item of batch) {
+            const name = item?.found?.name || item?.missing;
+            if (!names.includes(name) || read.has(name) || !(item.found || item.missing) ||
+                item.found && typeof item.found.updateTime !== "string") throw new Error("Invalid Firestore batchGet document");
+            read.set(name, item.found ? { data: parseFirestoreDoc(item.found), updateTime: item.found.updateTime } : null);
+          }
+          const decision = plan(read);
+          if (decision?.abort) {
+            await rollback();
+            return { kind: "aborted", attempt, value: decision.abort };
+          }
+          const writes = decision?.writes;
+          if (!Array.isArray(writes) || writes.length > maxWriteDocuments || !writes.every(firestoreSupportedWrite))
+            throw new Error("Unsupported Firestore transaction Write");
+          commitStarted = true;
+          let committed;
+            try { committed = await post(":commit", { transaction, writes }, limits.commit); }
+          catch {
+            try { const value = reconcile && await reconcile(decision.expected); if (value) return { kind: "reconciled", attempt, value }; } catch {}
+            return { kind: "uncertain", attempt };
+          }
+            const { response: commitResponse, body: commitBody } = committed;
+            if (commitResponse.ok) return { kind: "committed", attempt, value: decision.value };
+            if (conflict(commitResponse, commitBody)) {
+            if (attempt < maxAttempts) continue;
+            return { kind: "conflict", attempt };
+          }
+            return { kind: "permanent", attempt, stage: "commit", httpStatus: commitResponse.status };
+        } catch (error) {
+          await rollback();
+          return { kind: "permanent", attempt, error };
+        }
+      }
+      return { kind: "conflict", attempt: maxAttempts };
     }
     function phase4aDoc(collection, id, fields) {
       const out = {}; for (const [key, value] of Object.entries(fields)) out[key] = toFirestoreValue(value);
@@ -2299,6 +2539,7 @@
     const ADMIN_BROADCAST_MAX_PROCESS_CALLS = 1000;
     const RELEASE_REMINDER_COOLDOWN_MS = 72 * 60 * 60 * 1e3;
     const RELEASE_CURRENT_VERSION = "1.0.6";
+    const RELEASE_TEST_VERSION = "1.0.7";
     function compareReleaseSemver(left, right) {
       const parse = /* @__PURE__ */ __name((value) => String(value || "").split(".").map((part) => Number(part)), "parse");
       const a = parse(left);
@@ -2312,10 +2553,17 @@
       const comparison = compareReleaseSemver(record.appVersion, RELEASE_CURRENT_VERSION);
       return comparison !== null && comparison >= 0 ? "CURRENT" : "UPDATE_REQUIRED";
     }
+    function classifyReleaseDisplay(record) {
+      if (!record || !validClientSemver(record.appVersion)) return "UNKNOWN";
+      if (record.appVersion === RELEASE_TEST_VERSION) return "TEST_RELEASE";
+      if (record.appVersion === RELEASE_CURRENT_VERSION) return "PUBLIC_RELEASE";
+      return compareReleaseSemver(record.appVersion, RELEASE_CURRENT_VERSION) < 0 ? "OLDER" : "OTHER_REPORTED";
+    }
     function summarizeClientVersion(record) {
       return {
         appVersion: validClientSemver(record?.appVersion) ? record.appVersion : null,
         classification: classifyClientVersion(record),
+        displayCategory: classifyReleaseDisplay(record),
         lastReminderAt: typeof record?.lastReminderAt === "string" ? record.lastReminderAt : null
       };
     }
@@ -2335,8 +2583,9 @@
         ]);
         if (publicProfileDeletionActive(deletionSnapshot)) return { blocked: true };
         const previous = versionSnapshot?.data || null;
-        const comparison = validClientSemver(previous?.appVersion) ? compareReleaseSemver(parsed.appVersion, previous.appVersion) : 1;
-        if (comparison !== null && comparison <= 0) return { changed: false, appVersion: previous.appVersion };
+        // An account can report from more than one installation. Store the last
+        // received version, not the highest version ever observed for that UID.
+        if (previous?.appVersion === parsed.appVersion) return { changed: false, appVersion: previous.appVersion };
         const record = { appVersion: parsed.appVersion, updatedAt: nowIso, lastReminderAt: previous?.lastReminderAt || null };
         const writes = [
           { update: phase4aDoc("client_versions", uid, record), updateMask: { fieldPaths: Object.keys(record) }, currentDocument: versionSnapshot ? { updateTime: versionSnapshot.updateTime } : { exists: false } },
@@ -2366,17 +2615,19 @@
     function releaseIntelligenceForUsers(users, versions) {
       const versionByUid = new Map((versions || []).map((record) => [record._id || record.uid, record]));
       const counts = { CURRENT: 0, UPDATE_REQUIRED: 0, UNKNOWN: 0 };
+      const displayCounts = { TEST_RELEASE: 0, PUBLIC_RELEASE: 0, OLDER: 0, UNKNOWN: 0, OTHER_REPORTED: 0 };
       const distribution = {};
       const enrichedUsers = (users || []).map((user) => {
         const release = summarizeClientVersion(versionByUid.get(user._id));
         counts[release.classification]++;
+        displayCounts[release.displayCategory]++;
         const distributionKey = release.appVersion || "غير معروف";
         distribution[distributionKey] = (distribution[distributionKey] || 0) + 1;
         return { ...user, releaseIntelligence: release };
       });
       const totalUsers = (users || []).length;
       const adoptionPercent = totalUsers ? Math.round(counts.CURRENT * 1e4 / totalUsers) / 100 : 0;
-      return { users: enrichedUsers, counts, distribution, totalUsers, currentVersion: RELEASE_CURRENT_VERSION, adoptionPercent };
+      return { users: enrichedUsers, counts, displayCounts, distribution, totalUsers, currentVersion: RELEASE_CURRENT_VERSION, testVersion: RELEASE_TEST_VERSION, adoptionPercent };
     }
     function releaseReminderCandidate(user, release, nowMs = Date.now()) {
       if (!user || !release || release.classification !== "UPDATE_REQUIRED") return false;
@@ -2822,49 +3073,143 @@
       return matches.slice(0, resultLimit).map(({ order, driverToPickupDistanceKm, deliveryDistanceKm }) => driverAvailableDeliveryDtoV2(order, driverToPickupDistanceKm, deliveryDistanceKm, providerNames.get(order.providerUid) || ""));
     }
     const DELIVERY_PRICING_DEFAULTS = { currency: "SAR", baseFee: 5, perKmInsideCity: 2, perKmOutsideCity: 2, minFee: 5, maxFee: 50 };
+    // app_settings/main.deliveryPricingV2 = { feeCapMode: "uncapped" } is the
+    // only opt-in. Missing or malformed policy remains capped; the separate
+    // deliveryPricing.maxFee stays authoritative for deployed Legacy clients.
     function normalizeDeliveryPricing(value) {
-      const source = value?.deliveryPricing && typeof value.deliveryPricing === "object" ? value.deliveryPricing : value && typeof value === "object" ? value : {};
+      const source = value?.deliveryPricing && typeof value.deliveryPricing === "object" && !Array.isArray(value.deliveryPricing) ? value.deliveryPricing : value && typeof value === "object" && !Array.isArray(value) ? value : {};
       const finite = (candidate, fallback, maximum) => typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 && candidate <= maximum ? candidate : fallback;
       const minFee = finite(source.minFee, DELIVERY_PRICING_DEFAULTS.minFee, 1e5);
       const configuredMax = finite(source.maxFee, DELIVERY_PRICING_DEFAULTS.maxFee, 1e5);
+      const policy = value?.deliveryPricingV2;
+      const feeCapMode = exactObjectKeys(policy, ["feeCapMode"]) && policy.feeCapMode === "uncapped" ? "uncapped" : "capped";
       return {
         currency: typeof source.currency === "string" && /^[A-Z]{3}$/.test(source.currency) ? source.currency : DELIVERY_PRICING_DEFAULTS.currency,
         baseFee: finite(source.baseFee, DELIVERY_PRICING_DEFAULTS.baseFee, 1e4),
         perKmInsideCity: finite(source.perKmInsideCity, DELIVERY_PRICING_DEFAULTS.perKmInsideCity, 1e4),
         perKmOutsideCity: finite(source.perKmOutsideCity, DELIVERY_PRICING_DEFAULTS.perKmOutsideCity, 1e4),
         minFee,
-        maxFee: Math.max(minFee, configuredMax)
+        maxFee: Math.max(minFee, configuredMax),
+        deliveryPricingV2: { feeCapMode }
+      };
+    }
+    function validConfiguredDeliveryPricing(value) {
+      if (value && Object.prototype.hasOwnProperty.call(value, "deliveryPricing") && (!value.deliveryPricing || typeof value.deliveryPricing !== "object" || Array.isArray(value.deliveryPricing))) return false;
+      const source = value?.deliveryPricing && typeof value.deliveryPricing === "object" && !Array.isArray(value.deliveryPricing) ? value.deliveryPricing : value && typeof value === "object" && !Array.isArray(value) ? value : {};
+      for (const [key, maximum] of [["baseFee", 1e4], ["perKmInsideCity", 1e4], ["perKmOutsideCity", 1e4], ["minFee", 1e5], ["maxFee", 1e5]]) {
+        if (Object.prototype.hasOwnProperty.call(source, key) && (typeof source[key] !== "number" || !Number.isFinite(source[key]) || source[key] < 0 || source[key] > maximum)) return false;
+      }
+      return !Object.prototype.hasOwnProperty.call(source, "currency") || typeof source.currency === "string" && /^[A-Z]{3}$/.test(source.currency);
+    }
+    function adminDeliveryPricingPolicy(value) {
+      const pricing = normalizeDeliveryPricing(value);
+      const policy = value?.deliveryPricingV2;
+      const source = value?.deliveryPricing;
+      const hasStoredPricing = !!source && typeof source === "object" && !Array.isArray(source);
+      const rateKeys = ["currency", "baseFee", "perKmInsideCity", "minFee", "maxFee"];
+      return {
+        configurationValid: validConfiguredDeliveryPricing(value),
+        feeCapMode: pricing.deliveryPricingV2.feeCapMode,
+        commercialCapApplies: pricing.deliveryPricingV2.feeCapMode !== "uncapped",
+        policySource: pricing.deliveryPricingV2.feeCapMode === "uncapped" ? "explicit_uncapped" : policy === void 0 ? "default_capped" : "safe_fallback_capped",
+        rateSource: !hasStoredPricing ? "defaults" : rateKeys.every((key) => Object.prototype.hasOwnProperty.call(source, key)) ? "stored" : "stored_with_defaults",
+        currency: pricing.currency,
+        baseFee: pricing.baseFee,
+        perKmInsideCity: pricing.perKmInsideCity,
+        minFee: pricing.minFee,
+        commercialMaxFee: pricing.deliveryPricingV2.feeCapMode === "uncapped" ? null : pricing.maxFee
       };
     }
     function deliveryPricingVersion(value) {
       const pricing = normalizeDeliveryPricing(value);
-      const serialized = JSON.stringify([pricing.currency, pricing.baseFee, pricing.perKmInsideCity, pricing.perKmOutsideCity, pricing.minFee, pricing.maxFee]);
+      // Preserve the previous capped hash so already-issued V2 quotes retain
+      // their version. Uncapped policy has a distinct, explicit hash input.
+      const serialized = JSON.stringify([pricing.currency, pricing.baseFee, pricing.perKmInsideCity, pricing.perKmOutsideCity, pricing.minFee, pricing.maxFee, ...(pricing.deliveryPricingV2.feeCapMode === "uncapped" ? ["uncapped-v1"] : [])]);
       let hash = 2166136261;
       for (let index = 0; index < serialized.length; index++) {
         hash ^= serialized.charCodeAt(index);
         hash = Math.imul(hash, 16777619);
       }
-      return "delivery-v2-" + (hash >>> 0).toString(16).padStart(8, "0");
+      return (pricing.deliveryPricingV2.feeCapMode === "uncapped" ? "delivery-v2u-" : "delivery-v2-") + (hash >>> 0).toString(16).padStart(8, "0");
     }
     function calculateDeliveryPricing(order, value) {
-      if (!validCoordinatePair(order?.providerLat, order?.providerLng)) return { ok: false, code: "PROVIDER_COORDINATES_REQUIRED" };
-      if (!validCoordinatePair(order?.customerLat, order?.customerLng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
+      if (!validSaudiCoordinatePair(order?.providerLat, order?.providerLng)) return { ok: false, code: "PROVIDER_COORDINATES_REQUIRED" };
+      if (!validSaudiCoordinatePair(order?.customerLat, order?.customerLng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
+      if (!validConfiguredDeliveryPricing(value)) return { ok: false, code: "DELIVERY_PRICING_INVALID" };
       const pricing = normalizeDeliveryPricing(value);
       const distance = haversineDistanceKm(order.providerLat, order.providerLng, order.customerLat, order.customerLng);
       if (!Number.isFinite(distance)) return { ok: false, code: "DELIVERY_COORDINATES_INVALID" };
       const deliveryDistanceKm = roundDistanceKm(distance);
       let deliveryFee = Math.round(pricing.baseFee + deliveryDistanceKm * pricing.perKmInsideCity);
+      if (!Number.isSafeInteger(deliveryFee) || deliveryFee < 0) return { ok: false, code: "DELIVERY_PRICING_INVALID" };
       deliveryFee = Math.max(pricing.minFee, deliveryFee);
-      deliveryFee = Math.min(pricing.maxFee, deliveryFee);
+      if (pricing.deliveryPricingV2.feeCapMode !== "uncapped") deliveryFee = Math.min(pricing.maxFee, deliveryFee);
+      if (!Number.isFinite(deliveryFee) || deliveryFee < 0 || deliveryFee > Number.MAX_SAFE_INTEGER) return { ok: false, code: "DELIVERY_PRICING_INVALID" };
       return { ok: true, deliveryDistanceKm, deliveryFee, currency: pricing.currency, pricingVersion: deliveryPricingVersion(pricing), pricing };
     }
     async function loadDeliveryPricing(accessToken) {
-      try {
-        return normalizeDeliveryPricing(await getFirestoreDoc("app_settings", "main", accessToken));
-      } catch (error) {
-        console.log("[Worker] Could not load delivery pricing, using defaults:", error && error.message ? error.message : error);
-        return normalizeDeliveryPricing(null);
-      }
+      // A Firestore read error must not silently turn an uncapped quote into a
+      // capped default quote. Fence both issuance and finalization against a
+      // concurrent settings change in the same atomic Firestore commit.
+      const snapshot = await getFirestoreSnapshot("app_settings", "main", accessToken);
+      return {
+        value: snapshot?.data || null,
+        updateTime: snapshot?.updateTime || null
+      };
+    }
+    async function createDeliveryQuoteV2Transaction(auth, orderId, dropoff, saveAsDefault, accessToken) {
+      const preview = await getFirestoreSnapshot("orders", orderId, accessToken);
+      if (!preview) return { error: phase4aError("NOT_FOUND", "Order not found", 404) };
+      if (preview.data.customerUid !== auth.uid) return { error: phase4aError("FORBIDDEN", "Forbidden", 403) };
+      const providerUid = preview.data.providerUid;
+      if (!phase4aSafeSegment(providerUid)) return { error: phase4aError("STATE_CONFLICT", "Order provider is unavailable", 409) };
+      const name = (collection, id) => "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id;
+      const orderName = name("orders", orderId), settingsName = name("app_settings", "main");
+      const userName = name("users", auth.uid), preferenceName = name(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid);
+      const deletionName = (uid) => name("account_deletion_requests", uid);
+      const markerName = (uid) => name(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid);
+      const quoteId = "dq_" + Date.now().toString(36) + "_" + crypto.randomUUID().replace(/-/g, "");
+      const quotedAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + DELIVERY_QUOTE_LIFETIME_MS).toISOString();
+      const names = [orderName, settingsName, userName, deletionName(auth.uid), markerName(auth.uid), deletionName(providerUid), markerName(providerUid)];
+      if (saveAsDefault) names.push(preferenceName);
+      const result = await firestoreReadWriteTransaction([...new Set(names)], accessToken, (read) => {
+        const order = read.get(orderName)?.data;
+        const user = read.get(userName)?.data;
+        if (!user || user.role !== "customer" || user.accountStatus === "suspended" || user.accountStatus === "disabled") return { abort: { code: "FORBIDDEN", status: 403 } };
+        if (read.get(deletionName(auth.uid)) || read.get(markerName(auth.uid)) || read.get(deletionName(providerUid)) || read.get(markerName(providerUid))) return { abort: { code: "ACCOUNT_DELETION_BLOCKED", status: 409 } };
+        if (!order || order.customerUid !== auth.uid || order.providerUid !== providerUid || order.driverUid || order.status !== "ready_for_pickup") return { abort: { code: "STATE_CONFLICT", status: 409 } };
+        if (!validSaudiCoordinatePair(order.providerLat, order.providerLng)) return { abort: { code: "PROVIDER_COORDINATES_REQUIRED", status: 422 } };
+        const calculated = calculateDeliveryPricing({ ...order, customerLat: dropoff.lat, customerLng: dropoff.lng }, read.get(settingsName)?.data || null);
+        if (!calculated.ok) return { abort: { code: calculated.code, status: calculated.code === "DELIVERY_PRICING_INVALID" ? 503 : 422 } };
+        const quoteFields = { quoteId, orderId, customerUid: auth.uid, providerUid, dropoffLat: dropoff.lat, dropoffLng: dropoff.lng,
+          addressLine: dropoff.addressLine, city: dropoff.city, district: dropoff.district,
+          deliveryDistanceKm: calculated.deliveryDistanceKm, deliveryFee: calculated.deliveryFee,
+          pricingVersion: calculated.pricingVersion, quotedAt, expiresAt, usedAt: null, status: "active", schemaVersion: 1 };
+        const writes = [{ update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, quoteFields), currentDocument: { exists: false } }];
+        let preferenceFields = null;
+        if (saveAsDefault) {
+          const preference = read.get(preferenceName);
+          preferenceFields = { ...dropoff, label: typeof preference?.data?.label === "string" ? preference.data.label.slice(0, 80) : "", schemaVersion: 1 };
+          writes.push({ update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, preferenceFields),
+            updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
+            currentDocument: preference ? { updateTime: preference.updateTime } : { exists: false } });
+        }
+        const response = { success: true, quoteId, deliveryDistanceKm: calculated.deliveryDistanceKm,
+          deliveryFee: calculated.deliveryFee, pricingVersion: calculated.pricingVersion, quotedAt, expiresAt, currency: "SAR" };
+        return { writes, value: response, expected: { quoteFields, preferenceFields, response } };
+      }, async (expected) => {
+        const quote = await getFirestoreSnapshot(DELIVERY_QUOTES_COLLECTION, quoteId, accessToken);
+        if (!quote || Object.entries(expected.quoteFields).some(([key, value]) => !sameFirestoreValue(quote.data[key], value))) return false;
+        if (expected.preferenceFields) {
+          const preference = await getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, accessToken);
+          if (!preference || Object.entries(expected.preferenceFields).some(([key, value]) => !sameFirestoreValue(preference.data[key], value))) return false;
+        }
+        return expected.response;
+      });
+      if (result.kind === "aborted") return { error: phase4aError(result.value.code, "Order, account or pricing is unavailable", result.value.status) };
+      if (!["committed", "reconciled"].includes(result.kind)) return { error: phase4aError(result.kind === "uncertain" ? "STATE_UNCERTAIN" : "STATE_CONFLICT", "Order or saved location changed; request a new quote", result.kind === "uncertain" ? 503 : 409) };
+      return { value: result.value };
     }
     // Legacy-only compatibility for deployed clients. Their quote/finalize routes accepted
     // missing coordinates with zero distance and base-only fee; keep this until the store
@@ -2900,11 +3245,21 @@
     }
     async function saveCustomerDeliveryPreference(uid, preference, accessToken, deletionFence, existingSnapshot) {
       const fields = { ...preference, schemaVersion: 1 };
-      return phase4aCommit([{
-        update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, fields),
-        updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
-        currentDocument: existingSnapshot ? { updateTime: existingSnapshot.updateTime } : { exists: false }
-      }, deletionFence], accessToken);
+      const root = "projects/tabbakheen-99883/databases/(default)/documents/";
+      const userName = root + "users/" + uid, deletionName = root + "account_deletion_requests/" + uid;
+      const markerName = root + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + "/" + uid;
+      const preferenceName = root + CUSTOMER_DELIVERY_PREFERENCES_COLLECTION + "/" + uid;
+      const result = await firestoreReadWriteTransaction([userName, deletionName, markerName, preferenceName], accessToken, (read) => {
+        const user = read.get(userName), current = read.get(preferenceName);
+        if (!user || user.data.role !== "customer" || ["suspended", "disabled"].includes(user.data.accountStatus) || read.get(deletionName) || read.get(markerName)) return { abort: "FORBIDDEN" };
+        return { writes: [{ update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, fields),
+          updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
+          currentDocument: current ? { updateTime: current.updateTime } : { exists: false } }], expected: fields };
+      }, async (expected) => {
+        const saved = await getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, uid, accessToken);
+        return saved && Object.keys(expected).every((field) => saved.data[field] === expected[field]);
+      });
+      return ["committed", "reconciled"].includes(result.kind);
     }
     function deliveryFinalizationV2IsIdempotent(order, quoteId, deliveryPaymentMethod) {
       return !!order && order.deliveryQuoteId === quoteId && order.deliveryPaymentMethod === deliveryPaymentMethod && isDriverDeliveryMethod(order.deliveryMethod) && ["ready_for_driver", "driver_assigned", "picked_up", "arrived", "delivered_pending_confirmation", "delivered"].includes(order.deliveryStatus);
@@ -2939,79 +3294,76 @@
       if (!addressLine || !city || !district) return null;
       return { success: true, addressLine, city, district, lat: value.lat, lng: value.lng, deliveryNotes: typeof value.deliveryNotes === "string" ? value.deliveryNotes.slice(0, 500) : "" };
     }
-    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, stateVersion, accessToken, deletionFence) {
-      const event = "driver_delivery_requested_v2";
-      const eventId = notificationEventId(orderId, event, stateVersion);
-      const jobId = "dm_" + orderId + "_" + stateVersion;
-      const now = new Date().toISOString();
-      const orderFields = {};
-      for (const [key, value] of Object.entries(fields)) orderFields[key] = toFirestoreValue(value);
-      const privateFields = {};
-      for (const [key, value] of Object.entries({
-        orderId,
-        customerUid: privateDestination.customerUid,
-        providerUid: privateDestination.providerUid,
-        lat: privateDestination.lat,
-        lng: privateDestination.lng,
-        addressLine: privateDestination.addressLine,
-        city: privateDestination.city,
-        district: privateDestination.district,
-        deliveryNotes: privateDestination.deliveryNotes,
-        createdAt: typeof privateSnapshot?.data?.createdAt === "string" ? privateSnapshot.data.createdAt : now,
-        updatedAt: now,
-        schemaVersion: 1
-      })) privateFields[key] = toFirestoreValue(value);
-      const quoteFields = { status: toFirestoreValue("used"), usedAt: toFirestoreValue(now) };
-      const eventFields = {
-        orderId: toFirestoreValue(orderId),
-        transition: toFirestoreValue(event),
-        stateVersion: toFirestoreValue(stateVersion),
-        status: toFirestoreValue("pending"),
-        createdAt: toFirestoreValue(now)
-      };
-      const jobFields = {
-        orderId: toFirestoreValue(orderId),
-        stateVersion: toFirestoreValue(stateVersion),
-        status: toFirestoreValue("pending"),
-        cursor: toFirestoreValue(null),
-        scannedCount: toFirestoreValue(0),
-        matchedCount: toFirestoreValue(0),
-        notifiedCount: toFirestoreValue(0),
-        pageSequence: toFirestoreValue(0),
-        createdAt: toFirestoreValue(now),
-        updatedAt: toFirestoreValue(now),
-        schemaVersion: toFirestoreValue(1)
-      };
-      const response = await fetch(FIRESTORE_BASE + ":commit", {
-        method: "POST",
-        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ writes: [{
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + orderId, fields: orderFields },
-          // Masking absent private paths deletes any legacy destination/contact
-          // values that may already exist on the readable order.
-          updateMask: { fieldPaths: [...new Set([...Object.keys(fields), ...ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS])] },
-          currentDocument: { updateTime: orderSnapshot.updateTime }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/" + orderId, fields: privateFields },
-          currentDocument: privateSnapshot ? { updateTime: privateSnapshot.updateTime } : { exists: false }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + quoteId, fields: quoteFields },
-          updateMask: { fieldPaths: ["status", "usedAt"] },
-          currentDocument: { updateTime: quoteSnapshot.updateTime }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/order_transition_events/" + eventId, fields: eventFields },
-          currentDocument: { exists: false }
-        }, {
-          update: { name: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_MATCH_JOBS_COLLECTION + "/" + jobId, fields: jobFields },
-          currentDocument: { exists: false }
-        }, deletionFence] })
-      });
-      if (response.ok) return { ok: true, event, jobId };
-      const text = await response.text();
-      let status = "";
-      try { status = JSON.parse(text).error?.status || ""; } catch {}
-      if ([409, 412].includes(response.status) || ["ABORTED", "FAILED_PRECONDITION", "ALREADY_EXISTS"].includes(status)) return { ok: false, conflict: true };
-      throw new Error("Firestore delivery V2 finalization failed: " + response.status);
+    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, paymentMethod, accessToken, pricingSnapshot) {
+      const uid = orderSnapshot.data.customerUid, providerUid = orderSnapshot.data.providerUid;
+      if (!phase4aSafeSegment(uid) || !phase4aSafeSegment(providerUid)) return { ok: false, conflict: true };
+      const name = (collection, id) => "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id;
+      const orderName = name("orders", orderId), quoteName = name(DELIVERY_QUOTES_COLLECTION, quoteId);
+      const privateName = name(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId), settingsName = name("app_settings", "main");
+      const userName = name("users", uid);
+      const deletionName = (member) => name("account_deletion_requests", member);
+      const markerName = (member) => name(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, member);
+      const names = [orderName, quoteName, privateName, settingsName, userName,
+        deletionName(uid), markerName(uid), deletionName(providerUid), markerName(providerUid)];
+      const now = new Date().toISOString(), event = "driver_delivery_requested_v2";
+      const result = await firestoreReadWriteTransaction([...new Set(names)], accessToken, (read) => {
+        const orderRead = read.get(orderName), quoteRead = read.get(quoteName), privateRead = read.get(privateName), settingsRead = read.get(settingsName);
+        const user = read.get(userName)?.data;
+        if (!user || user.role !== "customer" || user.accountStatus === "suspended" || user.accountStatus === "disabled") return { abort: "FORBIDDEN" };
+        if (read.get(deletionName(uid)) || read.get(markerName(uid)) || read.get(deletionName(providerUid)) || read.get(markerName(providerUid))) return { abort: "ACCOUNT_DELETION_BLOCKED" };
+        if (!orderRead || !quoteRead || orderRead.updateTime !== orderSnapshot.updateTime || quoteRead.updateTime !== quoteSnapshot.updateTime ||
+            (privateRead?.updateTime || null) !== (privateSnapshot?.updateTime || null)) return { abort: "STATE_CONFLICT" };
+        if ((settingsRead?.updateTime || null) !== pricingSnapshot.updateTime) return { abort: "STALE_DELIVERY_QUOTE" };
+        const order = orderRead.data, quote = quoteRead.data;
+        if (order.customerUid !== uid || order.providerUid !== providerUid || order.driverUid || order.status !== "ready_for_pickup" ||
+            quote.customerUid !== uid || quote.orderId !== orderId || quote.providerUid !== providerUid || quote.status !== "active" || quote.usedAt ||
+            new Date(quote.expiresAt || 0).getTime() <= Date.now()) return { abort: "STALE_DELIVERY_QUOTE" };
+        if (!validSaudiCoordinatePair(quote.dropoffLat, quote.dropoffLng) || !boundedRequiredString(quote.addressLine, 300) ||
+            !boundedRequiredString(quote.city, 120) || !boundedRequiredString(quote.district, 120)) return { abort: "STALE_DELIVERY_QUOTE" };
+        const confirmed = calculateDeliveryPricing({ ...order, customerLat: quote.dropoffLat, customerLng: quote.dropoffLng }, settingsRead?.data || null);
+        if (!confirmed.ok || confirmed.pricingVersion !== quote.pricingVersion || confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm || confirmed.deliveryFee !== quote.deliveryFee) return { abort: "STALE_DELIVERY_QUOTE" };
+        const subtotal = order.priceSnapshot;
+        if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return { abort: "ORDER_PRICE_INVALID" };
+        const stateVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
+        const fields = { deliveryMethod: "driver", dropoffCity: quote.city, dropoffDistrict: quote.district, dropoffConfirmedAt: now,
+          deliveryDistanceKm: quote.deliveryDistanceKm, deliveryFee: quote.deliveryFee, totalAmount: subtotal + quote.deliveryFee,
+          deliveryQuoteId: quoteId, deliveryPricingVersion: quote.pricingVersion, deliveryPaymentMethod: paymentMethod,
+          platformDeliveryCommission: 0, driverGrossDeliveryEarnings: quote.deliveryFee, driverUid: null,
+          deliveryStatus: "ready_for_driver", status: "searching_driver", deliveryStateVersion: stateVersion, updatedAt: now };
+        const privateFields = { orderId, customerUid: uid, providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng,
+          addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "",
+          createdAt: typeof privateRead?.data?.createdAt === "string" ? privateRead.data.createdAt : now,
+          updatedAt: now, schemaVersion: 1 };
+        const eventId = notificationEventId(orderId, event, stateVersion), jobId = "dm_" + orderId + "_" + stateVersion;
+        const eventFields = { orderId, transition: event, stateVersion, status: "pending", createdAt: now };
+        const jobFields = { orderId, stateVersion, status: "pending", cursor: null, scannedCount: 0, matchedCount: 0,
+          notifiedCount: 0, pageSequence: 0, createdAt: now, updatedAt: now, schemaVersion: 1 };
+        const writes = [
+          { update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: [...new Set([...Object.keys(fields), ...ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS])] }, currentDocument: { updateTime: orderRead.updateTime } },
+          { update: phase4aDoc(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId, privateFields), currentDocument: privateRead ? { updateTime: privateRead.updateTime } : { exists: false } },
+          { update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, { status: "used", usedAt: now }), updateMask: { fieldPaths: ["status", "usedAt"] }, currentDocument: { updateTime: quoteRead.updateTime } },
+          { update: phase4aDoc("order_transition_events", eventId, eventFields), currentDocument: { exists: false } },
+          { update: phase4aDoc(DELIVERY_MATCH_JOBS_COLLECTION, jobId, jobFields), currentDocument: { exists: false } },
+          ...trackingJobWrite(orderId, eventId, now)
+        ];
+        return { writes, value: { event, jobId, fields, order, stateVersion }, expected: { fields, privateFields, eventId, jobId, stateVersion, usedAt: now } };
+      }, async (expected) => {
+        const [order, quote, destination, outbox, job] = await Promise.all([
+          getFirestoreSnapshot("orders", orderId, accessToken), getFirestoreSnapshot(DELIVERY_QUOTES_COLLECTION, quoteId, accessToken),
+          getFirestoreSnapshot(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId, accessToken),
+          getFirestoreSnapshot("order_transition_events", expected.eventId, accessToken),
+          getFirestoreSnapshot(DELIVERY_MATCH_JOBS_COLLECTION, expected.jobId, accessToken)
+        ]);
+        if (!order || !quote || !destination || !outbox || !job ||
+            Object.entries(expected.fields).some(([key, value]) => !sameFirestoreValue(order.data[key], value)) ||
+            Object.entries(expected.privateFields).some(([key, value]) => !sameFirestoreValue(destination.data[key], value)) ||
+            quote.data.status !== "used" || quote.data.usedAt !== expected.usedAt ||
+            outbox.data.orderId !== orderId || outbox.data.stateVersion !== expected.stateVersion ||
+            job.data.orderId !== orderId || job.data.stateVersion !== expected.stateVersion) return false;
+        return { event, jobId: expected.jobId, fields: expected.fields, order: order.data, stateVersion: expected.stateVersion };
+      }, 2, {}, 12);
+      if (["committed", "reconciled"].includes(result.kind)) return { ok: true, ...result.value };
+      return { ok: false, conflict: result.kind !== "uncertain", uncertain: result.kind === "uncertain" };
     }
     function parseAppleSubscriptionStatusPayload(payload) {
       if (!payload || typeof payload !== "object") return null;
@@ -3655,7 +4007,18 @@
       if (!(await phase4aCommit([{ update: phase4aDoc("offers", offerId, input), updateMask: { fieldPaths: Object.keys(input) }, currentDocument: { updateTime: offerSnap.updateTime } }, { update: phase4aDoc("offer_mutation_rate_limits", auth.uid, rate.fields), updateMask: { fieldPaths: Object.keys(rate.fields) }, currentDocument: rate.snapshot ? { updateTime: rate.snapshot.updateTime } : { exists: false } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Offer changed; refresh and retry", 409);
       return jsonResponse({ success: true });
     }
+    const PRIVATE_DESTINATION_ORDER_CONTRACT = "explicit_v2";
+    // A missing binding is deliberately OFF. Existing V2 orders continue
+    // through the V2 delivery paths when new creation is disabled.
+    function v2OrderCreationEnabled(env) {
+      return env?.V2_ORDER_CREATION_ENABLED === "true";
+    }
+    function isPrivateDestinationOrder(order) {
+      return order?.destinationContract === PRIVATE_DESTINATION_ORDER_CONTRACT;
+    }
     async function handlePhase4aOrderCreate(request, env, accessToken) {
+      const privateDestinationCreation = new URL(request.url).pathname === "/orders/create-v2";
+      if (privateDestinationCreation && !v2OrderCreationEnabled(env)) return phase4aError("v2_creation_disabled", "V2 order creation is unavailable", 503);
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
       if (auth.user.role !== "customer") return phase4aError("forbidden", "Customer account required", 403);
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
@@ -3665,49 +4028,124 @@
       if (!["cash", "cod", "bank_transfer", "stc", "stc_pay"].includes(paymentMethod)) return phase4aError("invalid_payment_method", "Unsupported payment method");
       const canonicalPaymentMethod = { cash: "CASH", cod: "CASH", bank_transfer: "BANK_TRANSFER", stc: "STC_PAY", stc_pay: "STC_PAY" }[paymentMethod];
       const input = { offerId: body.offerId, quantity, paymentMethod: canonicalPaymentMethod, note: typeof body.note === "string" ? body.note.trim().slice(0, 1000) : "" };
+      // Keep the legacy hash byte-for-byte compatible with existing request IDs.
+      // A request ID cannot replay across the two creation contracts.
+      const intentHash = JSON.stringify(privateDestinationCreation ? { ...input, destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : input);
       const idemPath = "order_creation_requests", idemId = auth.uid + "_" + body.requestId.trim();
-      const prior = await getFirestoreDoc(idemPath, idemId, accessToken);
-      if (prior) { if (prior.intentHash !== JSON.stringify(input)) return phase4aError("idempotency_conflict", "Request id already used", 409); const replayOrder = await getFirestoreDoc("orders", prior.orderId, accessToken); return jsonResponse({ success: true, orderId: prior.orderId, order: replayOrder && { ...replayOrder, id: prior.orderId }, idempotent: true }); }
-      const offerSnap = await getFirestoreSnapshot("offers", body.offerId, accessToken);
-      const offer = offerSnap?.data;
-      if (!offer) return phase4aError("offer_not_found", "Offer not found", 404);
-      const selectedProviderUid = resolveOfferProviderUid(offer);
-      if (!selectedProviderUid) return phase4aError("invalid_offer", "Offer provider is malformed", 403);
-      // providerUid is retained in the mobile request as an explicit selected
-      // provider, but the offer remains authoritative. A mismatch is rejected
-      // before any provider/payment data is used.
-      if (body.providerUid !== selectedProviderUid) return phase4aError("invalid_offer", "Offer does not belong to selected provider", 409);
-      if (offer.isAvailable !== undefined && typeof offer.isAvailable !== "boolean") return phase4aError("invalid_offer", "Offer availability is malformed");
-      if (offer.isAvailable === false) return phase4aError("offer_unavailable", "Offer unavailable", 409);
-      const offerProviderSnapshot = await getFirestoreSnapshot("users", selectedProviderUid, accessToken);
-      const offerProvider = offerProviderSnapshot?.data;
-      if (selectedProviderUid === auth.uid) return phase4aError("invalid_offer", "Offer provider is not eligible");
-      const offerAccess = phase4aProviderAccess(offerProvider);
-      if (!offerAccess.ok) {
-        await normalizeCommercialAccess(selectedProviderUid, offerProvider, offerAccess.entitlement, accessToken);
-        return phase4aError(offerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403);
-      }
-      // The order's selected method must be enabled by this exact provider.
-      // Cash is the product's universal COD option; destination methods are
-      // never assumed merely because a client named one.
-      const methods = offerProvider.paymentMethods || {};
-      if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) {
-        return phase4aError("payment_rejected", "Selected payment method is unavailable", 409);
-      }
-      const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
-      if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return phase4aError("invalid_offer", "Offer is malformed");
-      const providerUid = selectedProviderUid, now = new Date().toISOString(), orderId = crypto.randomUUID();
+      const providerUid = body.providerUid, now = new Date().toISOString(), orderId = crypto.randomUUID();
       const orderNumber = "TB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 8).toUpperCase();
-      const customer = auth.user, provider = offerProvider;
       const orderRef = "TAB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 12).toUpperCase();
-      const order = { id: orderId, orderNumber, orderRef, customerUid: auth.uid, providerUid, offerId: body.offerId, offerTitleSnapshot: offer.title.trim(), offerAvailabilityType: normalizedAvailability, offerPreparationTimeMinutes: normalizedAvailability === "preorder" ? offer.preparationTimeMinutes : null, title: offer.title.trim(), priceSnapshot: offer.price, unitPrice: offer.price, quantity, totalAmount: offer.price, paymentMethod: canonicalPaymentMethod, paymentStatus: "PENDING", status: "pending", driverUid: null, deliveryFee: 0, deliveryMethod: null, deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "", providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null, providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null, customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null, customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null, pickupAddress: provider && typeof provider.address === "string" ? provider.address : "", dropoffAddress: typeof customer.address === "string" ? customer.address : "", note: input.note, createdAt: now, updatedAt: now, stateVersion: 1, transactionalNotificationVersion: 1 };
       const eventId = notificationEventId(orderId, "order_created", 1);
       const event = { orderId, transition: "order_created", stateVersion: 1, status: "pending", createdAt: now };
-      const providerDeletion = await getFirestoreSnapshot("account_deletion_requests", providerUid, accessToken);
-      if (providerDeletion && ["requested", "in_progress", "auth_deleted", "cleanup_pending", "completed"].includes(providerDeletion.data.status)) return phase4aError("ACCOUNT_DELETION_BLOCKED", "Provider deletion is active", 409);
-      const ok = await phase4aCommit([{ update: phase4aDoc("offers", body.offerId, { lastOrderCreatedAt: now }), updateMask: { fieldPaths: ["lastOrderCreatedAt"] }, currentDocument: { updateTime: offerSnap.updateTime } }, { verify: "projects/tabbakheen-99883/databases/(default)/documents/users/" + providerUid, currentDocument: { updateTime: offerProviderSnapshot.updateTime } }, { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } }, { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } }, { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash: JSON.stringify(input), createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } }, { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } }, auth.deletionFence, phase4aDeletionFence(providerUid, providerDeletion)], accessToken);
-      if (!ok) { const retry = await getFirestoreDoc(idemPath, idemId, accessToken); if (retry && retry.intentHash === JSON.stringify(input)) { const replayOrder = await getFirestoreDoc("orders", retry.orderId, accessToken); return jsonResponse({ success: true, orderId: retry.orderId, order: replayOrder && { ...replayOrder, id: retry.orderId }, idempotent: true }); } return phase4aError("state_conflict", "Request conflicted; retry", 409); }
-      return jsonResponse({ success: true, orderId, order });
+      const paths = [
+        ["users", auth.uid], ["users", providerUid], ["offers", body.offerId],
+        ["account_deletion_requests", auth.uid], ["account_deletion_requests", providerUid],
+        [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid], [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, providerUid],
+        [idemPath, idemId]
+      ];
+      const names = paths.map(([collection, id]) => phase4aDoc(collection, id, {}).name);
+      let firstVersions = null;
+      const boundedOrderGet = async (collection, id) => {
+        const { response, body: document } = await firestoreBoundedJsonRequest(
+          FIRESTORE_BASE + "/" + collection + "/" + id,
+          { headers: { Authorization: "Bearer " + accessToken } }, 5e3);
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error("Order reconciliation read failed: " + response.status);
+        return parseFirestoreDoc(document);
+      };
+      const matchesCreationContract = (order) => privateDestinationCreation
+        ? isPrivateDestinationOrder(order) && !ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS.some((field) => Object.prototype.hasOwnProperty.call(order, field))
+        : order?.destinationContract == null;
+      const replay = async (existingOrderId) => {
+        if (!phase4aSafeSegment(existingOrderId)) return null;
+        const replayOrder = await boundedOrderGet("orders", existingOrderId);
+        return replayOrder && matchesCreationContract(replayOrder) && replayOrder.customerUid === auth.uid && replayOrder.offerId === body.offerId && replayOrder.providerUid === providerUid
+          ? { success: true, orderId: existingOrderId, order: { ...replayOrder, id: existingOrderId }, idempotent: true } : null;
+      };
+      const reconcile = async () => {
+        const prior = await boundedOrderGet(idemPath, idemId);
+        if (!prior || prior.uid !== auth.uid || prior.intentHash !== intentHash || !phase4aSafeSegment(prior.orderId)) return null;
+        const [storedOrder, storedEvent, storedNumber] = await Promise.all([
+          boundedOrderGet("orders", prior.orderId),
+          boundedOrderGet("order_transition_events", notificationEventId(prior.orderId, "order_created", 1)),
+          boundedOrderGet("order_numbers", orderNumber)
+        ]);
+        if (!storedOrder || !storedEvent || !storedNumber || !matchesCreationContract(storedOrder) || storedOrder.customerUid !== auth.uid ||
+            storedOrder.providerUid !== providerUid || storedOrder.offerId !== body.offerId ||
+            storedOrder.orderNumber !== orderNumber || storedEvent.orderId !== prior.orderId ||
+            storedEvent.transition !== "order_created" || storedEvent.stateVersion !== 1 ||
+            storedNumber.orderId !== prior.orderId) return null;
+        return { success: true, orderId: prior.orderId, order: { ...storedOrder, id: prior.orderId }, idempotent: true };
+      };
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const customerSnap = read.get(names[0]), providerSnap = read.get(names[1]), offerSnap = read.get(names[2]);
+        const prior = read.get(names[7])?.data;
+        if (prior) return { abort: prior.uid === auth.uid && prior.intentHash === intentHash && phase4aSafeSegment(prior.orderId)
+          ? { replayOrderId: prior.orderId } : phase4aError("idempotency_conflict", "Request id already used", 409) };
+        if (!customerSnap || customerSnap.data.role !== "customer" || ["suspended", "disabled"].includes(customerSnap.data.accountStatus)) return { abort: phase4aError("forbidden", "Customer account required", 403) };
+        if (read.get(names[3]) || read.get(names[4]) || read.get(names[5]) || read.get(names[6])) return { abort: phase4aError("account_deletion_blocked", "A participant has requested account deletion", 409) };
+        const offer = offerSnap?.data;
+        if (!offer) return { abort: phase4aError("offer_not_found", "Offer not found", 404) };
+        const selectedProviderUid = resolveOfferProviderUid(offer);
+        if (!selectedProviderUid) return { abort: phase4aError("invalid_offer", "Offer provider is malformed", 403) };
+        if (selectedProviderUid !== providerUid) return { abort: phase4aError("invalid_offer", "Offer does not belong to selected provider", 409) };
+        if (offer.isAvailable !== undefined && typeof offer.isAvailable !== "boolean") return { abort: phase4aError("invalid_offer", "Offer availability is malformed") };
+        if (offer.isAvailable === false) return { abort: phase4aError("offer_unavailable", "Offer unavailable", 409) };
+        const provider = providerSnap?.data;
+        if (providerUid === auth.uid) return { abort: phase4aError("invalid_offer", "Offer provider is not eligible") };
+        const providerAccess = phase4aProviderAccess(provider);
+        // Do not perform best-effort user/profile writes after rejecting an
+        // ineligible provider: deletion may begin after this read transaction.
+        if (!providerAccess.ok) return { abort: phase4aError(providerAccess.code === "SUBSCRIPTION_REQUIRED" ? "subscription_required" : "invalid_offer", "Offer provider is not eligible", 403) };
+        const methods = provider.paymentMethods || {};
+        if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) return { abort: phase4aError("payment_rejected", "Selected payment method is unavailable", 409) };
+        const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
+        if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return { abort: phase4aError("invalid_offer", "Offer is malformed") };
+        const versions = [customerSnap.updateTime, providerSnap.updateTime, offerSnap.updateTime];
+        if (firstVersions && versions.some((version, index) => version !== firstVersions[index])) return { abort: phase4aError("state_conflict", "Order inputs changed; retry", 409) };
+        firstVersions = versions;
+        const customer = customerSnap.data;
+        const order = {
+          id: orderId, orderNumber, orderRef, customerUid: auth.uid, providerUid, offerId: body.offerId,
+          offerTitleSnapshot: offer.title.trim(), offerAvailabilityType: normalizedAvailability,
+          offerPreparationTimeMinutes: normalizedAvailability === "preorder" ? offer.preparationTimeMinutes : null,
+          title: offer.title.trim(), priceSnapshot: offer.price, unitPrice: offer.price, quantity,
+          totalAmount: offer.price, paymentMethod: canonicalPaymentMethod, paymentStatus: "PENDING",
+          status: "pending", driverUid: null, deliveryFee: 0, deliveryMethod: null,
+          deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "",
+          providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null,
+          providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null,
+          ...(privateDestinationCreation ? { destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : {
+            customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null,
+            customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null,
+            dropoffAddress: typeof customer.address === "string" ? customer.address : ""
+          }),
+          pickupAddress: typeof provider.address === "string" ? provider.address : "",
+          note: input.note, createdAt: now, updatedAt: now, stateVersion: 1,
+          transactionalNotificationVersion: 1
+        };
+        return { writes: [
+          { update: phase4aDoc("offers", body.offerId, { lastOrderCreatedAt: now }), updateMask: { fieldPaths: ["lastOrderCreatedAt"] }, currentDocument: { updateTime: offerSnap.updateTime } },
+          { update: phase4aDoc("orders", orderId, order), updateMask: { fieldPaths: Object.keys(order) }, currentDocument: { exists: false } },
+          { update: phase4aDoc("order_transition_events", eventId, event), updateMask: { fieldPaths: Object.keys(event) }, currentDocument: { exists: false } },
+          { update: phase4aDoc(idemPath, idemId, { uid: auth.uid, orderId, intentHash, createdAt: now }), updateMask: { fieldPaths: ["uid", "orderId", "intentHash", "createdAt"] }, currentDocument: { exists: false } },
+          { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } },
+          ...trackingJobWrite(orderId, eventId, now)
+        ], value: { success: true, orderId, order }, expected: { orderId } };
+      }, reconcile);
+      if (result.kind === "aborted") {
+        if (result.value?.replayOrderId) {
+          const priorOrder = await replay(result.value.replayOrderId);
+          return priorOrder ? jsonResponse(priorOrder) : phase4aError("state_conflict", "Existing order is unavailable", 409);
+        }
+        return result.value;
+      }
+      if (result.kind === "committed" || result.kind === "reconciled") return jsonResponse(result.value);
+      if (result.kind === "conflict") {
+        const priorOrder = await reconcile();
+        return priorOrder ? jsonResponse(priorOrder) : phase4aError("state_conflict", "Request conflicted; retry", 409);
+      }
+      return phase4aError(result.kind === "uncertain" ? "state_uncertain" : "internal_error", "Order creation could not be confirmed", 503);
     }
     async function sha1Hex(str) {
       const data = new TextEncoder().encode(str);
@@ -4301,13 +4739,6 @@
     }
     __name(getUserPushToken, "getUserPushToken");
     __name2(getUserPushToken, "getUserPushToken");
-    async function getDriverPushTokens(accessToken) {
-      const drivers = await queryFirestore("users", "role", "EQUAL", "driver", accessToken);
-      const tokens = await Promise.all(drivers.map((driver) => driver?._id ? getUserPushToken(driver._id, accessToken) : null));
-      return tokens.filter(Boolean);
-    }
-    __name(getDriverPushTokens, "getDriverPushTokens");
-    __name2(getDriverPushTokens, "getDriverPushTokens");
     async function clearDeviceNotRegisteredToken(token, accessToken) {
       if (!accessToken || !isExpoPushToken(token)) return;
       const privateOwners = await queryFirestore("private_devices", "expoPushToken", "EQUAL", token, accessToken);
@@ -4516,10 +4947,15 @@
           break;
         }
         case "driver_delivery_requested": {
-          if (order.providerUid) {
+          // Only the current leased batch may be read or sent. The remaining
+          // frozen recipients stay in the outbox for later bounded retries.
+          const claimedUids = Array.isArray(recipientUids) ? recipientUids : [];
+          if (order.providerUid && claimedUids.includes(order.providerUid)) {
             const providerToken = await getUserPushToken(order.providerUid, accessToken);
+            preloadedTokens.set(order.providerUid, providerToken);
             if (providerToken) {
               messages.push({
+                _recipientUid: order.providerUid,
                 to: providerToken,
                 title: "\u062A\u0648\u0635\u064A\u0644 \u0628\u0645\u0646\u062F\u0648\u0628 \u{1F697}",
                 body: '\u0627\u0644\u0639\u0645\u064A\u0644 \u0637\u0644\u0628 \u062A\u0648\u0635\u064A\u0644 \u0627\u0644\u0637\u0644\u0628 "' + orderLabel + '" \u0628\u0648\u0627\u0633\u0637\u0629 \u0645\u0646\u062F\u0648\u0628',
@@ -4528,9 +4964,13 @@
               });
             }
           }
-          const driverTokens = await getDriverPushTokens(accessToken);
-          for (const token of driverTokens) {
+          for (const uid of claimedUids) {
+            if (uid === order.providerUid) continue;
+            const token = await getUserPushToken(uid, accessToken);
+            preloadedTokens.set(uid, token);
+            if (!token) continue;
             messages.push({
+              _recipientUid: uid,
               to: token,
               title: "\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u{1F680}",
               body: '\u062A\u0648\u0635\u064A\u0644\u0629 \u062C\u062F\u064A\u062F\u0629 \u0645\u062A\u0627\u062D\u0629 \u0644\u0644\u0637\u0644\u0628 "' + orderLabel + '"',
@@ -4870,8 +5310,8 @@
           else skippedRecipientUids.push(uid);
         }
         for (let i = messages.length - 1; i >= 0; i--) {
-          const uid = tokenOwners.get(messages[i].to);
-          if (!uid) messages.splice(i, 1);
+          const uid = event === "driver_delivery_requested" ? messages[i]._recipientUid : tokenOwners.get(messages[i].to);
+          if (!uid || event === "driver_delivery_requested" && !recipientUids.includes(uid)) messages.splice(i, 1);
           else {
             messages[i]._recipientUid = uid;
             if (badgeByUid.has(uid)) messages[i].badge = badgeByUid.get(uid);
@@ -6098,10 +6538,10 @@ function updateStaticLabels(){
 var TOKEN=sessionStorage.getItem("tbk_admin_token");
 var currentPage="dashboard";
 var allUsers=[];
-var releaseIntelligence={counts:{CURRENT:0,UPDATE_REQUIRED:0,UNKNOWN:0},distribution:{},totalUsers:0,currentVersion:"1.0.6",adoptionPercent:0};
+var releaseIntelligence={counts:{CURRENT:0,UPDATE_REQUIRED:0,UNKNOWN:0},displayCounts:{TEST_RELEASE:0,PUBLIC_RELEASE:0,OLDER:0,UNKNOWN:0,OTHER_REPORTED:0},distribution:{},totalUsers:0,currentVersion:"1.0.6",testVersion:"1.0.7",adoptionPercent:0};
 var releasePolling={timer:null,ageTimer:null,inFlight:false,controller:null,epoch:0,lastSignature:"",lastUpdatedAt:0,visibilityBound:false};
 function releaseDataSignature(data){
-  return JSON.stringify({counts:data&&data.counts||{},distribution:data&&data.distribution||{},totalUsers:data&&data.totalUsers||0,currentVersion:data&&data.currentVersion||"",users:(data&&data.users||[]).map(function(u){var r=u.releaseIntelligence||{};return [u._id||"",r.appVersion||"",r.classification||"UNKNOWN"];})});
+  return JSON.stringify({counts:data&&data.counts||{},displayCounts:data&&data.displayCounts||{},distribution:data&&data.distribution||{},totalUsers:data&&data.totalUsers||0,currentVersion:data&&data.currentVersion||"",users:(data&&data.users||[]).map(function(u){var r=u.releaseIntelligence||{};return [u._id||"",u.displayName||"",u.email||"",u.phone||"",u.role||"",u.accountStatus||"",r.appVersion||"",r.displayCategory||"UNKNOWN"];})});
 }
 function releaseLiveIndicator(){
   var el=document.getElementById("release-live-indicator");
@@ -6167,7 +6607,7 @@ function startReleasePolling(){
     });
     releasePolling.visibilityBound=true;
   }
-  releasePolling.lastSignature=releaseDataSignature({counts:releaseIntelligence.counts,distribution:releaseIntelligence.distribution,totalUsers:releaseIntelligence.totalUsers,currentVersion:releaseIntelligence.currentVersion,users:allUsers});
+  releasePolling.lastSignature=releaseDataSignature({counts:releaseIntelligence.counts,displayCounts:releaseIntelligence.displayCounts,distribution:releaseIntelligence.distribution,totalUsers:releaseIntelligence.totalUsers,currentVersion:releaseIntelligence.currentVersion,users:allUsers});
   releasePolling.lastUpdatedAt=Date.now();
   releaseLiveIndicator();
   scheduleReleaseLiveAge(releasePolling.epoch);
@@ -6496,7 +6936,7 @@ async function renderDashboard(c){
     '<div id="live-stat-verifiedAccounts" class="stat-card blue"><div class="label">'+(lang==="ar"?"الحسابات الموثقة":"Verified accounts")+'</div><div class="value">'+(s.verifiedAccounts||0)+'</div></div>'+
     '</div>'+
     '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"حالة إصدارات التطبيق":"App release health")+'</h2><p>'+(lang==="ar"?"ملخص المستخدمين حسب إصدار التطبيق المسجل لكل مستخدم.":"Users classified by their recorded app version.")+'</p></div><button class="btn btn-sm btn-secondary" onclick="navigate(\\'releases\\')">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button></div>'+
-    '<div class="release-grid"><div><div class="metric-label">على أحدث إصدار</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">يحتاجون تحديث</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">غير معروف</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
+    '<div class="release-grid"><div><div class="metric-label">على 1.0.6 أو أحدث</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">يحتاجون تحديث</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">غير معروف</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
     '<div id="drill-down"></div>';
 }
 
@@ -6569,17 +7009,25 @@ async function renderUsers(c){
   startReleasePolling();
 }
 
-function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",adoptionPercent:data.adoptionPercent||0};}
-function releaseStatusText(value){return value==="CURRENT"?"محدّث":value==="UPDATE_REQUIRED"?"يحتاج تحديث":"غير معروف";}
-function releaseStatusBadge(value){var cls=value==="CURRENT"?"status-current":value==="UPDATE_REQUIRED"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
-function releaseMetric(key,value,note){var labels={TOTAL:"إجمالي المستخدمين",CURRENT:"على أحدث إصدار",UPDATE_REQUIRED:"يحتاجون تحديث",UNKNOWN:"غير معروف",ADOPTION:"نسبة التحديث"};var cls=key==="CURRENT"?"current":key==="UPDATE_REQUIRED"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
-function knownReleaseVersions(){var values={};allUsers.forEach(function(u){var version=u.releaseIntelligence&&u.releaseIntelligence.appVersion;if(version)values[version]=true;});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
+function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},displayCounts:data.displayCounts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",testVersion:data.testVersion||"1.0.7",adoptionPercent:data.adoptionPercent||0};}
+function releaseStatusText(value){var labels={CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاج تحديث",TEST_RELEASE:"1.0.7 · جديد / تجريبي",PUBLIC_RELEASE:"1.0.6 · الإصدار العام",OLDER:"إصدار أقدم",OTHER_REPORTED:"إصدار آخر مُبلّغ عنه",UNKNOWN:"لم يُبلّغ عن إصدار"};return labels[value]||labels.UNKNOWN;}
+function releaseStatusBadge(value){var cls=value==="CURRENT"||value==="PUBLIC_RELEASE"?"status-current":value==="TEST_RELEASE"?"status-supported":value==="UPDATE_REQUIRED"||value==="OLDER"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
+function releaseMetric(key,value,note){var labels={TOTAL:"إجمالي المستخدمين",CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاجون تحديث",TEST_RELEASE:"1.0.7 · جديد / TestFlight / Internal Testing",PUBLIC_RELEASE:"1.0.6 · الإصدار العام الحالي",OLDER:"أقل من 1.0.6",OTHER_REPORTED:"إصدارات أخرى مُبلّغ عنها",UNKNOWN:"لم يُبلّغ عن إصدار",ADOPTION:"نسبة التحديث"};var cls=key==="CURRENT"||key==="PUBLIC_RELEASE"?"current":key==="TEST_RELEASE"?"supported":key==="UPDATE_REQUIRED"||key==="OLDER"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
+function knownReleaseVersions(){var values={"1.0.7":true,"1.0.6":true};allUsers.forEach(function(u){var version=u.releaseIntelligence&&u.releaseIntelligence.appVersion;if(version)values[version]=true;});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
+function refreshReleaseVersionFilter(){var select=document.getElementById("f-version");if(!select)return;var selected=select.value;select.innerHTML='<option value="">الإصدار: الكل</option>'+knownReleaseVersions().map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");select.value=selected;}
+function releaseCategoryMetric(key){var count=(releaseIntelligence.displayCounts||{})[key]||0,total=releaseIntelligence.totalUsers||0,pct=total?Math.round(count*1000/total)/10:0;return releaseMetric(key,count,pct+"% من إجمالي الحسابات");}
 
 async function renderReleaseIntelligence(c){
   var data=await api("/users");if(!data)return;allUsers=data.users||[];setReleaseIntelligence(data);
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">ملخص بسيط لإصدار التطبيق المسجل لكل مستخدم. الإصدار الحالي: <span id="release-current-version">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span></p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
-    '<div class="release-grid"><div id="release-metric-total">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+'</div><div id="release-metric-current">'+releaseMetric("CURRENT",(releaseIntelligence.counts||{}).CURRENT||0)+'</div><div id="release-metric-required">'+releaseMetric("UPDATE_REQUIRED",(releaseIntelligence.counts||{}).UPDATE_REQUIRED||0)+'</div><div id="release-metric-unknown">'+releaseMetric("UNKNOWN",(releaseIntelligence.counts||{}).UNKNOWN||0)+'</div><div id="release-metric-adoption">'+releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%")+'</div></div>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد المستخدمين المسجل لكل إصدار من التطبيق.</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>';
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">آخر إصدار أبلغ عنه كل حساب، وليس إصدار كل جهاز. الإصدار العام الحالي: <span id="release-current-version">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span> · 1.0.7 إصدار تجريبي ولا يغيّر أهلية تذكير مستخدمي 1.0.6.</p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
+    '<div class="release-grid"><div id="release-metric-total">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+'</div><div id="release-metric-test">'+releaseCategoryMetric("TEST_RELEASE")+'</div><div id="release-metric-public">'+releaseCategoryMetric("PUBLIC_RELEASE")+'</div><div id="release-metric-older">'+releaseCategoryMetric("OLDER")+'</div><div id="release-metric-unknown">'+releaseCategoryMetric("UNKNOWN")+'</div><div id="release-metric-other">'+releaseCategoryMetric("OTHER_REPORTED")+'</div></div>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد ونسبة الحسابات حسب آخر إصدار مُبلّغ عنه؛ غير المعروف لا يعني إصدارًا قديمًا.</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>إصدارات الحسابات</h2><p>تصفية حسب الإصدار الدقيق والدور والحساب؛ البيانات تخص الحساب لا التثبيت الفعلي.</p></div></div><div class="filters">'+
+    '<select id="f-role" aria-label="تصفية الدور" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
+    '<select id="f-release" aria-label="تصفية فئة الإصدار" onchange="filterUsers()"><option value="">فئة الإصدار: الكل</option><option value="TEST_RELEASE">1.0.7 · تجريبي</option><option value="PUBLIC_RELEASE">1.0.6 · عام</option><option value="OLDER">أقدم من 1.0.6</option><option value="UNKNOWN">لم يُبلّغ</option><option value="OTHER_REPORTED">إصدار آخر</option></select>'+
+    '<select id="f-version" aria-label="تصفية الإصدار الدقيق" onchange="filterUsers()"></select><input type="text" id="f-search" aria-label="تصفية الحساب بالاسم أو المعرّف" placeholder="ابحث باسم الحساب أو معرّفه" oninput="filterUsers()"></div>'+
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>آخر إصدار أبلغ عنه الحساب</th><th>فئة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>';
+  refreshReleaseVersionFilter();
   paintReleaseIntelligence();
   startReleasePolling();
 }
@@ -6588,17 +7036,21 @@ function paintReleaseIntelligence(){
   var set=function(id,html){var el=document.getElementById(id);if(el)el.innerHTML=html;};
   set("release-current-version",esc(releaseIntelligence.currentVersion||"1.0.6"));
   set("release-metric-total",releaseMetric("TOTAL",releaseIntelligence.totalUsers||0));
-  set("release-metric-current",releaseMetric("CURRENT",rc.CURRENT||0));
-  set("release-metric-required",releaseMetric("UPDATE_REQUIRED",rc.UPDATE_REQUIRED||0));
-  set("release-metric-unknown",releaseMetric("UNKNOWN",rc.UNKNOWN||0));
-  set("release-metric-adoption",releaseMetric("ADOPTION",(releaseIntelligence.adoptionPercent||0)+"%"));
+  set("release-metric-test",releaseCategoryMetric("TEST_RELEASE"));
+  set("release-metric-public",releaseCategoryMetric("PUBLIC_RELEASE"));
+  set("release-metric-older",releaseCategoryMetric("OLDER"));
+  set("release-metric-unknown",releaseCategoryMetric("UNKNOWN"));
+  set("release-metric-other",releaseCategoryMetric("OTHER_REPORTED"));
   var action=document.getElementById("release-reminder-action");
   if(action)action.innerHTML=(rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">إرسال تنبيه جماعي</button>':"";
   set("release-distribution",releaseDistributionHtml());
+  refreshReleaseVersionFilter();
+  filterUsers();
   releaseLiveIndicator();
 }
 function paintUsersTable(){
   var count=document.getElementById("users-count");if(count)count.textContent=allUsers.length;
+  refreshReleaseVersionFilter();
   filterUsers();
 }
 
@@ -6648,7 +7100,7 @@ function startAdminLivePolling(){
   refreshAdminLive(true,adminLiveState.epoch);scheduleAdminLivePolling(adminLiveState.epoch);
 }
 
-function releaseDistributionHtml(){var distribution=releaseIntelligence.distribution||{},grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(rows||'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
+function releaseDistributionHtml(){var distribution=Object.assign({"1.0.7":0,"1.0.6":0},releaseIntelligence.distribution||{}),grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(grand?rows:'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
 
 function filterUsers(){
   var role=document.getElementById("f-role")?document.getElementById("f-role").value:"";
@@ -6659,10 +7111,10 @@ function filterUsers(){
   var filtered=allUsers;
   if(role)filtered=filtered.filter(function(u){return u.role===role;});
   if(status)filtered=filtered.filter(function(u){return u.accountStatus===status;});
-  if(release)filtered=filtered.filter(function(u){return (u.releaseIntelligence&&u.releaseIntelligence.classification||"UNKNOWN")===release;});
+  if(release)filtered=filtered.filter(function(u){var r=u.releaseIntelligence||{};return (currentPage==="releases"?r.displayCategory:r.classification||"UNKNOWN")===release;});
   if(version)filtered=filtered.filter(function(u){return (u.releaseIntelligence&&u.releaseIntelligence.appVersion||"")===version;});
   if(search)filtered=filtered.filter(function(u){
-    return(u.displayName||"").toLowerCase().indexOf(search)>=0||(u.email||"").toLowerCase().indexOf(search)>=0||(u.phone||"").indexOf(search)>=0;
+    return(u._id||"").toLowerCase().indexOf(search)>=0||(u.displayName||"").toLowerCase().indexOf(search)>=0||(u.email||"").toLowerCase().indexOf(search)>=0||(u.phone||"").indexOf(search)>=0;
   });
   var tbody=document.getElementById("users-tbody");
   if(!tbody)return;
@@ -6674,7 +7126,7 @@ function filterUsers(){
       "<td>"+roleBadge(u.role)+"</td>"+
       "<td>"+statusBadge(u.accountStatus)+"</td>"+
       "<td><strong>"+esc(r.appVersion||"—")+"</strong></td>"+
-      "<td>"+releaseStatusBadge(r.classification)+"</td>"+
+      "<td>"+releaseStatusBadge(currentPage==="releases"?r.displayCategory:r.classification)+"</td>"+
       "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(r.classification==="UPDATE_REQUIRED"?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">طلب تحديث</button>":"")+"</div></td>"+
     "</tr>";
   }).join("");
@@ -6899,6 +7351,12 @@ async function renderSettings(c){
   var data=await api("/settings");
   if(!data)return;
   appSettings=data.settings||{};
+  var v2Policy=data.deliveryPricingPolicy||{};
+  var v2Valid=v2Policy.configurationValid===true;
+  var v2Uncapped=v2Valid&&v2Policy.feeCapMode==="uncapped";
+  var v2Source=v2Policy.policySource==="explicit_uncapped"?(lang==="ar"?"تفعيل صريح في الإعدادات المحفوظة":"Explicitly enabled in saved settings"):v2Policy.policySource==="default_capped"?(lang==="ar"?"الافتراضي الآمن: لا توجد سياسة V2":"Safe default: no V2 policy"):(lang==="ar"?"رجوع آمن للوضع المحدود: سياسة غير صالحة أو غير مدعومة":"Safe capped fallback: invalid or unsupported policy");
+  var v2RateSource=v2Policy.rateSource==="stored"?(lang==="ar"?"الإعدادات المحفوظة":"Saved settings"):v2Policy.rateSource==="stored_with_defaults"?(lang==="ar"?"الإعدادات المحفوظة مع قيم افتراضية للحقول الناقصة":"Saved settings with defaults for missing fields"):(lang==="ar"?"القيم الافتراضية":"Defaults");
+  var v2Amount=function(value){return v2Valid&&Number.isFinite(value)?esc(String(value))+" "+esc(v2Policy.currency||"SAR"):"—";};
   var bannerUrl=appSettings.bannerImageUrl||"";
   var bannerEnabled=appSettings.bannerEnabled!==false;
   var requirePhoneAtSignup=appSettings.requirePhoneAtSignup!==false;
@@ -6922,17 +7380,27 @@ async function renderSettings(c){
     '<div class="form-group"><label>'+t("supportEmail")+'</label><input id="s-supportEmail" value="'+esc(appSettings.supportEmail||"")+'"></div>'+
     '<div class="form-group"><label>'+t("supportWhatsapp")+'</label><input id="s-supportWhatsapp" value="'+esc(appSettings.supportWhatsapp||"")+'"></div>'+
     '</div>'+
-    '<div class="settings-section"><h3>'+t("deliveryPricing")+'</h3>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"تسعير التوصيل القديم (Legacy)":"Legacy delivery pricing")+'</h3>'+
     '<p style="font-size:13px;color:var(--text2);margin-bottom:16px">'+t("pricingFormula")+'</p>'+
     '<div class="grid-2">'+
     '<div class="form-group"><label>'+t("baseFee")+'</label><input type="number" min="0" step="0.5" id="s-baseFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.baseFee!=null?appSettings.deliveryPricing.baseFee:5)+'" oninput="updatePricingPreview()"></div>'+
     '<div class="form-group"><label>'+t("perKmCity")+'</label><input type="number" min="0" step="0.5" id="s-perKmCity" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.perKmInsideCity!=null?appSettings.deliveryPricing.perKmInsideCity:2)+'" oninput="updatePricingPreview()"></div>'+
     '<div class="form-group"><label>'+t("minFee")+'</label><input type="number" min="0" step="0.5" id="s-minFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.minFee!=null?appSettings.deliveryPricing.minFee:5)+'" oninput="updatePricingPreview()"></div>'+
-    '<div class="form-group"><label>'+t("maxFee")+'</label><input type="number" min="0" step="0.5" id="s-maxFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.maxFee!=null?appSettings.deliveryPricing.maxFee:50)+'" oninput="updatePricingPreview()"></div>'+
+    '<div class="form-group"><label>'+(lang==="ar"?"الحد الأقصى القديم / V2 المحدود":"Legacy / capped V2 maximum")+'</label><input type="number" min="0" step="0.5" id="s-maxFee" value="'+(appSettings.deliveryPricing&&appSettings.deliveryPricing.maxFee!=null?appSettings.deliveryPricing.maxFee:50)+'" oninput="updatePricingPreview()"></div>'+
     '</div>'+
     '<div id="pricing-validation" style="margin-top:8px"></div>'+
     '<div id="pricing-preview" style="margin-top:12px;padding:16px;background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:10px"></div>'+
     '</div>'+
+    '<div class="settings-section" aria-label="'+(lang==="ar"?"سياسة تسعير التوصيل V2":"Delivery V2 pricing policy")+'"><h3>'+(lang==="ar"?"التوصيل V2 — السياسة الفعلية المحفوظة":"Delivery V2 — saved effective policy")+'</h3>'+
+    '<p style="font-size:13px;color:var(--text2);margin-bottom:12px">'+(lang==="ar"?"للعرض فقط. لا يغيّر هذا القسم سياسة الإنتاج، والتعديلات أعلاه لا تظهر هنا حتى تُحفظ.":"Read only. This section does not activate a production policy; edits above appear here only after saving.")+'</p>'+
+    (v2Policy.configurationValid===false?'<p role="status" style="color:var(--error)">'+(lang==="ar"?"إعدادات التسعير غير صالحة؛ اقتباسات V2 غير متاحة حتى تُصحح.":"Pricing configuration is invalid; V2 quotes are unavailable until corrected.")+'</p>':'')+
+    '<div style="line-height:1.8;color:var(--text)"><div><strong>'+(lang==="ar"?"الوضع":"Mode")+':</strong> '+(!v2Valid?(lang==="ar"?"غير متاح — إعدادات غير صالحة":"Unavailable — invalid configuration"):v2Uncapped?(lang==="ar"?"غير محدود تجاريًا":"Commercially uncapped"):(lang==="ar"?"محدود":"Capped"))+'</div>'+
+    '<div><strong>'+(lang==="ar"?"الحد التجاري":"Commercial fee cap")+':</strong> '+(!v2Valid?"—":v2Uncapped?(lang==="ar"?"لا ينطبق":"Does not apply"):v2Amount(v2Policy.commercialMaxFee))+'</div>'+
+    '<div><strong>'+(lang==="ar"?"رسوم الأساس الفعلية":"Effective base fee")+':</strong> '+v2Amount(v2Policy.baseFee)+'</div>'+
+    '<div><strong>'+(lang==="ar"?"معدل الكيلومتر الفعلي":"Effective per-km rate")+':</strong> '+v2Amount(v2Policy.perKmInsideCity)+'</div>'+
+    '<div><strong>'+(lang==="ar"?"الحد الأدنى الفعلي":"Effective minimum fee")+':</strong> '+v2Amount(v2Policy.minFee)+'</div>'+
+    '<div><strong>'+(lang==="ar"?"مصدر السياسة":"Policy source")+':</strong> '+v2Source+'</div>'+
+    '<div><strong>'+(lang==="ar"?"مصدر المعدلات":"Rate source")+':</strong> '+v2RateSource+'</div></div></div>'+
     '<div class="settings-section"><h3>'+t("adminNotifications")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewUser"'+(appSettings.notifyOnNewUser?" checked":"")+'> '+t("notifyNewUser")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewProvider"'+(appSettings.notifyOnNewProvider?" checked":"")+'> '+t("notifyNewProvider")+'</label></div>'+
@@ -7018,6 +7486,7 @@ async function saveSettings(){
     supportEmail:document.getElementById("s-supportEmail")?document.getElementById("s-supportEmail").value:"",
     supportWhatsapp:document.getElementById("s-supportWhatsapp")?document.getElementById("s-supportWhatsapp").value:"",
     deliveryPricing:{
+      ...(appSettings.deliveryPricing&&typeof appSettings.deliveryPricing==="object"&&!Array.isArray(appSettings.deliveryPricing)?appSettings.deliveryPricing:{}),
       currency:"SAR",
       baseFee:Math.max(0,numberValue("s-baseFee",5)),
       perKmInsideCity:Math.max(0,numberValue("s-perKmCity",2)),
@@ -7035,7 +7504,7 @@ async function saveSettings(){
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
   var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});
-  if(data&&data.success)toast(t("settingsSaved"));
+  if(data&&data.success){toast(t("settingsSaved"));await renderSettings(document.getElementById("page-content"));}
   else toast(data&&data.error||t("failedSave"),"error");
 }
 
@@ -7509,7 +7978,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         response = await fetch("https://identitytoolkit.googleapis.com/v1/projects/tabbakheen-99883/accounts:delete", {
           method: "POST",
           headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
-          body: JSON.stringify({ localId: uid })
+          body: JSON.stringify({ localId: uid }),
+          signal: AbortSignal.timeout(8e3)
         });
       } catch {
         return { outcome: "uncertain" };
@@ -7552,16 +8022,41 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(orderIsActive, "orderIsActive");
     __name2(orderIsActive, "orderIsActive");
-    async function accountDeletionActiveOrders(uid, role, accessToken) {
-      const matches = [];
-      const roleField = { customer: "customerUid", provider: "providerUid", driver: "driverUid" }[role];
-      if (!roleField) return matches;
-      const orders = await queryFirestore("orders", roleField, "EQUAL", uid, accessToken);
-      for (const order of orders) if (orderIsActive(order)) matches.push(order);
-      return matches;
+    const ACCOUNT_DELETION_PAGE_SIZE = 10;
+    const ACCOUNT_DELETION_ORDER_FIELDS = ["customerUid", "providerUid", "driverUid"];
+    async function accountDeletionOrderPage(uid, roleField, cursor, accessToken) {
+      if (!ACCOUNT_DELETION_ORDER_FIELDS.includes(roleField)) throw new Error("Invalid deletion participant field");
+      const prefix = phase4aDoc("orders", "", {}).name;
+      if (cursor !== null && (typeof cursor !== "string" || !cursor.startsWith(prefix) || cursor.length > 2048)) throw new Error("Invalid deletion cursor");
+      const query = {
+        from: [{ collectionId: "orders" }],
+        where: { fieldFilter: { field: { fieldPath: roleField }, op: "EQUAL", value: { stringValue: uid } } },
+        orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
+        select: { fields: [{ fieldPath: "status" }, { fieldPath: "deliveryStatus" }] },
+        limit: ACCOUNT_DELETION_PAGE_SIZE
+      };
+      if (cursor) query.startAt = { values: [{ referenceValue: cursor }], before: false };
+      const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + ":runQuery", {
+        method: "POST", headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ structuredQuery: query })
+      }, 8e3);
+      if (!response.ok || !Array.isArray(body) || !body.length || body.length > ACCOUNT_DELETION_PAGE_SIZE + 1 ||
+          body.some((entry) => !entry || !entry.document && typeof entry.readTime !== "string")) throw new Error("Deletion order page failed");
+      const documents = body.filter((entry) => entry.document).map((entry) => entry.document);
+      if (documents.length > ACCOUNT_DELETION_PAGE_SIZE ||
+          documents.some((doc) => typeof doc.name !== "string" || !doc.name.startsWith(prefix)))
+        throw new Error("Deletion order page malformed");
+      let previous = cursor;
+      for (const document of documents) {
+        if (previous && document.name <= previous) throw new Error("Deletion order page did not advance");
+        previous = document.name;
+      }
+      return { orders: documents.map(parseFirestoreDoc),
+        cursor: documents.length ? documents[documents.length - 1].name : cursor,
+        complete: documents.length < ACCOUNT_DELETION_PAGE_SIZE };
     }
-    __name(accountDeletionActiveOrders, "accountDeletionActiveOrders");
-    __name2(accountDeletionActiveOrders, "accountDeletionActiveOrders");
+    __name(accountDeletionOrderPage, "accountDeletionOrderPage");
+    __name2(accountDeletionOrderPage, "accountDeletionOrderPage");
     const ACCOUNT_DELETION_LEASE_MS = 12e4;
     function deletionTransitionAllowed(current, next) {
       if (current === "completed") return next === "completed";
@@ -7571,6 +8066,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(deletionTransitionAllowed, "deletionTransitionAllowed");
     __name2(deletionTransitionAllowed, "deletionTransitionAllowed");
+    function commitAccountDeletionState(uid, fields, updateTime, accessToken) {
+      return phase4aCommit([{
+        update: phase4aDoc("account_deletion_requests", uid, fields),
+        updateMask: { fieldPaths: Object.keys(fields) },
+        currentDocument: { updateTime }
+      }], accessToken);
+    }
     async function claimAccountDeletion(uid, accessToken) {
       const owner = crypto.randomUUID();
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -7580,12 +8082,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (snapshot.data.status === "completed") return { claimed: false, state: snapshot.data };
         if (snapshot.data.executionLeaseOwner && new Date(snapshot.data.executionLeaseUntil || 0).getTime() > now) return { claimed: false, state: snapshot.data };
         const executionLeaseUntil = new Date(now + ACCOUNT_DELETION_LEASE_MS).toISOString();
-        const claimed = await compareAndSetFirestoreDocument("account_deletion_requests", uid, {
+        const claimed = await commitAccountDeletionState(uid, {
           executionLeaseOwner: owner,
           executionLeaseUntil,
           updatedAt: new Date(now).toISOString()
         }, snapshot.updateTime, accessToken);
-        if (claimed.ok) return { claimed: true, owner, state: { ...snapshot.data, executionLeaseOwner: owner, executionLeaseUntil } };
+        if (claimed) return { claimed: true, owner, state: { ...snapshot.data, executionLeaseOwner: owner, executionLeaseUntil } };
       }
       const latest = await getFirestoreDoc("account_deletion_requests", uid, accessToken);
       return { claimed: false, state: latest };
@@ -7606,8 +8108,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           executionLeaseUntil: releaseLease ? null : new Date(now + ACCOUNT_DELETION_LEASE_MS).toISOString(),
           updatedAt: new Date(now).toISOString()
         };
-        const written = await compareAndSetFirestoreDocument("account_deletion_requests", uid, nextFields, snapshot.updateTime, accessToken);
-        if (written.ok) return { ...snapshot.data, ...nextFields };
+        const written = await commitAccountDeletionState(uid, nextFields, snapshot.updateTime, accessToken);
+        if (written) return { ...snapshot.data, ...nextFields };
       }
       return null;
     }
@@ -7626,55 +8128,49 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name(cleanupLimitationsFrom, "cleanupLimitationsFrom");
     __name2(cleanupLimitationsFrom, "cleanupLimitationsFrom");
     async function deleteNotificationSubcollectionBatch(uid, rootCollection, accessToken) {
-      const page = await listFirestorePage(rootCollection + "/" + uid + "/items", 50, null, accessToken);
+      const page = await listFirestorePage(rootCollection + "/" + uid + "/items", 5, null, accessToken);
       const ids = page.items.map((item) => item._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + rootCollection + "/" + uid + "/items/";
         const committed = await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken);
         if (!committed) throw new Error("Notification cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 && !page.nextPageToken };
+      return { deletedCount: ids.length, complete: ids.length < 5 && !page.nextPageToken };
     }
     async function deleteClientInstallationBatch(uid, accessToken) {
-      const page = await listFirestorePage("client_installations/" + uid + "/devices", 50, null, accessToken);
+      const page = await listFirestorePage("client_installations/" + uid + "/devices", 5, null, accessToken);
       const ids = page.items.map((item) => item._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/client_installations/" + uid + "/devices/";
         const committed = await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken);
         if (!committed) throw new Error("Installation cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 && !page.nextPageToken };
+      return { deletedCount: ids.length, complete: ids.length < 5 && !page.nextPageToken };
     }
     async function deleteDeliveryQuotesForCustomerBatch(uid, accessToken) {
-      const quotes = await queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "customerUid", "EQUAL", uid, 50, accessToken);
+      const quotes = await queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "customerUid", "EQUAL", uid, 5, accessToken);
       const ids = quotes.map((quote) => quote?._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/";
         if (!await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken)) throw new Error("Delivery quote cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 };
+      return { deletedCount: ids.length, complete: ids.length < 5 };
     }
     async function deleteOrderDeliveryPrivateForCustomerBatch(uid, accessToken) {
-      const records = await queryFirestoreLimited(ORDER_DELIVERY_PRIVATE_COLLECTION, "customerUid", "EQUAL", uid, 50, accessToken);
+      const records = await queryFirestoreLimited(ORDER_DELIVERY_PRIVATE_COLLECTION, "customerUid", "EQUAL", uid, 5, accessToken);
       const ids = records.map((record) => record?._id).filter(phase4aSafeSegment);
       if (ids.length) {
         const prefix = "projects/tabbakheen-99883/databases/(default)/documents/" + ORDER_DELIVERY_PRIVATE_COLLECTION + "/";
         if (!await phase4aCommit(ids.map((id) => ({ delete: prefix + id })), accessToken)) throw new Error("Private delivery cleanup changed; retry");
       }
-      return { deletedCount: ids.length, complete: ids.length < 50 };
+      return { deletedCount: ids.length, complete: ids.length < 5 };
     }
     async function buildAccountDeletionManifest(uid, user, accessToken, env) {
       const verification = await getFirestoreDoc("verifications", uid, accessToken);
       const certificatePublicId = cloudinaryPublicIdFromVerification(verification);
-      const offers = user.role === "provider" ? await queryFirestore("offers", "providerId", "EQUAL", uid, accessToken) : [];
-      if (user.role === "provider") {
-        const legacyOffers = await queryFirestore("offers", "providerUid", "EQUAL", uid, accessToken);
-        for (const offer of legacyOffers) if (!offers.some((item) => item._id === offer._id)) offers.push(offer);
-      }
       const cleanupLimitations = cleanupLimitationsFrom(user, "profile");
       const verificationLimitations = cleanupLimitationsFrom(verification, "verification");
       cleanupLimitations.push(...(certificatePublicId ? verificationLimitations.filter((item) => !item.startsWith("verification.freelanceCertificate.fileUrl_has_no_public_id")) : verificationLimitations));
-      cleanupLimitations.push(...offers.flatMap((offer) => cleanupLimitationsFrom(offer, "offer")));
       if (!certificatePublicId && verification?.freelanceCertificate?.fileUrl) cleanupLimitations.push("certificate_url_has_no_public_id");
       const profilePhone = normalizeSaudiMobilePhone(user.phone);
       const indexedPhoneMustBeRemoved = profilePhone && user.phoneIndexStatus === "indexed";
@@ -7683,7 +8179,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         role: user.role,
         certificatePublicId,
         certificateDeleted: !certificatePublicId,
-        remainingOfferIds: [...new Set(offers.map((offer) => offer?._id).filter(Boolean))],
+        // Old manifests retain their bounded remainingOfferIds cursor. New
+        // manifests drain each provider alias from a small first page until
+        // empty; an empty array alone never certifies offer cleanup.
+        remainingOfferIds: [],
+        offerSweepField: user.role === "provider" ? "providerId" : "done",
+        offerSweepComplete: user.role !== "provider",
         // Hash only: no phone is copied into the account-deletion record.
         phoneIndexKey,
         phoneIndexDeleted: !indexedPhoneMustBeRemoved,
@@ -7701,11 +8202,35 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         clientInstallationSummaryDeleted: false,
         userDeleted: false,
         verificationDeleted: false,
-        cleanupLimitations: [...new Set(cleanupLimitations)]
+        cleanupLimitations: [...new Set(cleanupLimitations)].slice(0, 32),
+        cleanupLimitationsOverflow: cleanupLimitations.length > 32
       };
     }
     __name(buildAccountDeletionManifest, "buildAccountDeletionManifest");
     __name2(buildAccountDeletionManifest, "buildAccountDeletionManifest");
+    async function accountDeletionOfferPage(uid, field, accessToken) {
+      if (!["providerId", "providerUid"].includes(field)) throw new Error("Invalid offer cleanup field");
+      const query = { from: [{ collectionId: "offers" }],
+        where: { fieldFilter: { field: { fieldPath: field }, op: "EQUAL", value: { stringValue: uid } } },
+        orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }], limit: 3 };
+      const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + ":runQuery", {
+        method: "POST", headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ structuredQuery: query })
+      }, 8e3);
+      if (!response.ok || !Array.isArray(body) || body.length > 4) throw new Error("Offer cleanup page failed");
+      const prefix = phase4aDoc("offers", "", {}).name;
+      const offers = body.filter((entry) => entry.document).map((entry) => entry.document);
+      if (offers.length > 3 || offers.some((doc) => !doc.name?.startsWith(prefix) || !doc.updateTime)) throw new Error("Offer cleanup page malformed");
+      return offers.map((doc) => ({ name: doc.name, updateTime: doc.updateTime, data: parseFirestoreDoc(doc) }));
+    }
+    async function yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken) {
+      return await writeDeletionState(uid, owner, {
+        status: "cleanup_pending", cleanupManifest: manifest,
+        cleanupFailures: [...new Set(failures)],
+        failureCode: failures.length ? "cleanup_failed" : "",
+        code: failures.length ? "ACCOUNT_DELETE_FAILED" : null
+      }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+    }
     async function createAccountDeletionRequestIfAbsent(uid, record, accessToken) {
       const fields = {};
       for (const [key, value] of Object.entries(record)) fields[key] = toFirestoreValue(value);
@@ -7726,6 +8251,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       const manifest = { ...(record.cleanupManifest || {}) };
       manifest.remainingOfferIds = Array.isArray(manifest.remainingOfferIds) ? manifest.remainingOfferIds : [];
       manifest.cleanupLimitations = Array.isArray(manifest.cleanupLimitations) ? manifest.cleanupLimitations : [];
+      // Existing exhaustive manifests are drained first, then both aliases
+      // are re-queried. An empty legacy ID array is never proof of completion.
+      if (!Object.prototype.hasOwnProperty.call(manifest, "offerSweepComplete")) manifest.offerSweepComplete = ["customer", "driver"].includes(manifest.role);
+      if (!manifest.offerSweepComplete && !["providerId", "providerUid", "done"].includes(manifest.offerSweepField)) manifest.offerSweepField = "providerId";
       // Manifests created before phone identity existed have no index to clean;
       // preserve their resumability rather than turning an old deletion into a
       // permanently pending request.
@@ -7745,6 +8274,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientVersionDeleted")) manifest.clientVersionDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientInstallationsDeleted")) manifest.clientInstallationsDeleted = false;
       if (!Object.prototype.hasOwnProperty.call(manifest, "clientInstallationSummaryDeleted")) manifest.clientInstallationSummaryDeleted = false;
+      const pendingStep = manifest.phoneIndexDeleted !== true ? "phoneIndexDeleted" :
+        manifest.certificatePublicId && manifest.certificateDeleted !== true ? "certificateDeleted" :
+        manifest.remainingOfferIds.length || !manifest.offerSweepComplete ? "offers" :
+        ["publicProfileDeleted", "privateDeviceDeleted", "driverRuntimeLocationDeleted",
+          "customerDeliveryPreferenceDeleted", "deliveryQuotesDeleted", "orderDeliveryPrivateDeleted",
+          "notificationItemsDeleted", "notificationUnreadDeleted", "notificationSummaryDeleted",
+          "clientVersionDeleted", "clientInstallationsDeleted", "clientInstallationSummaryDeleted",
+          "userDeleted", "verificationDeleted"].find((field) => manifest[field] !== true) || "complete";
       const failures = [];
       if (manifest.phoneIndexDeleted !== true) {
         if (!manifest.phoneIndexKey) {
@@ -7766,6 +8303,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
         }
       }
+      if (pendingStep === "phoneIndexDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       // Known media is optional infrastructure, isolated from all critical deletes.
       if (manifest.certificatePublicId && manifest.certificateDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -7778,16 +8316,55 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           failures.push("certificate_delete_failed");
         }
       }
-      for (const offerId of [...manifest.remainingOfferIds]) {
+      if (pendingStep === "certificateDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
+      if (manifest.remainingOfferIds.length) {
+        const offerId = manifest.remainingOfferIds[0];
+        if (!phase4aSafeSegment(offerId)) return yieldAccountDeletionCleanup(uid, owner, manifest, ["offer_id_invalid"], accessToken);
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
-          await deleteFirestoreDocument("offers", offerId, accessToken);
+          const offer = await getFirestoreSnapshot("offers", offerId, accessToken);
+          if (offer && resolveOfferProviderUid(offer.data) !== uid) throw new Error("Legacy offer owner changed");
+          if (offer && !await phase4aCommit([{
+            delete: phase4aDoc("offers", offerId, {}).name,
+            currentDocument: { updateTime: offer.updateTime }
+          }], accessToken)) throw new Error("Legacy offer changed");
           manifest.remainingOfferIds = manifest.remainingOfferIds.filter((id) => id !== offerId);
           const persisted = await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken);
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch {
           failures.push("offer_delete_failed");
         }
+        return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
+      }
+      if (!manifest.offerSweepComplete) {
+        if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        try {
+          const field = manifest.offerSweepField;
+          const offers = await accountDeletionOfferPage(uid, field, accessToken);
+          if (offers.length) {
+            if (offers.some((offer) => !phase4aSafeSegment(offer.data?._id) || offer.data[field] !== uid || resolveOfferProviderUid(offer.data) !== uid)) {
+              failures.push("offer_owner_mismatch");
+            } else {
+              for (const offer of offers) {
+                for (const limitation of cleanupLimitationsFrom(offer.data, "offer")) {
+                  if (!manifest.cleanupLimitations.includes(limitation)) {
+                    if (manifest.cleanupLimitations.length < 32) manifest.cleanupLimitations.push(limitation);
+                    else manifest.cleanupLimitationsOverflow = true;
+                  }
+                }
+              }
+              // Persist the media audit before a possibly ambiguous delete.
+              // Re-reading the first page after interruption cannot skip it.
+              if (!await writeDeletionState(uid, owner, { status: "cleanup_pending", cleanupManifest: manifest }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+              const committed = await phase4aCommit(offers.map((offer) => ({ delete: offer.name, currentDocument: { updateTime: offer.updateTime } })), accessToken);
+              if (!committed) failures.push("offer_delete_conflict");
+            }
+          } else {
+            manifest.offerSweepField = field === "providerId" ? "providerUid" : "done";
+            manifest.offerSweepComplete = manifest.offerSweepField === "done";
+          }
+        } catch { failures.push("offer_sweep_failed"); }
+        return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       }
       if (manifest.publicProfileDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -7798,6 +8375,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("public_profile_delete_failed"); }
       }
+      if (pendingStep === "publicProfileDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.privateDeviceDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7807,6 +8385,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("private_device_delete_failed"); }
       }
+      if (pendingStep === "privateDeviceDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.driverRuntimeLocationDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7816,6 +8395,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("driver_runtime_location_delete_failed"); }
       }
+      if (pendingStep === "driverRuntimeLocationDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.customerDeliveryPreferenceDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7825,6 +8405,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("customer_delivery_preference_delete_failed"); }
       }
+      if (pendingStep === "customerDeliveryPreferenceDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.deliveryQuotesDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7834,6 +8415,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("delivery_quotes_delete_failed"); }
       }
+      if (pendingStep === "deliveryQuotesDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.orderDeliveryPrivateDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7843,6 +8425,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("order_delivery_private_delete_failed"); }
       }
+      if (pendingStep === "orderDeliveryPrivateDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.notificationItemsDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7852,6 +8435,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("notification_items_delete_failed"); }
       }
+      if (pendingStep === "notificationItemsDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.notificationUnreadDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7861,6 +8445,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("notification_unread_delete_failed"); }
       }
+      if (pendingStep === "notificationUnreadDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.notificationSummaryDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7870,6 +8455,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("notification_summary_delete_failed"); }
       }
+      if (pendingStep === "notificationSummaryDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.clientVersionDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7879,6 +8465,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("client_version_delete_failed"); }
       }
+      if (pendingStep === "clientVersionDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.clientInstallationsDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7888,6 +8475,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("client_installations_delete_failed"); }
       }
+      if (pendingStep === "clientInstallationsDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.clientInstallationSummaryDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7897,6 +8485,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("client_installation_summary_delete_failed"); }
       }
+      if (pendingStep === "clientInstallationSummaryDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.userDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7906,6 +8495,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("user_delete_failed"); }
       }
+      if (pendingStep === "userDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
       if (manifest.verificationDeleted !== true) {
         if (!await writeDeletionState(uid, owner, { status: "cleanup_pending" }, accessToken)) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         try {
@@ -7915,7 +8505,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!persisted) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         } catch { failures.push("verification_delete_failed"); }
       }
-      const complete = manifest.remainingOfferIds.length === 0 && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.driverRuntimeLocationDeleted === true && manifest.customerDeliveryPreferenceDeleted === true && manifest.deliveryQuotesDeleted === true && manifest.orderDeliveryPrivateDeleted === true && manifest.notificationItemsDeleted === true && manifest.notificationUnreadDeleted === true && manifest.notificationSummaryDeleted === true && manifest.clientInstallationsDeleted === true && manifest.clientInstallationSummaryDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
+      if (pendingStep === "verificationDeleted") return yieldAccountDeletionCleanup(uid, owner, manifest, failures, accessToken);
+      const complete = manifest.remainingOfferIds.length === 0 && manifest.offerSweepComplete === true && manifest.phoneIndexDeleted === true && manifest.publicProfileDeleted === true && manifest.privateDeviceDeleted === true && manifest.driverRuntimeLocationDeleted === true && manifest.customerDeliveryPreferenceDeleted === true && manifest.deliveryQuotesDeleted === true && manifest.orderDeliveryPrivateDeleted === true && manifest.notificationItemsDeleted === true && manifest.notificationUnreadDeleted === true && manifest.notificationSummaryDeleted === true && manifest.clientVersionDeleted === true && manifest.clientInstallationsDeleted === true && manifest.clientInstallationSummaryDeleted === true && manifest.userDeleted === true && manifest.verificationDeleted === true && manifest.certificateDeleted === true;
       const final = await writeDeletionState(uid, owner, {
         status: complete ? "completed" : "cleanup_pending",
         cleanupManifest: manifest,
@@ -7938,16 +8529,58 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (!user || !["customer", "provider", "driver"].includes(user.role) || user.isOwner === true || user.privileged === true) {
           return await writeDeletionState(uid, owner, { status: "failed", code: "ADMIN_REQUIRED", failureCode: "ineligible" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
-        const active = await accountDeletionActiveOrders(uid, user.role, accessToken);
-        if (active.length) {
-          return await writeDeletionState(uid, owner, { status: "failed", code: "ACTIVE_ORDERS", failureCode: "active_orders" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        const preflight = record.status === "requested" && record.orderPreflight?.role === user.role ? record.orderPreflight :
+          { role: user.role, fieldIndex: 0, cursor: null, complete: false };
+        if (preflight.complete && (preflight.fieldIndex !== ACCOUNT_DELETION_ORDER_FIELDS.length || preflight.cursor !== null)) throw new Error("Deletion preflight completion invalid");
+        if (!preflight.complete) {
+          if (!Number.isInteger(preflight.fieldIndex) || preflight.fieldIndex < 0 || preflight.fieldIndex >= ACCOUNT_DELETION_ORDER_FIELDS.length) throw new Error("Deletion preflight state invalid");
+          const page = await accountDeletionOrderPage(uid, ACCOUNT_DELETION_ORDER_FIELDS[preflight.fieldIndex], preflight.cursor, accessToken);
+          if (page.orders.some((order) => orderIsActive(order) || !["cancelled", "delivered", "rejected", "completed"].includes(order?.status))) {
+            return await writeDeletionState(uid, owner, { status: "failed", code: "ACTIVE_ORDERS", failureCode: "active_orders", orderPreflight: null }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+          }
+          const fieldIndex = preflight.fieldIndex + (page.complete ? 1 : 0);
+          const nextPreflight = { role: user.role, fieldIndex, cursor: page.complete ? null : page.cursor,
+            complete: fieldIndex === ACCOUNT_DELETION_ORDER_FIELDS.length };
+          record = await writeDeletionState(uid, owner, { status: "requested", orderPreflight: nextPreflight }, accessToken, true);
+          return record || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        }
+        // The existing Final Rules deny direct order/offer writes. Do not
+        // cross the Auth boundary under the deployed Bridge Rules. This exact
+        // binding is an owner-controlled deployment prerequisite, not a V2 flag.
+        if (env.ACCOUNT_DELETION_FINAL_RULES_ACTIVE !== "true") {
+          return await writeDeletionState(uid, owner, { status: "requested", code: "ACCOUNT_DELETE_FAILED", failureCode: "final_rules_required" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
         const cleanupManifest = await buildAccountDeletionManifest(uid, user, accessToken, env);
-        record = await writeDeletionState(uid, owner, { uid, role: user.role, status: "in_progress", cleanupManifest, code: null, failureCode: "" }, accessToken);
+        record = await writeDeletionState(uid, owner, { uid, role: user.role, status: "in_progress", deletionAttemptId: crypto.randomUUID(), cleanupManifest, code: null, failureCode: "" }, accessToken, true);
         if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+        return record;
       }
       if (record.status === "in_progress") {
         if (!record.cleanupManifest) throw new Error("Cleanup manifest unavailable");
+        if (record.deletionAttemptId) {
+          // Marker creation and request CAS are one commit. An ambiguous
+          // response is reconciled by reading both documents before Auth.
+          let marker = await getFirestoreSnapshot(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken);
+          if (!marker) {
+            if (env.ACCOUNT_DELETION_FINAL_RULES_ACTIVE !== "true") return record;
+            const requestSnapshot = await getFirestoreSnapshot("account_deletion_requests", uid, accessToken);
+            if (!requestSnapshot || requestSnapshot.data.status !== "in_progress" || requestSnapshot.data.orderPreflight?.complete !== true ||
+                requestSnapshot.data.orderPreflight?.fieldIndex !== ACCOUNT_DELETION_ORDER_FIELDS.length ||
+                requestSnapshot.data.executionLeaseOwner !== owner || requestSnapshot.data.deletionAttemptId !== record.deletionAttemptId) return requestSnapshot?.data || record;
+            const now = new Date().toISOString();
+            try {
+              await phase4aCommit([{
+                update: phase4aDoc("account_deletion_requests", uid, { irreversibleStartedAt: now }),
+                updateMask: { fieldPaths: ["irreversibleStartedAt"] }, currentDocument: { updateTime: requestSnapshot.updateTime }
+              }, {
+                update: phase4aDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, { uid, attemptId: record.deletionAttemptId, startedAt: now }),
+                currentDocument: { exists: false }
+              }], accessToken);
+            } catch { /* Read authoritative state after an uncertain commit. */ }
+            marker = await getFirestoreSnapshot(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken);
+          }
+          if (marker?.data?.uid !== uid || marker.data.attemptId !== record.deletionAttemptId) return record;
+        }
         record = await writeDeletionState(uid, owner, { status: "in_progress" }, accessToken);
         if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         const authResult = await deleteFirebaseAuthUser(uid, env);
@@ -7955,7 +8588,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return await writeDeletionState(uid, owner, { status: "in_progress", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_uncertain" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
         if (authResult.outcome === "permanent") {
-          return await writeDeletionState(uid, owner, { status: "failed", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_rejected" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
+          // Keep the same attempt and marker. A later repaired Auth
+          // configuration can resume it; restarting preflight would create a
+          // new attempt that could never match the irreversible marker.
+          return await writeDeletionState(uid, owner, { status: "in_progress", code: "ACCOUNT_DELETE_FAILED", failureCode: "auth_delete_rejected" }, accessToken, true) || await getFirestoreDoc("account_deletion_requests", uid, accessToken);
         }
         record = await writeDeletionState(uid, owner, { status: "auth_deleted", authDeletedAt: new Date().toISOString(), code: null, failureCode: "" }, accessToken);
         if (!record) return await getFirestoreDoc("account_deletion_requests", uid, accessToken);
@@ -7984,7 +8620,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (!body || body.confirm !== true || Object.keys(body).some((key) => !["confirm"].includes(key))) return jsonResponse({ success: false, code: "INVALID_REQUEST", error: "confirm:true is required" }, 400);
       const existing = await getFirestoreDoc("account_deletion_requests", uid, accessToken);
       if (existing?.status === "completed") return jsonResponse({ success: true, status: "completed", code: null, idempotent: true });
-      if (existing?.status && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(existing.status)) return jsonResponse({ success: true, status: existing.status, code: existing.code || null, idempotent: true });
+      if (existing?.status && ACCOUNT_DELETION_BLOCKED_STATUSES.includes(existing.status)) {
+        try {
+          const result = await processAccountDeletion(uid, env, accessToken, existing);
+          return jsonResponse({ success: result.status === "completed", status: result.status, code: result.code || null, idempotent: true });
+        } catch {
+          return jsonResponse({ success: false, status: existing.status, code: "ACCOUNT_DELETE_FAILED", error: "Account deletion could not be completed" }, 500);
+        }
+      }
       const user = await getFirestoreDoc("users", uid, accessToken);
       if (!user || !["customer", "provider", "driver"].includes(user.role) || user.isOwner === true || user.privileged === true) return jsonResponse({ success: false, code: "ADMIN_REQUIRED", error: "Account is not eligible" }, 403);
       const record = existing || { uid, role: user.role, status: "requested", requestedAt: new Date().toISOString() };
@@ -8000,14 +8643,482 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(handleAccountDeletion, "handleAccountDeletion");
     __name2(handleAccountDeletion, "handleAccountDeletion");
-    async function resumeAccountDeletionsWithAccessToken(env, suppliedAccessToken) {
-      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-      const records = [];
-      for (const status of ["requested", "in_progress", "auth_deleted", "cleanup_pending"]) records.push(...await queryFirestore("account_deletion_requests", "status", "EQUAL", status, accessToken));
-      for (const record of records.slice(0, 10)) {
-        try { await processAccountDeletion(record.uid, env, accessToken, record); } catch {}
+    const CRON_QUEUE_STATE_COLLECTION = "cron_maintenance_state";
+    const CRON_QUEUE_STATE_ID = "account_deletion_outbox_v2";
+    const TRACKING_SESSIONS = "order_tracking_sessions";
+    const TRACKING_REGISTRIES = "order_tracking_registries";
+    const TRACKING_LEASES = "order_tracking_leases";
+    const TRACKING_RATE_LIMITS = "order_tracking_rate_limits";
+    const TRACKING_JOBS = "order_tracking_jobs";
+    const TRACKING_ROOT = "projects/tabbakheen-99883/databases/(default)/documents/";
+    const TRACKING_LEASE_SECONDS = 8 * 3600;
+    function trackingReady(env) {
+      return env.ORDER_TRACKING_IOS_REMOTE_ENABLED === "true" && env.ORDER_TRACKING_ANDROID_REMOTE_ENABLED === "true" &&
+        typeof env.ORDER_TRACKING_LEASE_SECRET === "string" && env.ORDER_TRACKING_LEASE_SECRET.length >= 32 &&
+        typeof env.ORDER_TRACKING_APNS_TEAM_ID === "string" && /^[A-Z0-9]{10}$/.test(env.ORDER_TRACKING_APNS_TEAM_ID) &&
+        typeof env.ORDER_TRACKING_APNS_KEY_ID === "string" && /^[A-Z0-9]{10}$/.test(env.ORDER_TRACKING_APNS_KEY_ID) &&
+        typeof env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8 === "string" && env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8.includes("BEGIN PRIVATE KEY") &&
+        ["production", "development"].includes(env.ORDER_TRACKING_APNS_ENV) &&
+        typeof env.FIREBASE_CLIENT_EMAIL === "string" && typeof env.FIREBASE_PRIVATE_KEY === "string";
+    }
+    function trackingDoc(collection, id) { return TRACKING_ROOT + collection + "/" + id; }
+    async function trackingSnapshot(collection, id, accessToken) {
+      if (!phase4aSafeSegment(id)) throw new Error("Invalid tracking document ID");
+      const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + "/" + collection + "/" + id,
+        { headers: { Authorization: "Bearer " + accessToken } }, 8e3);
+      if (response.status === 404) return null;
+      if (!response.ok || typeof body?.updateTime !== "string" || !body.fields) throw new Error("Tracking document read failed");
+      return { data: parseFirestoreDoc(body), updateTime: body.updateTime };
+    }
+    async function trackingGet(collection, id, accessToken) { return (await trackingSnapshot(collection, id, accessToken))?.data || null; }
+    async function trackingHash(value) { return base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))); }
+    async function trackingLease(env, uid, orderId, sessionId, nonce) {
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.ORDER_TRACKING_LEASE_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      return base64url(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode([uid, orderId, sessionId, nonce].join("\n"))));
+    }
+    function trackingTokenValid(platform, token) {
+      return typeof token === "string" && (platform === "ios" ? /^[0-9a-fA-F]{64,512}$/.test(token) && token.length % 2 === 0 :
+        platform === "android" && token.length <= 4096 && /^[\x21-\x7E]{20,4096}$/.test(token) &&
+          !token.startsWith("ExponentPushToken[") && !token.startsWith("ExpoPushToken["));
+    }
+    function trackingState(order, nowSeconds = Math.floor(Date.now() / 1e3)) {
+      const status = order?.status, delivery = order?.deliveryStatus;
+      let stage = "unknown";
+      if (status === "cancelled" || delivery === "cancelled") stage = "cancelled";
+      else if (status === "rejected") stage = "rejected";
+      else if (status === "delivered" || delivery === "delivered") stage = "completed";
+      else if (order?.paymentStatus === "PAYMENT_REJECTED") stage = "payment_failed";
+      else if (delivery === "arrived" || delivery === "delivered_pending_confirmation") stage = "arrived";
+      else if (delivery === "picked_up" || status === "picked_up") stage = "picked_up";
+      else if (delivery === "in_transit") stage = "in_transit";
+      else if (delivery === "driver_assigned" || status === "assigned_to_driver") stage = "assigned";
+      else if (status === "searching_driver" || ["pending_driver", "ready_for_driver", "driver_rejected"].includes(delivery)) stage = "searching";
+      else if (order?.deliveryMethod === "self_pickup" && delivery === "self_pickup_selected") stage = "self_pickup";
+      else if (status === "ready_for_pickup") stage = "ready";
+      else if (status === "preparing") stage = "preparing";
+      else if (status === "accepted") stage = "confirmed";
+      else if (status === "pending") stage = "received";
+      const orderVersion = Number.isSafeInteger(order?.stateVersion) && order.stateVersion >= 0 ? order.stateVersion : 0;
+      const deliveryVersion = Number.isSafeInteger(order?.deliveryStateVersion) && order.deliveryStateVersion >= 0 ? order.deliveryStateVersion : 0;
+      return { schemaVersion: 1, stage, orderVersion, deliveryVersion, updatedAt: nowSeconds, staleAt: nowSeconds + 600, etaEpochSeconds: null };
+    }
+    function trackingTerminal(stage) { return ["completed", "cancelled", "rejected", "payment_failed", "unknown"].includes(stage); }
+    function trackingVector(state) { return [state.orderVersion, state.deliveryVersion]; }
+    function trackingIsNewer(next, previous) {
+      if (!previous || !Number.isSafeInteger(previous.orderVersion) || !Number.isSafeInteger(previous.deliveryVersion)) return true;
+      return next.orderVersion >= previous.orderVersion && next.deliveryVersion >= previous.deliveryVersion &&
+        (next.orderVersion > previous.orderVersion || next.deliveryVersion > previous.deliveryVersion || next.stage !== previous.stage);
+    }
+    function trackingJobWrite(orderId, eventId, now = new Date().toISOString()) {
+      if (!trackingReady(globalThis)) return [];
+      return [{ update: phase4aDoc(TRACKING_JOBS, eventId, { orderId, eventId, status: "pending", createdAt: now }), currentDocument: { exists: false } }];
+    }
+    async function trackingRegister(uid, body, env, accessToken) {
+      if (!exactObjectKeys(body, ["schemaVersion", "orderId", "sessionId", "platform", "pushToken", "locale"]) || body.schemaVersion !== 1 ||
+          !phase4aSafeSegment(body.orderId) || !/^[A-Za-z0-9_-]{1,128}$/.test(body.sessionId) ||
+          !["ar", "en"].includes(body.locale) || !trackingTokenValid(body.platform, body.pushToken))
+        return { status: 400, code: "invalid_request" };
+      const now = Math.floor(Date.now() / 1e3);
+      const sessionId = await trackingHash([uid, body.orderId, body.sessionId].join("\n"));
+      const registryId = await trackingHash(body.orderId);
+      const nonce = base64url(crypto.getRandomValues(new Uint8Array(24)));
+      const newLease = await trackingLease(env, uid, body.orderId, body.sessionId, nonce);
+      const newHash = await trackingHash(newLease);
+      const names = [trackingDoc("orders", body.orderId), trackingDoc("users", uid),
+        trackingDoc("account_deletion_requests", uid), trackingDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid),
+        trackingDoc(TRACKING_REGISTRIES, registryId), trackingDoc(TRACKING_SESSIONS, sessionId), trackingDoc(TRACKING_RATE_LIMITS, uid)];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const order = read.get(names[0])?.data, user = read.get(names[1])?.data;
+        if (!order || order.customerUid !== uid || !user || user.role !== "customer" ||
+            ["disabled", "suspended"].includes(user.accountStatus) || read.get(names[2]) || read.get(names[3])) return { abort: "forbidden" };
+        const state = trackingState(order, now);
+        if (trackingTerminal(state.stage)) return { abort: "order_terminal" };
+        const registry = read.get(names[4]), previous = read.get(names[5]), rate = read.get(names[6]);
+        if (previous && (previous.data.uid !== uid || previous.data.orderId !== body.orderId ||
+            previous.data.sessionId !== body.sessionId || previous.data.platform !== body.platform)) return { abort: "forbidden" };
+        const slots = (Array.isArray(registry?.data?.sessions) ? registry.data.sessions : [])
+          .filter((slot) => slot && typeof slot.id === "string" && Number.isFinite(slot.expiresAt) && slot.expiresAt > now);
+        if (slots.filter((slot) => slot.id !== sessionId).length >= 3) return { abort: "capacity" };
+        // A Firebase-authenticated re-registration renews before the native
+        // client's five-minute refresh threshold, never with an expired lease.
+        const active = previous && previous.data.status !== "revoked" && previous.data.expiresAt > now + 300;
+        const changed = !active || previous.data.pushToken !== body.pushToken;
+        const windowStart = Number.isFinite(rate?.data?.windowStart) && rate.data.windowStart > now - 3600 ? rate.data.windowStart : now;
+        const count = windowStart === rate?.data?.windowStart ? Number(rate.data.count) || 0 : 0;
+        if (changed && count >= 12) return { abort: "rate_limited" };
+        const selectedNonce = active ? previous.data.leaseNonce : nonce;
+        const selectedHash = active ? previous.data.leaseHash : newHash;
+        if (!selectedNonce || !selectedHash) return { abort: "state_conflict" };
+        const expiresAt = active ? previous.data.expiresAt : now + TRACKING_LEASE_SECONDS;
+        const selectedSlots = [...slots.filter((slot) => slot.id !== sessionId), { id: sessionId, expiresAt }];
+        const newer = trackingIsNewer(state, previous?.data?.pendingState || previous?.data?.sentState);
+        const update = changed || newer || !slots.some((slot) => slot.id === sessionId);
+        const value = { nonce: selectedNonce, expiresAt, sessionId };
+        if (!update) return { writes: [], value, expected: value };
+        const fields = { uid, orderId: body.orderId, sessionId: body.sessionId, platform: body.platform,
+          pushToken: body.pushToken, locale: body.locale, leaseNonce: selectedNonce, leaseHash: selectedHash,
+          expiresAt, tokenGeneration: (previous?.data?.tokenGeneration || 0) + (changed ? 1 : 0),
+          pendingState: state, pendingEventId: "registration", status: "pending", attempts: 0, updatedAt: new Date().toISOString() };
+        const writes = [
+          { update: phase4aDoc(TRACKING_SESSIONS, sessionId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: previous ? { updateTime: previous.updateTime } : { exists: false } },
+          { update: phase4aDoc(TRACKING_REGISTRIES, registryId, { orderId: body.orderId, sessions: selectedSlots }), updateMask: { fieldPaths: ["orderId", "sessions"] }, currentDocument: registry ? { updateTime: registry.updateTime } : { exists: false } }
+        ];
+        if (!active) writes.push({ update: phase4aDoc(TRACKING_LEASES, selectedHash, { sessionDocId: sessionId, expiresAt }), currentDocument: { exists: false } });
+        if (changed) writes.push({ update: phase4aDoc(TRACKING_RATE_LIMITS, uid, { windowStart, count: count + 1 }), updateMask: { fieldPaths: ["windowStart", "count"] }, currentDocument: rate ? { updateTime: rate.updateTime } : { exists: false } });
+        return { writes, value, expected: value };
+      }, async (expected) => {
+        const stored = await trackingGet(TRACKING_SESSIONS, sessionId, accessToken);
+        return stored && stored.uid === uid && stored.orderId === body.orderId && stored.leaseNonce === expected.nonce &&
+          stored.expiresAt === expected.expiresAt ? expected : null;
+      }, 2, {}, 7, 4);
+      if (result.kind === "aborted") return { status: result.value === "rate_limited" ? 429 : result.value === "capacity" ? 409 : 403, code: result.value };
+      if (!["committed", "reconciled"].includes(result.kind)) return { status: 503, code: "state_conflict" };
+      const lease = await trackingLease(env, uid, body.orderId, body.sessionId, result.value.nonce);
+      return { status: 200, value: { success: true, lease, expiresAt: result.value.expiresAt } };
+    }
+    async function trackingLeaseMutation(action, request, env, accessToken) {
+      const match = /^OrderTrackingLease ([A-Za-z0-9_-]{32,512})$/.exec(request.headers.get("Authorization") || "");
+      if (!match) return { status: 401, code: "unauthorized" };
+      let body;
+      try { if (Number(request.headers.get("content-length")) > 8192) throw Error(); body = JSON.parse(await trackingReadTransportBody(request)); } catch { return { status: 400, code: "invalid_request" }; }
+      if (!exactObjectKeys(body, action === "rotate" ? ["schemaVersion", "sessionId", "pushToken"] : ["schemaVersion", "sessionId"]) ||
+          body.schemaVersion !== 1 || !/^[A-Za-z0-9_-]{1,128}$/.test(body.sessionId)) return { status: 400, code: "invalid_request" };
+      const leaseHash = await trackingHash(match[1]);
+      const leaseIndex = await trackingGet(TRACKING_LEASES, leaseHash, accessToken);
+      if (!leaseIndex || !phase4aSafeSegment(leaseIndex.sessionDocId)) return action === "end" ? { status: 200, value: { success: true } } : { status: 401, code: "unauthorized" };
+      const sessionDocId = leaseIndex.sessionDocId;
+      const preview = await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken);
+      if (!preview || preview.leaseHash !== leaseHash || preview.sessionId !== body.sessionId || preview.status === "revoked" ||
+          preview.expiresAt <= Date.now() / 1e3) return action === "end" ? { status: 200, value: { success: true } } : { status: 401, code: "unauthorized" };
+      if (action === "rotate" && !trackingTokenValid(preview.platform, body.pushToken)) return { status: 400, code: "invalid_request" };
+      const registryId = await trackingHash(preview.orderId);
+      const names = [trackingDoc(TRACKING_SESSIONS, sessionDocId), trackingDoc(TRACKING_LEASES, leaseHash), trackingDoc(TRACKING_REGISTRIES, registryId),
+        trackingDoc("orders", preview.orderId), trackingDoc("users", preview.uid), trackingDoc("account_deletion_requests", preview.uid),
+        trackingDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, preview.uid)];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const session = read.get(names[0]), index = read.get(names[1]), registry = read.get(names[2]);
+        if (!session || !index || session.data.leaseHash !== leaseHash || index.data.sessionDocId !== sessionDocId ||
+            session.data.sessionId !== body.sessionId || session.data.expiresAt <= Date.now() / 1e3) return { abort: "unauthorized" };
+        if (action === "end") {
+          const slots = (registry?.data?.sessions || []).filter((slot) => slot.id !== sessionDocId);
+          const writes = [
+            { update: phase4aDoc(TRACKING_SESSIONS, sessionDocId, { status: "revoked", pushToken: null, leaseHash: null, pendingState: null }),
+              updateMask: { fieldPaths: ["status", "pushToken", "leaseHash", "pendingState", "expiresAt"] }, currentDocument: { updateTime: session.updateTime } },
+            { delete: names[1], currentDocument: { updateTime: index.updateTime } }
+          ];
+          if (registry) writes.push({ update: phase4aDoc(TRACKING_REGISTRIES, registryId, { sessions: slots }), updateMask: { fieldPaths: ["sessions"] }, currentDocument: { updateTime: registry.updateTime } });
+          return { writes, value: true, expected: true };
+        }
+        const order = read.get(names[3])?.data, user = read.get(names[4])?.data;
+        if (!order || order.customerUid !== session.data.uid || !user || user.role !== "customer" ||
+            read.get(names[5]) || read.get(names[6]) || trackingTerminal(trackingState(order).stage)) return { abort: "forbidden" };
+        if (session.data.pushToken === body.pushToken) return { writes: [], value: true, expected: true };
+        const now = Math.floor(Date.now() / 1e3);
+        const windowStart = session.data.rotationWindowStart > now - 3600 ? session.data.rotationWindowStart : now;
+        const count = windowStart === session.data.rotationWindowStart ? session.data.rotationCount || 0 : 0;
+        if (count >= 12) return { abort: "rate_limited" };
+        const fields = { pushToken: body.pushToken, tokenGeneration: (session.data.tokenGeneration || 0) + 1,
+          pendingState: trackingState(order, now), pendingEventId: "rotation", status: "pending", attempts: 0,
+          rotationWindowStart: windowStart, rotationCount: count + 1 };
+        return { writes: [{ update: phase4aDoc(TRACKING_SESSIONS, sessionDocId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: session.updateTime } }], value: true, expected: true };
+      }, async () => {
+        const latest = await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken);
+        return action === "end" ? latest?.status === "revoked" : latest?.pushToken === body.pushToken;
+      }, 2, {}, 7, 3);
+      if (["committed", "reconciled"].includes(result.kind)) return { status: 200, value: { success: true } };
+      if (result.kind === "aborted") return { status: result.value === "rate_limited" ? 429 : result.value === "forbidden" ? 403 : 401, code: result.value };
+      return { status: 503, code: "state_conflict" };
+    }
+    async function handleOrderTrackingRequest(request, path, env) {
+      const action = path.slice("/order-tracking/".length);
+      if (!["capabilities", "register", "rotate", "end"].includes(action)) return jsonResponse({ success: false, code: "not_found" }, 404);
+      if (action === "capabilities" && request.method !== "GET" || action !== "capabilities" && request.method !== "POST") return jsonResponse({ success: false, code: "method_not_allowed" }, 405);
+      try {
+        let uid = null;
+        if (action === "capabilities" || action === "register") {
+          try { uid = await verifyFirebaseIdToken(getTokenFromRequest(request)); } catch { return jsonResponse({ success: false, code: "unauthorized" }, 401); }
+        }
+        if (action === "capabilities") return jsonResponse({ success: true, schemaVersion: 1, iosRemote: trackingReady(env), androidRemote: trackingReady(env) });
+        if (!trackingReady(env) && action !== "end") return jsonResponse({ success: false, code: "tracking_unavailable" }, 503);
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        let outcome;
+        if (action === "register") {
+          let body;
+          try { if (Number(request.headers.get("content-length")) > 8192) throw Error(); body = JSON.parse(await trackingReadTransportBody(request)); } catch { return jsonResponse({ success: false, code: "invalid_request" }, 400); }
+          outcome = await trackingRegister(uid, body, env, accessToken);
+        } else outcome = await trackingLeaseMutation(action, request, env, accessToken);
+        return jsonResponse(outcome.value || { success: false, code: outcome.code }, outcome.status);
+      } catch { return jsonResponse({ success: false, code: "tracking_unavailable" }, 503); }
+    }
+    async function trackingReadTransportBody(response) {
+      if (!response.body) return "";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      let result = "", bytes = 0;
+      let timer;
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Tracking response deadline exceeded")), 8e3);
+      });
+      try {
+        while (true) {
+          const chunk = await Promise.race([reader.read(), deadline]);
+          if (chunk.done) break;
+          bytes += chunk.value.byteLength;
+          if (bytes > 8192) throw new Error("Tracking transport response too large");
+          result += decoder.decode(chunk.value, { stream: true });
+        }
+        return result + decoder.decode();
+      } finally { clearTimeout(timer); try { await reader.cancel(); } catch {} }
+    }
+    async function trackingMessagingAccessToken(env) {
+      const jwt = await createJWT(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY,
+        "https://www.googleapis.com/auth/firebase.messaging");
+      const response = await fetch(TOKEN_URL, {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(8e3),
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Ajwt-bearer&assertion=${jwt}`
+      });
+      const raw = await trackingReadTransportBody(response);
+      if (!response.ok) throw new Error("Tracking OAuth unavailable");
+      const token = JSON.parse(raw).access_token;
+      if (typeof token !== "string" || token.length < 1 || token.length > 8192) throw new Error("Invalid tracking OAuth response");
+      return token;
+    }
+    async function trackingApnsJwt(env) {
+      const pem = env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8.replace(/\\n/g, "\n").replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, "");
+      const bytes = Uint8Array.from(atob(pem), (char) => char.charCodeAt(0));
+      const key = await crypto.subtle.importKey("pkcs8", bytes, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+      const part = base64urlStr(JSON.stringify({ alg: "ES256", kid: env.ORDER_TRACKING_APNS_KEY_ID })) + "." +
+        base64urlStr(JSON.stringify({ iss: env.ORDER_TRACKING_APNS_TEAM_ID, iat: Math.floor(Date.now() / 1e3) }));
+      return part + "." + base64url(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(part)));
+    }
+    async function trackingSend(env, session, state, event) {
+      try {
+        if (session.platform === "ios") {
+          const host = env.ORDER_TRACKING_APNS_ENV === "production" ? "https://api.push.apple.com" : "https://api.sandbox.push.apple.com";
+          const aps = { timestamp: Math.floor(Date.now() / 1e3), event, "content-state": state, "stale-date": state.staleAt,
+            ...(event === "end" ? { "dismissal-date": Math.floor(Date.now() / 1e3) } : {}) };
+          const response = await fetch(host + "/3/device/" + session.pushToken, {
+            method: "POST", redirect: "error", signal: AbortSignal.timeout(8e3),
+            headers: { authorization: "bearer " + await trackingApnsJwt(env), "apns-topic": "com.tabbakheen.app.push-type.liveactivity",
+              "apns-push-type": "liveactivity", "apns-priority": "10", "content-type": "application/json" },
+            body: JSON.stringify({ aps })
+          });
+          await trackingReadTransportBody(response);
+          if (response.status === 200) return "accepted";
+          if (response.status === 410) return "retired";
+          if (response.status === 429) return "retry";
+          return "uncertain";
+        }
+        const tracking = JSON.stringify({ schemaVersion: 1, sessionId: session.sessionId, orderId: session.orderId, event, "content-state": state });
+        if (new TextEncoder().encode(tracking).byteLength > 4096) return "uncertain";
+        const bearer = await trackingMessagingAccessToken(env);
+        const response = await fetch("https://fcm.googleapis.com/v1/projects/tabbakheen-99883/messages:send", {
+          method: "POST", redirect: "error", signal: AbortSignal.timeout(8e3),
+          headers: { authorization: "Bearer " + bearer, "content-type": "application/json" },
+          body: JSON.stringify({ message: { token: session.pushToken, data: { kind: "tabbakheen.order-tracking.v1", tracking },
+            android: { priority: "HIGH", ttl: "60s" } } })
+        });
+        const raw = await trackingReadTransportBody(response);
+        if (response.status === 200) return "accepted";
+        let errorCode = "";
+        try { errorCode = (JSON.parse(raw).error?.details || []).find((detail) => detail.errorCode)?.errorCode || ""; } catch {}
+        if (errorCode === "UNREGISTERED" || errorCode === "SENDER_ID_MISMATCH") return "retired";
+        if (response.status === 429) return "retry";
+        return "uncertain";
+      } catch { return "uncertain"; }
+    }
+    async function trackingProjectJob(job, accessToken) {
+      if (!job || !phase4aSafeSegment(job.orderId) || !phase4aSafeSegment(job._id)) return false;
+      const registryId = await trackingHash(job.orderId);
+      const registry = await trackingGet(TRACKING_REGISTRIES, registryId, accessToken);
+      const ids = (Array.isArray(registry?.sessions) ? registry.sessions : []).map((slot) => slot?.id);
+      if (ids.length > 3 || ids.some((id) => !phase4aSafeSegment(id))) throw new Error("Tracking registry exceeds cap");
+      const names = [trackingDoc(TRACKING_JOBS, job._id), trackingDoc("orders", job.orderId), trackingDoc(TRACKING_REGISTRIES, registryId),
+        ...ids.map((id) => trackingDoc(TRACKING_SESSIONS, id))];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const currentJob = read.get(names[0]), order = read.get(names[1])?.data, currentRegistry = read.get(names[2]);
+        if (!currentJob || !["pending", "failed"].includes(currentJob.data.status)) return { abort: "already_done" };
+        if (JSON.stringify((currentRegistry?.data?.sessions || []).map((slot) => slot.id)) !== JSON.stringify(ids)) return { abort: "registry_changed" };
+        const state = trackingState(order);
+        const writes = [];
+        for (let index = 0; index < ids.length; index++) {
+          const snapshot = read.get(names[3 + index]);
+          if (!snapshot || snapshot.data.orderId !== job.orderId || snapshot.data.status === "revoked" ||
+              snapshot.data.expiresAt <= Date.now() / 1e3) continue;
+          const previousState = snapshot.data.pendingState || snapshot.data.sentState;
+          const target = order ? state : { ...state,
+            orderVersion: Math.max(state.orderVersion, previousState?.orderVersion || 0),
+            deliveryVersion: Math.max(state.deliveryVersion, previousState?.deliveryVersion || 0) };
+          if (!trackingIsNewer(target, previousState)) continue;
+          const fields = { pendingState: target, pendingEventId: job.eventId || job._id, status: "pending", attempts: 0 };
+          writes.push({ update: phase4aDoc(TRACKING_SESSIONS, ids[index], fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snapshot.updateTime } });
+        }
+        writes.push({ update: phase4aDoc(TRACKING_JOBS, job._id, { status: "terminal", completedAt: new Date().toISOString() }),
+          updateMask: { fieldPaths: ["status", "completedAt"] }, currentDocument: { updateTime: currentJob.updateTime } });
+        return { writes, value: true, expected: true };
+      }, async () => (await trackingGet(TRACKING_JOBS, job._id, accessToken))?.status === "terminal", 2, {}, 6, 4);
+      return ["committed", "reconciled"].includes(result.kind);
+    }
+    async function trackingRetire(sessionDocId, accessToken) {
+      const preview = await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken);
+      if (!preview || preview.status === "revoked" && preview.expiresAt == null) return true;
+      const registryId = await trackingHash(preview.orderId);
+      const names = [trackingDoc(TRACKING_SESSIONS, sessionDocId), trackingDoc(TRACKING_REGISTRIES, registryId),
+        ...(preview.leaseHash ? [trackingDoc(TRACKING_LEASES, preview.leaseHash)] : [])];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const session = read.get(names[0]), registry = read.get(names[1]), index = names[2] ? read.get(names[2]) : null;
+        if (!session || session.data.orderId !== preview.orderId || session.data.leaseHash !== preview.leaseHash) return { abort: "changed" };
+        const fields = { status: "revoked", pushToken: null, leaseHash: null, pendingState: null };
+        const writes = [{ update: phase4aDoc(TRACKING_SESSIONS, sessionDocId, fields), updateMask: { fieldPaths: [...Object.keys(fields), "expiresAt"] },
+          currentDocument: { updateTime: session.updateTime } }];
+        if (registry) writes.push({ update: phase4aDoc(TRACKING_REGISTRIES, registryId,
+          { sessions: (registry.data.sessions || []).filter((slot) => slot.id !== sessionDocId) }),
+          updateMask: { fieldPaths: ["sessions"] }, currentDocument: { updateTime: registry.updateTime } });
+        if (index) writes.push({ delete: names[2], currentDocument: { updateTime: index.updateTime } });
+        return { writes, value: true, expected: true };
+      }, async () => (await trackingGet(TRACKING_SESSIONS, sessionDocId, accessToken))?.status === "revoked", 2, {}, 3, 3);
+      return ["committed", "reconciled"].includes(result.kind);
+    }
+    async function trackingDispatch(sessionDoc, env, accessToken) {
+      if (!sessionDoc || !phase4aSafeSegment(sessionDoc._id) || !phase4aSafeSegment(sessionDoc.orderId)) return false;
+      const now = Math.floor(Date.now() / 1e3);
+      if (sessionDoc.nextAttemptAt && sessionDoc.nextAttemptAt > now) return false;
+      const owner = crypto.randomUUID();
+      const names = [trackingDoc(TRACKING_SESSIONS, sessionDoc._id), trackingDoc("orders", sessionDoc.orderId),
+        trackingDoc("users", sessionDoc.uid), trackingDoc("account_deletion_requests", sessionDoc.uid),
+        trackingDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, sessionDoc.uid)];
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const session = read.get(names[0]), order = read.get(names[1])?.data, user = read.get(names[2])?.data;
+        if (!session || !["pending", "failed"].includes(session.data.status) || !session.data.pushToken ||
+            session.data.expiresAt <= now) return { abort: "inactive" };
+        const authorized = !!order && order.customerUid === session.data.uid && user?.role === "customer" &&
+          !["disabled", "suspended"].includes(user.accountStatus) && !read.get(names[3]) && !read.get(names[4]);
+        const state = trackingState(authorized ? order : null, now);
+        const latest = !authorized ? { ...state,
+          orderVersion: Math.max(state.orderVersion, session.data.pendingState?.orderVersion || 0),
+          deliveryVersion: Math.max(state.deliveryVersion, session.data.pendingState?.deliveryVersion || 0) } :
+          trackingIsNewer(state, session.data.pendingState) ? state : session.data.pendingState;
+        const event = !authorized || trackingTerminal(latest.stage) ? "end" : "update";
+        const fields = { status: "inflight", dispatchOwner: owner, dispatchUntil: now + 30, pendingState: latest,
+          dispatchKey: [session.data.pendingEventId || "registration", session.data.sessionId, session.data.tokenGeneration || 1,
+            ...trackingVector(latest)].join(":"), attempts: (session.data.attempts || 0) + 1 };
+        return { writes: [{ update: phase4aDoc(TRACKING_SESSIONS, sessionDoc._id, fields), updateMask: { fieldPaths: Object.keys(fields) },
+          currentDocument: { updateTime: session.updateTime } }], value: { state: latest, event }, expected: { owner } };
+      }, async (expected) => {
+        const persisted = await trackingGet(TRACKING_SESSIONS, sessionDoc._id, accessToken);
+        return persisted?.dispatchOwner === expected.owner && persisted.status === "inflight" ? { state: persisted.pendingState,
+          event: trackingTerminal(persisted.pendingState?.stage) ? "end" : "update" } : null;
+      }, 2, {}, 5, 1);
+      if (!["committed", "reconciled"].includes(result.kind)) return false;
+      const claimed = await trackingSnapshot(TRACKING_SESSIONS, sessionDoc._id, accessToken);
+      if (!claimed || claimed.data.dispatchOwner !== owner || claimed.data.status !== "inflight" || claimed.data.dispatchUntil <= Date.now() / 1e3) return false;
+      const [currentOrder, currentUser, deletion, marker] = await Promise.all([
+        trackingGet("orders", claimed.data.orderId, accessToken), trackingGet("users", claimed.data.uid, accessToken),
+        trackingGet("account_deletion_requests", claimed.data.uid, accessToken),
+        trackingGet(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, claimed.data.uid, accessToken)
+      ]);
+      const stillAuthorized = currentOrder?.customerUid === claimed.data.uid && currentUser?.role === "customer" &&
+        !["disabled", "suspended"].includes(currentUser.accountStatus) && !deletion && !marker;
+      if (!stillAuthorized && claimed.data.pendingState?.stage !== "unknown" ||
+          stillAuthorized && trackingIsNewer(trackingState(currentOrder), claimed.data.pendingState)) {
+        const fresh = trackingState(stillAuthorized ? currentOrder : null);
+        const next = stillAuthorized ? fresh : { ...fresh,
+          orderVersion: Math.max(fresh.orderVersion, claimed.data.pendingState?.orderVersion || 0),
+          deliveryVersion: Math.max(fresh.deliveryVersion, claimed.data.pendingState?.deliveryVersion || 0) };
+        await compareAndSetFirestoreDocument(TRACKING_SESSIONS, sessionDoc._id,
+          { pendingState: next, status: "pending", dispatchOwner: null, attempts: 0 }, claimed.updateTime, accessToken);
+        return false;
       }
-      return records.length > 0;
+      // Persisted `inflight` is deliberately NOT retryable after a crash or a
+      // lost transport response. A future authoritative state can supersede it.
+      const outcome = await trackingSend(env, claimed.data, claimed.data.pendingState, result.value.event);
+      const fields = outcome === "accepted" ? { status: trackingTerminal(claimed.data.pendingState.stage) ? "terminal" : "sent", sentState: claimed.data.pendingState } :
+        outcome === "retired" ? { status: "revoked", pushToken: null } :
+        outcome === "retry" && claimed.data.attempts < 3 ? { status: "failed", nextAttemptAt: Math.floor(Date.now() / 1e3) + 60 * claimed.data.attempts } :
+        { status: "uncertain" };
+      const saved = await compareAndSetFirestoreDocument(TRACKING_SESSIONS, sessionDoc._id, { ...fields, dispatchOwner: null }, claimed.updateTime, accessToken);
+      if (saved.ok && (outcome === "retired" || outcome === "accepted" && result.value.event === "end"))
+        await trackingRetire(sessionDoc._id, accessToken);
+      return true;
+    }
+    async function handleScheduledTracking(env, accessToken) {
+      if (!trackingReady(env)) return false;
+      const minute = Math.floor(Date.now() / 6e4);
+      const expireOne = async () => {
+        const expired = await queryFirestoreLimited(TRACKING_SESSIONS, "expiresAt", "LESS_THAN_OR_EQUAL", Math.floor(Date.now() / 1e3), 1, accessToken);
+        return expired[0] ? trackingRetire(expired[0]._id, accessToken) : false;
+      };
+      // Reserve one fast-lane slot per six minutes for expired-lease cleanup,
+      // even under a sustained tracking backlog. Each call still does one unit.
+      if (minute % 6 === 0 && await expireOne()) return true;
+      const project = async () => {
+        const job = await cronQueueNext(TRACKING_JOBS, minute % 2 ? "pending" : "failed", accessToken) ||
+          await cronQueueNext(TRACKING_JOBS, minute % 2 ? "failed" : "pending", accessToken);
+        return job ? trackingProjectJob(job, accessToken) : false;
+      };
+      const dispatch = async () => {
+        const session = await cronQueueNext(TRACKING_SESSIONS, minute % 2 ? "failed" : "pending", accessToken) ||
+          await cronQueueNext(TRACKING_SESSIONS, minute % 2 ? "pending" : "failed", accessToken);
+        return session ? trackingDispatch(session, env, accessToken) : false;
+      };
+      if (minute % 2 ? await project() || await dispatch() : await dispatch() || await project()) return true;
+      return minute % 6 === 0 ? false : expireOne();
+    }
+    async function cronQueueNext(collection, status, accessToken) {
+      const key = collection + "_" + status;
+      const prefix = phase4aDoc(collection, "", {}).name;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let checkpoint = await getFirestoreSnapshot(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID, accessToken);
+        if (!checkpoint) {
+          await phase4aCommit([{ update: phase4aDoc(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID, { cursors: {} }), currentDocument: { exists: false } }], accessToken);
+          checkpoint = await getFirestoreSnapshot(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID, accessToken);
+          if (!checkpoint) return null;
+        }
+        const cursors = checkpoint.data.cursors && typeof checkpoint.data.cursors === "object" && !Array.isArray(checkpoint.data.cursors) ? checkpoint.data.cursors : {};
+        const prior = cursors[key] || null;
+        if (prior && (typeof prior !== "string" || !prior.startsWith(prefix) || prior.length > 2048)) throw new Error("Invalid Cron cursor");
+        const page = async (cursor) => {
+          const query = { from: [{ collectionId: collection }],
+            where: { fieldFilter: { field: { fieldPath: "status" }, op: "EQUAL", value: { stringValue: status } } },
+            orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }], limit: 3 };
+          if (cursor) query.startAt = { values: [{ referenceValue: cursor }], before: false };
+          const { response, body } = await firestoreBoundedJsonRequest(FIRESTORE_BASE + ":runQuery", {
+            method: "POST", headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+            body: JSON.stringify({ structuredQuery: query })
+          }, 8e3);
+          if (!response.ok || !Array.isArray(body) || !body.length || body.length > 4) throw new Error("Cron queue page failed");
+          const docs = body.filter((entry) => entry.document).map((entry) => entry.document);
+          if (docs.length > 3 || docs.some((doc) => !doc.name?.startsWith(prefix))) throw new Error("Cron queue page malformed");
+          return docs;
+        };
+        let docs = await page(prior);
+        if (!docs.length && prior) docs = await page(null);
+        const now = Date.now();
+        const selected = docs.map(parseFirestoreDoc).find((doc) =>
+          (!doc.leaseUntil || new Date(doc.leaseUntil).getTime() <= now) &&
+          (!doc.receiptLeaseUntil || new Date(doc.receiptLeaseUntil).getTime() <= now)) || null;
+        const nextCursor = selected ? phase4aDoc(collection, selected._id, {}).name : docs.length ? docs[docs.length - 1].name : null;
+        // A supported Commit updateTime precondition is the cursor CAS. On a
+        // lost response, the next invocation rereads the durable cursor;
+        // replaying a selected item remains safe only through its own lease.
+        const written = await phase4aCommit([{
+          update: phase4aDoc(CRON_QUEUE_STATE_COLLECTION, CRON_QUEUE_STATE_ID,
+            { cursors: { ...cursors, [key]: nextCursor } }),
+          updateMask: { fieldPaths: ["cursors"] },
+          currentDocument: { updateTime: checkpoint.updateTime }
+        }], accessToken);
+        if (written) return selected;
+      }
+      return null;
+    }
+    async function resumeAccountDeletionsWithAccessToken(env, suppliedAccessToken, status = "requested") {
+      const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+      if (!["requested", "in_progress", "auth_deleted", "cleanup_pending"].includes(status)) throw new Error("Invalid deletion queue status");
+      const record = await cronQueueNext("account_deletion_requests", status, accessToken);
+      if (!record || !phase4aSafeSegment(record.uid)) return false;
+      try { await processAccountDeletion(record.uid, env, accessToken, record); } catch { /* State remains retryable on the next cursor sweep. */ }
+      return true;
     }
     async function resumeAccountDeletions(env) {
       return resumeAccountDeletionsWithAccessToken(env);
@@ -8100,33 +9211,22 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         queryFirestoreLimited(DELIVERY_QUOTES_COLLECTION, "status", "EQUAL", "used", 10, accessToken)
       ]);
       const ids = [...new Set([...expired, ...used].map((quote) => quote?._id).filter(phase4aSafeSegment))].slice(0, 20);
-      if (ids.length) await phase4aCommit(ids.map((id) => ({ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + id })), accessToken);
+      return ids.length ? !!await phase4aCommit(ids.map((id) => ({ delete: "projects/tabbakheen-99883/databases/(default)/documents/" + DELIVERY_QUOTES_COLLECTION + "/" + id })), accessToken) : false;
     }
-    async function handleScheduledOutbox(env, suppliedAccessToken) {
+    async function handleScheduledOutbox(env, suppliedAccessToken, status = "pending") {
       // Commercial entitlement reconciliation is intentionally event-driven
       // (entitlement reads and denied mutations). A minute-cron sweep would
       // require scanning users/offers or new index assumptions, so none is run.
       const accessToken = suppliedAccessToken || await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-      const [pending, failed, sent, pendingOrders] = await Promise.all([
-        queryFirestore("order_transition_events", "status", "EQUAL", "pending", accessToken),
-        queryFirestore("order_transition_events", "status", "EQUAL", "failed", accessToken),
-        queryFirestore("order_transition_events", "status", "EQUAL", "sent", accessToken),
-        // Only pending orders that still need the v1 -> v2 notification
-        // repair. The old status == "pending" scan re-read every stale
-        // pending order every minute (~26k reads/day on its own).
-        queryFirestoreAllEqual("orders", { status: "pending", transactionalNotificationVersion: 1 }, 25, accessToken)
-      ]);
-      // One outbox work item per invocation gives targeted matching a hard
-      // subrequest ceiling. Admin broadcasts use a separate architecture.
-      const retryableEvent = [...pending, ...failed].find((eventDoc) => !eventDoc.leaseUntil || new Date(eventDoc.leaseUntil).getTime() <= Date.now());
-      if (retryableEvent) {
-        await sendTransitionNotification(retryableEvent.transition, retryableEvent.orderId, accessToken, retryableEvent.stateVersion, retryableEvent._id);
+      if (["pending", "failed", "sent"].includes(status)) {
+        const eventDoc = await cronQueueNext("order_transition_events", status, accessToken);
+        if (!eventDoc) return false;
+        if (status === "sent") await pollOutboxReceipts(eventDoc, accessToken);
+        else await sendTransitionNotification(eventDoc.transition, eventDoc.orderId, accessToken, eventDoc.stateVersion, eventDoc._id);
         return true;
       }
-      if (sent.length) {
-        await pollOutboxReceipts(sent[0], accessToken);
-        return true;
-      }
+      if (status !== "legacy_order") throw new Error("Invalid outbox queue status");
+      const pendingOrders = await queryFirestoreAllEqual("orders", { status: "pending", transactionalNotificationVersion: 1 }, 3, accessToken);
       const repairOrder = pendingOrders.find((item) => item.status === "pending" && item.transactionalNotificationVersion === 1);
       if (repairOrder) {
         const order = repairOrder;
@@ -8141,30 +9241,73 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         }
         return true;
       }
-      return pending.length > 0 || failed.length > 0 || sent.length > 0 || pendingOrders.length > 0;
+      return false;
     }
     __name(handleScheduledOutbox, "handleScheduledOutbox");
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
     async function handleScheduledMaintenance(env) {
       const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-      // Never combine account-deletion work with outbox transport in the same
-      // invocation: deletion retries can be large and are not part of the
-      // targeted notification's fixed budget.
-      const deletionBusy = await resumeAccountDeletionsWithAccessToken(env, accessToken);
-      if (deletionBusy) return;
-      const outboxBusy = await handleScheduledOutbox(env, accessToken);
-      // Existing outbox and account-deletion work always has priority. On an
-      // idle minute, process one one-driver match page; cleanup uses the lane
-      // only when no match job is waiting. This keeps the modeled worst case
-      // below the 50-subrequest Free-plan ceiling without changing the cron.
-      if (outboxBusy) return;
-      if (!await processDeliveryMatchJobs(env, accessToken)) await cleanupDeliveryQuotes(env, accessToken);
+      return handleScheduledMaintenanceWithAccessToken(env, accessToken);
+    }
+    async function handleScheduledMaintenanceWithAccessToken(env, accessToken) {
+      // Fast lanes share four of six minute slots; deletion and quote cleanup
+      // retain reserved slots. An empty maintenance lane yields to fast work.
+      // At most two bounded business units run on a fast invocation.
+      const minute = Math.floor(Date.now() / 6e4);
+      const lane = ["fast", "fast", "deletion", "fast", "fast", "quotes"][minute % 6];
+      const runQueue = async (queue) => {
+        const statusIndex = queue === "deletion" ? Math.floor(minute / 6) % 4 : minute % 4;
+        const statuses = queue === "deletion"
+          ? ["requested", "in_progress", "auth_deleted", "cleanup_pending"]
+          : ["pending", "failed", "sent", "legacy_order"];
+        // Rotating first choice prevents a persistent status from starving the
+        // other durable queues; a lone active status is found every slot.
+        for (let offset = 0; offset < statuses.length; offset++) {
+          const status = statuses[(statusIndex + offset) % statuses.length];
+          const worked = queue === "deletion"
+            ? await resumeAccountDeletionsWithAccessToken(env, accessToken, status)
+            : await handleScheduledOutbox(env, accessToken, status);
+          if (worked) return true;
+        }
+        return false;
+      };
+      const runFast = async () => {
+        let failure;
+        try { await runQueue("outbox"); } catch (error) { failure = error; }
+        try { await processDeliveryMatchJobs(env, accessToken); } catch (error) { failure ||= error; }
+        // One bounded native-tracking unit only when both owner-controlled
+        // transports and their credentials are configured. Legacy Cron is
+        // unchanged while this new feature remains DEFAULT OFF.
+        try { await handleScheduledTracking(env, accessToken); } catch (error) { failure ||= error; }
+        if (failure) throw failure;
+      };
+      if (lane === "fast") return runFast();
+      let worked = false;
+      let failure;
+      try { worked = lane === "deletion" ? await runQueue("deletion") : await cleanupDeliveryQuotes(env, accessToken); }
+      catch (error) { failure = error; }
+      if (!worked) {
+        try { await runFast(); } catch (error) { failure ||= error; }
+      }
+      if (failure) throw failure;
     }
     // Offline tests load the compiled Worker in Node with this explicit process
     // flag. Cloudflare Workers have no `process`, so no test surface exists in
     // production.
     if (typeof process !== "undefined" && process?.env?.PHONE_AUTH_TEST_MODE === "1") {
       globalThis.__PHONE_AUTH_TEST_HOOKS = {
+        trackingReady,
+        trackingState,
+        trackingTokenValid,
+        trackingIsNewer,
+        trackingRegister,
+        trackingLeaseMutation,
+        trackingProjectJob,
+        trackingDispatch,
+        trackingSend,
+        handleScheduledTracking,
+        handleOrderTrackingRequest,
+        firestoreReadWriteTransaction,
         escapeHtml,
         validateInvoicePayload,
         generateInvoiceHTML,
@@ -8188,6 +9331,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         phoneLoginActivationBlocker,
         executePhoneIndexBackfill,
         executeAccountDeletionCleanup,
+        accountDeletionOrderPage,
+        accountDeletionOfferPage,
+        processAccountDeletion,
+        handleAccountDeletion,
+        resumeAccountDeletionsWithAccessToken,
+        cronQueueNext,
+        handleScheduledOutbox,
+        handleScheduledMaintenance,
+        handleScheduledMaintenanceWithAccessToken,
         classifyPhoneIndexBackfill,
         phoneLookupKey,
         phase4aCommit,
@@ -8257,6 +9409,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         handleMyComplaints,
         handleComplaintCreate,
         claimNotificationEvent,
+        sendTransitionNotification,
         getEventRecipientUids,
         prepareNotificationCreate,
         persistUserNotification,
@@ -8274,6 +9427,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         recordClientVersion,
         compareReleaseSemver,
         classifyClientVersion,
+        classifyReleaseDisplay,
         summarizeClientVersion,
         releaseIntelligenceForUsers,
         releaseReminderCandidate,
@@ -8314,6 +9468,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof ADMIN_TOKEN_SECRET !== "undefined") env.ADMIN_TOKEN_SECRET = ADMIN_TOKEN_SECRET;
       } catch {
       }
+      try {
+        if (typeof V2_ORDER_CREATION_ENABLED !== "undefined") env.V2_ORDER_CREATION_ENABLED = V2_ORDER_CREATION_ENABLED;
+      } catch {
+      }
+      try { if (typeof ORDER_TRACKING_IOS_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_IOS_REMOTE_ENABLED = ORDER_TRACKING_IOS_REMOTE_ENABLED; } catch {}
+      try { if (typeof ORDER_TRACKING_ANDROID_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_ANDROID_REMOTE_ENABLED = ORDER_TRACKING_ANDROID_REMOTE_ENABLED; } catch {}
+      try { if (typeof ORDER_TRACKING_LEASE_SECRET !== "undefined") env.ORDER_TRACKING_LEASE_SECRET = ORDER_TRACKING_LEASE_SECRET; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_TEAM_ID !== "undefined") env.ORDER_TRACKING_APNS_TEAM_ID = ORDER_TRACKING_APNS_TEAM_ID; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_KEY_ID !== "undefined") env.ORDER_TRACKING_APNS_KEY_ID = ORDER_TRACKING_APNS_KEY_ID; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_PRIVATE_KEY_P8 !== "undefined") env.ORDER_TRACKING_APNS_PRIVATE_KEY_P8 = ORDER_TRACKING_APNS_PRIVATE_KEY_P8; } catch {}
+      try { if (typeof ORDER_TRACKING_APNS_ENV !== "undefined") env.ORDER_TRACKING_APNS_ENV = ORDER_TRACKING_APNS_ENV; } catch {}
       try {
         if (typeof CLOUDINARY_CLOUD_NAME !== "undefined") env.CLOUDINARY_CLOUD_NAME = CLOUDINARY_CLOUD_NAME;
       } catch {
@@ -8810,10 +9975,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return phase4aError("internal_error", "Internal error", 500);
         }
       }
-      if (["/orders/create", "/offers/create", "/offers/update", "/orders/payment-proof", "/orders/payment-confirm", "/orders/payment-reject"].includes(path) && request.method === "POST") {
+      if (["/orders/create", "/orders/create-v2", "/offers/create", "/offers/update", "/orders/payment-proof", "/orders/payment-confirm", "/orders/payment-reject"].includes(path) && request.method === "POST") {
+        // Reject even authenticated direct calls before OAuth or Firestore I/O.
+        if (path === "/orders/create-v2" && !v2OrderCreationEnabled(env)) return phase4aError("v2_creation_disabled", "V2 order creation is unavailable", 503);
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          if (path === "/orders/create") return await handlePhase4aOrderCreate(request, env, accessToken);
+          if (path === "/orders/create" || path === "/orders/create-v2") return await handlePhase4aOrderCreate(request, env, accessToken);
           if (path === "/offers/create") return await handlePhase4aOfferCreate(request, env, accessToken);
           const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
           let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
@@ -8864,7 +10031,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const providerAccess = phase4aProviderAccess(auth.user);
             if (!providerAccess.ok) { await normalizeCommercialAccess(auth.uid, auth.user, providerAccess.entitlement, accessToken); return phase4aError(providerAccess.code, "Provider subscription required", 403); }
             const fields = { paymentStatus: "PAYMENT_REJECTED", paymentRejectionReason: String(body.reason || "").trim(), paymentRejectedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-            if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
+            const trackingEventId = await trackingHash("payment-rejected\n" + body.orderId + "\n" + snap.updateTime);
+            if (!(await phase4aCommit([{ update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, auth.deletionFence,
+              ...trackingJobWrite(body.orderId, trackingEventId)], accessToken))) return phase4aError("state_conflict", "Order changed; retry", 409);
             return jsonResponse({ success: true, orderId: body.orderId, paymentStatus: "PAYMENT_REJECTED" });
           }
         } catch (e) { console.error("[Phase4A] mutation error:", e); return phase4aError("internal_error", "Internal error", 500); }
@@ -9325,7 +10494,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               requirePhoneAtSignup: !settings || settings.requirePhoneAtSignup !== false,
               phonePasswordLoginEnabled: false
             };
-            return jsonResponse({ success: true, settings: adminSettings });
+            return jsonResponse({ success: true, settings: adminSettings, deliveryPricingPolicy: adminDeliveryPricingPolicy(settings) });
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
@@ -9334,6 +10503,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if ("providerDiscoveryRadiusKm" in body && body.providerDiscoveryRadiusKm !== null && ![10,25,50,100].includes(body.providerDiscoveryRadiusKm)) return jsonResponse({ error: "providerDiscoveryRadiusKm must be null, 10, 25, 50, or 100" }, 400);
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
             if ("clientVersionGate" in body) return jsonResponse({ error: "Unsupported settings field" }, 400);
+            if ("deliveryPricingV2" in body || "deliveryPricingPolicy" in body) return jsonResponse({ error: "Delivery V2 pricing policy is read-only in Admin" }, 400);
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -9372,6 +10542,12 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               return jsonResponse({ error: "No valid settings fields" }, 400);
             }
             const before = await getFirestoreDoc("app_settings", "main", accessToken) || {};
+            if ("deliveryPricing" in fields) {
+              if (!fields.deliveryPricing || typeof fields.deliveryPricing !== "object" || Array.isArray(fields.deliveryPricing)) return jsonResponse({ error: "Invalid delivery pricing" }, 400);
+              const priorPricing = before.deliveryPricing && typeof before.deliveryPricing === "object" && !Array.isArray(before.deliveryPricing) ? before.deliveryPricing : {};
+              fields.deliveryPricing = { ...priorPricing, ...fields.deliveryPricing };
+              if (!validConfiguredDeliveryPricing({ deliveryPricing: fields.deliveryPricing })) return jsonResponse({ error: "Invalid delivery pricing" }, 400);
+            }
             const audits = [], changedAt = new Date().toISOString();
             const oldPhone = before.requirePhoneAtSignup !== false;
             if ("requirePhoneAtSignup" in fields && oldPhone !== fields.requirePhoneAtSignup) {
@@ -9718,6 +10894,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         catch { return jsonResponse({ success: false, error: "Unauthorized" }, 401); }
         const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
         return await handleAccountDeletion(request, env, accessToken, claims.sub, claims);
+      }
+      if (["/order-tracking/capabilities", "/order-tracking/register", "/order-tracking/rotate", "/order-tracking/end"].includes(path)) {
+        return handleOrderTrackingRequest(request, path, env);
       }
       const apiKey = request.headers.get("x-api-key");
       const hasServiceKey = !!apiKey && !!env.API_KEY && apiKey === env.API_KEY;
@@ -10119,57 +11298,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!exactObjectKeys(body, ["orderId", "dropoff", "saveAsDefault"]) || !phase4aSafeSegment(body.orderId) || typeof body.saveAsDefault !== "boolean") return phase4aError("CUSTOMER_DROPOFF_REQUIRED", "Order and customer dropoff are required");
           const dropoff = validateCustomerDropoff(body.dropoff, false);
           if (!dropoff.ok) return phase4aError(dropoff.code, "A valid Saudi delivery location with address, city and district is required", 422);
-          const [orderSnapshot, preferenceSnapshot] = await Promise.all([
-            getFirestoreSnapshot("orders", body.orderId, accessToken),
-            body.saveAsDefault ? getFirestoreSnapshot(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, accessToken) : Promise.resolve(null)
-          ]);
-          if (!orderSnapshot) return phase4aError("NOT_FOUND", "Order not found", 404);
-          const order = orderSnapshot.data;
-          if (order.customerUid !== auth.uid) return phase4aError("FORBIDDEN", "Forbidden", 403);
-          if (order.driverUid || order.status !== "ready_for_pickup") return phase4aError("TRANSITION_NOT_ALLOWED", "Delivery destination can no longer be changed", 409);
-          if (!validSaudiCoordinatePair(order.providerLat, order.providerLng)) return phase4aError("PROVIDER_COORDINATES_REQUIRED", "Provider pickup coordinates are required", 422);
-          const pricing = await loadDeliveryPricing(accessToken);
-          const calculated = calculateDeliveryPricing({ ...order, customerLat: dropoff.value.lat, customerLng: dropoff.value.lng }, pricing);
-          if (!calculated.ok) return phase4aError(calculated.code, "Valid provider and customer coordinates are required", 422);
-          const quoteId = "dq_" + Date.now().toString(36) + "_" + crypto.randomUUID().replace(/-/g, "");
-          const quotedAt = new Date().toISOString();
-          const expiresAt = new Date(Date.now() + DELIVERY_QUOTE_LIFETIME_MS).toISOString();
-          const quoteFields = {
-            quoteId,
-            orderId: body.orderId,
-            customerUid: auth.uid,
-            providerUid: order.providerUid,
-            dropoffLat: dropoff.value.lat,
-            dropoffLng: dropoff.value.lng,
-            addressLine: dropoff.value.addressLine,
-            city: dropoff.value.city,
-            district: dropoff.value.district,
-            deliveryDistanceKm: calculated.deliveryDistanceKm,
-            deliveryFee: calculated.deliveryFee,
-            pricingVersion: calculated.pricingVersion,
-            quotedAt,
-            expiresAt,
-            usedAt: null,
-            status: "active",
-            schemaVersion: 1
-          };
-          const writes = [{
-            update: phase4aDoc(DELIVERY_QUOTES_COLLECTION, quoteId, quoteFields),
-            currentDocument: { exists: false }
-          }, {
-            verify: "projects/tabbakheen-99883/databases/(default)/documents/orders/" + body.orderId,
-            currentDocument: { updateTime: orderSnapshot.updateTime }
-          }, auth.deletionFence];
-          if (body.saveAsDefault) {
-            const preferenceFields = { ...dropoff.value, label: typeof preferenceSnapshot?.data?.label === "string" ? preferenceSnapshot.data.label.slice(0, 80) : "", schemaVersion: 1 };
-            writes.splice(1, 0, {
-              update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, preferenceFields),
-              updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
-              currentDocument: preferenceSnapshot ? { updateTime: preferenceSnapshot.updateTime } : { exists: false }
-            });
-          }
-          if (!await phase4aCommit(writes, accessToken)) return phase4aError("STATE_CONFLICT", "Order or saved location changed; request a new quote", 409);
-          return jsonResponse({ success: true, quoteId, deliveryDistanceKm: calculated.deliveryDistanceKm, deliveryFee: calculated.deliveryFee, pricingVersion: calculated.pricingVersion, quotedAt, expiresAt, currency: "SAR" });
+          const created = await createDeliveryQuoteV2Transaction(auth, body.orderId, dropoff.value, body.saveAsDefault, accessToken);
+          return created.error || jsonResponse(created.value);
         } catch (error) {
           console.error("[DeliveryQuoteV2] Failed:", error && error.message ? error.message : error);
           return phase4aError("INTERNAL_ERROR", "Unable to create delivery quote", 500);
@@ -10199,9 +11329,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return phase4aError("DELIVERY_QUOTE_EXPIRED", "Delivery quote expired", 409);
           if (order.driverUid || order.status !== "ready_for_pickup") return phase4aError("TRANSITION_NOT_ALLOWED", "Delivery can no longer be finalized", 409);
           if (!validSaudiCoordinatePair(quote.dropoffLat, quote.dropoffLng) || !boundedRequiredString(quote.addressLine, 300) || !boundedRequiredString(quote.city, 120) || !boundedRequiredString(quote.district, 120) || !Number.isFinite(quote.deliveryDistanceKm) || quote.deliveryDistanceKm < 0 || !Number.isFinite(quote.deliveryFee) || quote.deliveryFee < 0 || typeof quote.pricingVersion !== "string") return phase4aError("STALE_DELIVERY_QUOTE", "Delivery quote snapshot is invalid", 409);
+          const pricing = await loadDeliveryPricing(accessToken);
+          const confirmed = calculateDeliveryPricing({ ...order, customerLat: quote.dropoffLat, customerLng: quote.dropoffLng }, pricing.value);
+          if (!confirmed.ok || confirmed.pricingVersion !== quote.pricingVersion || confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm || confirmed.deliveryFee !== quote.deliveryFee) return phase4aError("STALE_DELIVERY_QUOTE", "Delivery pricing changed; request a new quote", 409);
           const now = new Date().toISOString();
           const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
-          const subtotal = typeof order.priceSnapshot === "number" && Number.isFinite(order.priceSnapshot) ? order.priceSnapshot : 0;
+          const subtotal = order.priceSnapshot;
+          if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return phase4aError("ORDER_PRICE_INVALID", "Order subtotal cannot be combined safely with delivery fee", 409);
           const fields = {
             deliveryMethod: "driver",
             dropoffCity: quote.city,
@@ -10222,14 +11356,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             updatedAt: now
           };
           const privateDestination = { customerUid: auth.uid, providerUid: order.providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng, addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "" };
-          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, privateDestination, fields, nextVersion, accessToken, auth.deletionFence);
+          const participants = await newActiveWorkDeletionFences([auth.uid, order.providerUid], accessToken, new Map([[auth.uid, auth.deletionSnapshot]]));
+          if (participants.blocked) return phase4aError("ACCOUNT_DELETION_BLOCKED", "A participant has requested account deletion", 409);
+          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, body.deliveryPaymentMethod, accessToken, pricing);
           if (!committed.ok) {
+            if (committed.uncertain) return phase4aError("STATE_UNCERTAIN", "Delivery finalization outcome is uncertain; check the order before retrying", 503);
             const latest = await getFirestoreDoc("orders", body.orderId, accessToken);
             if (latest && deliveryFinalizationV2IsIdempotent(latest, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(latest, true));
             return phase4aError("STALE_DELIVERY_QUOTE", "Order or quote changed; request a new quote", 409);
           }
-          await sendTransitionNotification(committed.event, body.orderId, accessToken, nextVersion);
-          return jsonResponse(deliveryFinalizationV2Response({ ...order, ...fields }));
+          await sendTransitionNotification(committed.event, body.orderId, accessToken, committed.stateVersion);
+          return jsonResponse(deliveryFinalizationV2Response({ ...committed.order, ...committed.fields }));
         } catch (error) {
           console.error("[FinalizeDeliveryV2] Failed:", error && error.message ? error.message : error);
           return phase4aError("INTERNAL_ERROR", "Unable to finalize delivery", 500);
@@ -10273,6 +11410,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           const order = snapshot.data;
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+          // A V2-created order has no legacy location snapshot. Self-pickup
+          // remains valid, but driver delivery must use an explicit V2 quote.
+          if (method === "driver" && isPrivateDestinationOrder(order)) return jsonResponse({ success: false, code: "explicit_destination_required", error: "Use an explicit V2 delivery quote" }, 409);
           const expectedStatus = method === "self_pickup" ? "self_pickup_selected" : "ready_for_driver";
           if (order.deliveryMethod === method && order.deliveryStatus === expectedStatus && !order.driverUid) {
             return jsonResponse({
@@ -10325,8 +11465,18 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             responseData = { deliveryFee: quote.deliveryFee, totalAmount: fields.totalAmount, deliveryDistanceKm: quote.deliveryDistanceKm, deliveryQuoteId: quoteId };
             notificationEvent = "driver_delivery_requested";
           }
-          const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken);
-          if (!committed.ok) return jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
+          let deletionFences = [];
+          if (method === "driver") {
+            const participants = await newActiveWorkDeletionFences([order.customerUid, order.providerUid], accessToken);
+            if (participants.blocked) return jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409);
+            deletionFences = participants.fences;
+          }
+          const committed = await commitOrderAndOutbox(orderId, fields, [], snapshot.updateTime, notificationEvent, nextVersion, accessToken, deletionFences);
+          if (!committed.ok) return committed.uncertain
+            ? jsonResponse({ success: false, code: "state_uncertain", error: "Order outcome is uncertain; refresh before retrying" }, 503)
+            : committed.deletionBlocked
+              ? jsonResponse({ success: false, code: "account_deletion_blocked", error: "A participant has requested account deletion" }, 409)
+              : jsonResponse({ success: false, code: "state_conflict", error: "Order state changed; refresh and try again" }, 409);
           await sendTransitionNotification(notificationEvent, orderId, accessToken, nextVersion);
           return jsonResponse({ success: true, ...responseData });
         } catch (error) {
@@ -10353,6 +11503,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           }
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+          if (isPrivateDestinationOrder(order)) return jsonResponse({ success: false, code: "explicit_destination_required", error: "Use an explicit V2 delivery quote" }, 409);
           const quote = await calculateLegacyDeliveryPricing(order, accessToken, "quote");
           const priceSnapshot = order.priceSnapshot || 0;
           return Response.json({

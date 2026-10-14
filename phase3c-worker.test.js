@@ -24,7 +24,8 @@ has('identitytoolkit.googleapis.com/v1/projects/tabbakheen-99883/accounts:delete
 has('USER_NOT_FOUND');
 has('deleteFirestoreDocument("users", uid');
 has('deleteFirestoreDocument("verifications", uid');
-has('deleteFirestoreDocument("offers", offerId');
+has('resolveOfferProviderUid(offer.data) !== uid');
+has('delete: phase4aDoc("offers", offerId, {}).name');
 
 // Conservative order model checks every ownership relation and both state fields.
 for (const field of ["customerUid", "providerUid", "driverUid"]) has(`"${field}"`);
@@ -40,8 +41,8 @@ has('const cloudName = env.CLOUDINARY_CLOUD_NAME || "dv6n9vnly"');
 has('Cloudinary credentials unavailable');
 has('persisted?.status || "failed"');
 has('verificationLimitations.filter');
-has('providerId", "EQUAL", uid');
-has('roleField = { customer: "customerUid", provider: "providerUid", driver: "driverUid" }[role]');
+has('accountDeletionOfferPage(uid, field, accessToken)');
+has('ACCOUNT_DELETION_ORDER_FIELDS = ["customerUid", "providerUid", "driverUid"]');
 has('cleanupLimitations');
 has('has_no_public_id');
 has('buildAccountDeletionManifest');
@@ -77,7 +78,7 @@ assert(
 has("Orders, complaints, ratings, and audit records are intentionally preserved");
 assert(!source.includes('deleteFirestoreDocument("orders"'), "account deletion must preserve orders");
 assert(!source.includes('deleteFirestoreDocument("complaints"'), "account deletion must preserve complaints");
-has("accountDeletionActiveOrders");
+has("accountDeletionOrderPage");
 
 // Cleanup is constrained to a verification-owned, allowlisted Cloudinary public id.
 has("cloudinaryPublicIdFromVerification");
@@ -91,7 +92,7 @@ has("freelanceCertificate");
 for (const status of ["in_progress", "auth_deleted", "cleanup_pending", "completed"]) has(`ACCOUNT_DELETION_BLOCKED_STATUSES`);
 has("if (!hasServiceKey && callerUid)");
 has("resumeAccountDeletions(env)");
-has("slice(0, 10)");
+has('cronQueueNext("account_deletion_requests", status, accessToken)');
 has('["requested", "in_progress", "auth_deleted", "cleanup_pending"]');
 
 // Small executable model checks for active-order and idempotent status behavior.
