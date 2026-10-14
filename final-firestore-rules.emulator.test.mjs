@@ -52,6 +52,7 @@ const env = await initializeTestEnvironment({
 
 const db = (uid) => env.authenticatedContext(uid).firestore();
 const anon = () => env.unauthenticatedContext().firestore();
+const claimedAdmin = () => env.authenticatedContext('CLAIMED-ADMIN', { role: 'admin', admin: true, owner: true }).firestore();
 const publicProfile = (uid, role = 'provider') => ({
   uid, role, displayName: `${role}-${uid}`, photoUrl: 'https://images.example.test/a.jpg',
   ratingAverage: 4.5, ratingCount: 2, verificationStatus: 'verified',
@@ -117,6 +118,7 @@ async function seed() {
       setDoc(doc(admin, 'verifications', 'P1'), { crNumber: 'private', status: 'verified' }),
       setDoc(doc(admin, 'provider_ratings', 'P1', 'ratings', 'O1'), { customerUid: 'C1', stars: 5 }),
       setDoc(doc(admin, 'delivery_complaints', 'K1'), { orderId: 'O1', note: 'private' }),
+      setDoc(doc(admin, 'complaint_email_alerts', 'A1'), { complaintId: 'K1', status: 'pending' }),
       setDoc(doc(admin, 'order_cash_funding_events', 'O1_driver_consent_1'), { orderId: 'O1', actorUid: 'D1', amountSar: 25 }),
       setDoc(doc(admin, 'order_delivery_private', 'O1'), { addressLine: 'private address', dropoffLat: 24.7 }),
       setDoc(doc(admin, 'order_transition_events', 'O1_driver_assigned_1'), { orderId: 'O1', status: 'pending' }),
@@ -192,15 +194,28 @@ try {
     ['J raw delivery complaint', () => getDoc(doc(db('C1'), 'delivery_complaints', 'K1'))],
   ]) await check(id, assertFails(action()));
 
+  await check('J client cannot create raw delivery complaint', assertFails(setDoc(
+    doc(db('C1'), 'delivery_complaints', 'FORGED'), { orderId: 'O1', note: 'forged' },
+  )));
+  await check('J claimed admin cannot read raw delivery complaint', assertFails(getDoc(
+    doc(claimedAdmin(), 'delivery_complaints', 'K1'),
+  )));
+
   // New funded-delivery records are Worker-only, including for order participants.
   for (const [path, value] of [
     ['order_cash_funding_events/O1_driver_consent_1', { orderId: 'O1', actorUid: 'D1' }],
     ['order_delivery_private/O1', { addressLine: 'forged address' }],
     ['order_transition_events/O1_driver_assigned_1', { status: 'sent' }],
+    ['complaint_email_alerts/A1', { complaintId: 'K1', status: 'sent' }],
   ]) {
     await check(`K participant cannot read ${path}`, assertFails(getDoc(doc(db('C1'), path))));
     await check(`K participant cannot write ${path}`, assertFails(setDoc(doc(db('C1'), path), value)));
   }
+  for (const [role, client] of [
+    ['anonymous', anon()], ['provider', db('P1')], ['driver', db('D1')], ['claimed admin', claimedAdmin()],
+  ]) await check(`K ${role} cannot read complaint email alert`, assertFails(getDoc(
+    doc(client, 'complaint_email_alerts', 'A1'),
+  )));
 
   // M–N: participant-only reads, constrained queries, and all direct writes denied.
   for (const uid of ['C1', 'P1', 'D1']) {
