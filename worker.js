@@ -2000,8 +2000,16 @@
       const report = { orderId: body.orderId, reporterUid: auth.uid, source: auth.user.role, target: auth.user.role === "customer" ? "provider" : "customer", type: "order_chat_report", messageId: body.messageId || "", note: typeof body.note === "string" ? body.note.trim() : "", complaintStatus: "pending", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
       const saved = await getFirestoreDoc("delivery_complaints", reportId, accessToken);
       if (saved) return saved.orderId === report.orderId && saved.source === report.source ? jsonResponse({ success: true, idempotent: true, reportId }) : phase4aError("idempotency_conflict", "Report already exists", 409);
-      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", reportId, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, auth.deletionFence], accessToken);
+      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", reportId, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, await complaintEmailAlertWrite(reportId, report), auth.deletionFence], accessToken);
       return created ? jsonResponse({ success: true, reportId }) : phase4aError("state_conflict", "Report changed; retry", 409);
+    }
+    async function complaintEmailAlertWrite(complaintId, complaint) {
+      const id = "a_" + (await sha256Hex("complaint-email:" + complaintId)).slice(0, 48);
+      return { update: phase4aDoc("complaint_email_alerts", id, {
+        complaintId, orderId: complaint.orderId, category: complaint.type,
+        submittedAt: complaint.createdAt, status: "pending", attempts: 0,
+        createdAt: complaint.createdAt, updatedAt: complaint.createdAt
+      }), currentDocument: { exists: false } };
     }
     function complaintRefDto(complaint) {
       if (!complaint || typeof complaint.orderId !== "string" || typeof complaint.source !== "string" || typeof complaint.complaintStatus !== "string") return null;
@@ -2163,6 +2171,7 @@
         if (existing) return existing.reporterUid === auth.uid && existing.orderId === body.orderId && existing.targetAccountUid === targetUid && existing.reasonCode === report.reasonCode && existing.note === report.note ? jsonResponse({ success: true, idempotent: true, complaint: complaintRefDto(existing) }) : phase4aError('idempotency_conflict', 'Safety report already exists', 409);
         const created = await phase4aCommit([
           { update: phase4aDoc('delivery_complaints', id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } },
+          await complaintEmailAlertWrite(id, report),
           { verify: 'projects/tabbakheen-99883/databases/(default)/documents/orders/' + body.orderId, currentDocument: { updateTime: orderSnapshot.updateTime } },
           { verify: 'projects/tabbakheen-99883/databases/(default)/documents/' + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + '/' + auth.uid, currentDocument: { exists: false } },
           auth.deletionFence
@@ -2180,7 +2189,7 @@
       const report = { orderId: body.orderId, customerUid: order.customerUid || "", providerUid: order.providerUid || "", driverUid: order.driverUid || "", status: order.status || "", deliveryStatus: order.deliveryStatus || "", source: role, target: body.target || "", type: body.type, note: body.note.trim(), complaintStatus: "pending", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
       const existing = await getFirestoreDoc("delivery_complaints", id, accessToken);
       if (existing) return existing.source === role && existing.orderId === body.orderId ? jsonResponse({ success: true, idempotent: true, complaint: complaintRefDto(existing) }) : phase4aError("idempotency_conflict", "Complaint already exists", 409);
-      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, auth.deletionFence], accessToken);
+      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, await complaintEmailAlertWrite(id, report), auth.deletionFence], accessToken);
       return created ? jsonResponse({ success: true, complaint: complaintRefDto({ ...report, _id: id }) }) : phase4aError("state_conflict", "Complaint changed; retry", 409);
     }
     async function handleSafetyReportResponse(request, complaintId, accessToken) {
@@ -4355,17 +4364,33 @@
       const existing = order[field];
       const same = (value) => value?.actorUid === auth.uid && (issue ? value.kind === body.kind :
         value.termsVersion === body.termsVersion && sarCents(value.amountSar) === sarCents(amount));
-      if (existing) return same(existing) ? jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action }) : phase4aError("event_exists", "Cash-funding event already recorded", 409);
       const eventId = orderId + "_" + (issue ? "issue_" + auth.uid + "_" + body.kind : action);
+      const casePossible = issue || action === "provider-receipt";
+      const caseReason = issue ? body.kind : "conflicting_payment_evidence";
+      const complaintId = casePossible ? "cash_" + (await sha256Hex("cash-funding-issue:" + eventId)).slice(0, 48) : null;
+      const complaintRecorded = async (required) => {
+        if (!required) return true;
+        const alertId = "a_" + (await sha256Hex("complaint-email:" + complaintId)).slice(0, 48);
+        const [complaint, alert] = await Promise.all([
+          getFirestoreDoc("delivery_complaints", complaintId, accessToken),
+          getFirestoreDoc("complaint_email_alerts", alertId, accessToken)
+        ]);
+        return complaint?.orderId === orderId && complaint.reporterUid === auth.uid &&
+          complaint.type === "cash_funding_issue" && complaint.reasonCode === caseReason &&
+          alert?.complaintId === complaintId;
+      };
+      if (existing) return same(existing) && await complaintRecorded(issue || action === "provider-receipt" && order.cashFundingHold?.kind === "conflicting_payment_evidence") ? jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action }) : phase4aError("event_exists", "Cash-funding event already recorded", 409);
       const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
       const orderName = doc("orders", orderId), eventName = doc("order_cash_funding_events", eventId), userName = doc("users", auth.uid);
+      const complaintName = casePossible ? doc("delivery_complaints", complaintId) : null;
       const members = [order.customerUid, order.providerUid, order.driverUid];
       if (members.some((uid) => !phase4aSafeSegment(uid))) return phase4aError("state_conflict", "Order participants unavailable", 409);
       const fences = members.flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
       const now = new Date().toISOString();
-      const result = await firestoreReadWriteTransaction([orderName, eventName, userName, ...fences], accessToken, (read) => {
+      const alertWrite = casePossible ? await complaintEmailAlertWrite(complaintId, { orderId, type: "cash_funding_issue", createdAt: now }) : null;
+      const result = await firestoreReadWriteTransaction([orderName, eventName, userName, ...fences, ...(casePossible ? [complaintName] : [])], accessToken, (read) => {
         const current = read.get(orderName), actor = read.get(userName)?.data;
-        if (!current || current.updateTime !== orderSnapshot.updateTime || read.get(eventName) || !actor || actor.role !== role ||
+        if (!current || current.updateTime !== orderSnapshot.updateTime || read.get(eventName) || casePossible && read.get(complaintName) || !actor || actor.role !== role ||
             ["suspended", "disabled"].includes(actor.accountStatus)) return { abort: "state_conflict" };
         if (fences.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
         const latest = current.data, exact = cashFundingAmounts(latest);
@@ -4388,18 +4413,23 @@
         const fields = { [field]: recorded, updatedAt: now };
         if (action === "provider-receipt" && (latest.cashFundingDriverRelease || latest.cashFundingProviderNoReceipt))
           fields.cashFundingHold = { kind: "conflicting_payment_evidence", actorUid: auth.uid, actorRole: role, createdAt: now };
+        const caseRequired = issue || !!fields.cashFundingHold;
         return { writes: [
           { update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: current.updateTime } },
-          { update: phase4aDoc("order_cash_funding_events", eventId, { orderId, type: action, ...recorded }), currentDocument: { exists: false } }
-        ], value: true, expected: recorded };
+          { update: phase4aDoc("order_cash_funding_events", eventId, { orderId, type: action, ...recorded }), currentDocument: { exists: false } },
+          ...(caseRequired ? [{ update: phase4aDoc("delivery_complaints", complaintId, {
+            orderId, reporterUid: auth.uid, source: role, target: "admin", type: "cash_funding_issue",
+            reasonCode: caseReason, note: "", complaintStatus: "pending", createdAt: now, updatedAt: now
+          }), currentDocument: { exists: false } }, alertWrite] : [])
+        ], value: true, expected: { recorded, caseRequired } };
       }, async (expected) => {
-        const [latest, event] = await Promise.all([getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_cash_funding_events", eventId, accessToken)]);
-        return !!latest && !!event && same(latest[field]) && event.actorUid === auth.uid && event.createdAt === expected.createdAt;
-      }, 2, {}, 9);
+        const [latest, event, complaint, alert] = await Promise.all([getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_cash_funding_events", eventId, accessToken), expected.caseRequired ? getFirestoreDoc("delivery_complaints", complaintId, accessToken) : null, expected.caseRequired ? getFirestoreDoc("complaint_email_alerts", alertWrite.update.name.split("/").at(-1), accessToken) : null]);
+        return !!latest && !!event && (!expected.caseRequired || complaint?.reporterUid === auth.uid && complaint?.reasonCode === caseReason && alert?.complaintId === complaintId) && same(latest[field]) && event.actorUid === auth.uid && event.createdAt === expected.recorded.createdAt;
+      }, 2, {}, casePossible ? 10 : 9);
       if (["committed", "reconciled"].includes(result.kind)) return jsonResponse({ success: true, orderId, state: issue ? "manual_review" : action, ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
       if (result.kind === "uncertain") return phase4aError("state_uncertain", "Event outcome uncertain; refresh before retrying", 503);
       const latest = await getFirestoreDoc("orders", orderId, accessToken);
-      if (same(latest?.[field])) return jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action });
+      if (same(latest?.[field]) && await complaintRecorded(issue || action === "provider-receipt" && latest?.cashFundingHold?.kind === "conflicting_payment_evidence")) return jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action });
       return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" : result.value || "state_conflict", "Cash-funding state changed", 409);
     }
     async function cashFundingV1Recovery(request, orderId, action, accessToken) {
@@ -4746,37 +4776,62 @@
     }
     __name(hashPassword, "hashPassword");
     __name2(hashPassword, "hashPassword");
-    async function sendEmail(to, subject, html, env, attachments) {
+    async function sendEmail(to, subject, html, env, attachments, options) {
       const apiKey = env.EMAIL_API_KEY;
       if (!apiKey) {
         console.log("[Email] EMAIL_API_KEY not configured; email skipped");
-        return { sent: false, reason: "EMAIL_API_KEY not configured" };
+        return { sent: false, reason: "EMAIL_API_KEY not configured", code: "missing_credentials" };
       }
-      const from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
+      const from = options?.from || env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
       try {
         const payload = { from, to: [to], subject, html };
         if (attachments && attachments.length > 0) {
           payload.attachments = attachments;
         }
-        const res = await fetch("https://api.resend.com/emails", {
+        const headers = { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" };
+        if (options?.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
+        const request = {
           method: "POST",
-          headers: {
-            "Authorization": "Bearer " + apiKey,
-            "Content-Type": "application/json"
-          },
+          headers,
           body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (res.ok) {
+        };
+        let res, data;
+        if (options?.deadlineMs) {
+          // Alert retries need a finite transport deadline and bounded response.
+          // The existing transactional-user email path remains unchanged.
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), options.deadlineMs);
+          try {
+            res = await fetch("https://api.resend.com/emails", { ...request, signal: controller.signal });
+            const reader = res.body?.getReader();
+            let size = 0, text = "";
+            if (reader) {
+              const decoder = new TextDecoder("utf-8", { fatal: true });
+              while (true) {
+                const chunk = await reader.read();
+                if (chunk.done) break;
+                size += chunk.value.byteLength;
+                if (size > 16384) { await reader.cancel(); throw new Error("Email response too large"); }
+                text += decoder.decode(chunk.value, { stream: true });
+              }
+              text += decoder.decode();
+            }
+            data = text ? JSON.parse(text) : {};
+          } finally { clearTimeout(timer); }
+        } else {
+          res = await fetch("https://api.resend.com/emails", request);
+          data = await res.json();
+        }
+        if (res.ok && (!options?.idempotencyKey || typeof data.id === "string" && data.id.length > 0)) {
           console.log("[Email] Sent");
           return { sent: true, id: data.id };
         } else {
           console.error("[Email] Failed");
-          return { sent: false, reason: data.message || "Failed" };
+          return { sent: false, reason: data.message || "Failed", code: res.ok ? "uncertain" : data.name || data.error || "provider_rejected", httpStatus: res.ok ? null : res.status };
         }
       } catch (e) {
         console.error("[Email] Error");
-        return { sent: false, reason: e.message };
+        return { sent: false, reason: e.message, code: "uncertain" };
       }
     }
     __name(sendEmail, "sendEmail");
@@ -7179,7 +7234,7 @@ async function api(path,opts){
 }
 
 function showLogin(){document.getElementById("login-view").style.display="flex";document.getElementById("main-view").style.display="none";}
-function showMain(){document.getElementById("login-view").style.display="none";document.getElementById("main-view").style.display="block";if(isMobile()){forceSidebarClosed();}else{closeSidebar();}setTimeout(function(){navigate("dashboard");},0);}
+function showMain(){document.getElementById("login-view").style.display="none";document.getElementById("main-view").style.display="block";if(isMobile()){forceSidebarClosed();}else{closeSidebar();}setTimeout(function(){navigate(location.hash==="#complaints"?"complaints":"dashboard");},0);}
 
 function setLoginStatus(message,type){
   var el=document.getElementById("login-status");
@@ -7302,6 +7357,7 @@ function complaintStatusLabel(status){return ct(status==="pending"?"pending":sta
 function complaintTypeLabel(type){
   if(type==="order_chat_report")return lang==="ar"?"بلاغ محادثة الطلب":"Order chat report";
   if(type==="participant_safety")return lang==="ar"?"بلاغ سلامة مشارك":"Participant safety report";
+  if(type==="cash_funding_issue")return lang==="ar"?"نزاع تمويل نقدي":"Cash funding issue";
   var m={customer_complaint:"customerComplaint",provider_complaint:"providerComplaint",delivery_not_confirmed:"deliveryNotConfirmed",customer_rejected_receipt:"customerRejectedReceipt"};
   return ct(m[type]||"unknown");
 }
@@ -7372,6 +7428,7 @@ function paintComplaintRows(){
   }).join("")||'<tr><td colspan="8" class="empty">'+ct("noComplaints")+'</td></tr>';
 }
 function complaintRoleLabel(role){
+  if(role==="admin")return lang==="ar"?"الإدارة":"Admin";
   var m={customer:"customer",provider:"provider",driver:"driver"};
   return ct(m[role]||"unknown");
 }
@@ -7382,6 +7439,7 @@ async function viewComplaint(id){
   var x=data.complaint;
   var chatContext=x.type==="order_chat_report"?'<div class="form-group"><label>'+(lang==="ar"?"الرسالة المُبلّغ عنها":"Reported chat message")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+((x.reportedChatContext||[]).map(function(m){return '<div><strong>'+esc(complaintRoleLabel(m.senderRole))+'</strong><div>'+esc(m.text||"")+'</div><small>'+complaintDate(m.createdAt)+'</small></div>';}).join("")||(lang==="ar"?"لا توجد رسالة مرتبطة بهذا البلاغ":"No message is attached to this report"))+'</div></div>':"";
   var safetyReview=x.type==="participant_safety"?'<div class="form-group"><label>'+(lang==="ar"?"سبب البلاغ":"Report reason")+'</label><strong>'+esc(x.reasonCode||"")+'</strong></div><div class="form-group"><label>'+(lang==="ar"?"رد الطرف المعني":"Reported participant response")+'</label><div style="white-space:pre-wrap">'+esc(x.targetResponse||"-")+'</div></div><div class="form-group"><label for="safety-finding">'+(lang==="ar"?"نتيجة المراجعة الخاصة بالإدارة":"Private review finding")+'</label><select id="safety-finding" style="width:100%">'+["pending","substantiated","unsubstantiated"].map(function(s){return '<option value="'+s+'" '+(x.reviewFinding===s?"selected":"")+'>'+esc(s)+'</option>';}).join("")+'</select></div><div class="form-group"><label for="safety-review-note">'+(lang==="ar"?"مبرر المراجعة":"Review rationale")+'</label><textarea id="safety-review-note" rows="3" maxlength="2000" style="width:100%">'+esc(x.reviewNote||"")+'</textarea></div><button class="btn btn-secondary" data-id="'+esc(x.id)+'" onclick="saveSafetyReview(this.dataset.id)">'+(lang==="ar"?"حفظ المراجعة الخاصة":"Save private review")+'</button>':"";
+  var cashIssue=x.type==="cash_funding_issue"?'<div class="form-group"><label>'+(lang==="ar"?"نوع النزاع المالي":"Cash issue type")+'</label><strong>'+esc(x.reasonCode||"-")+'</strong></div>':"";
   openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span style="font-size:13px;color:var(--text2)">#'+esc(x.orderNumber||x.orderId||x.id)+'</span></h3>'+
     '<div class="detail-grid">'+
     '<div><label>'+ct("orderNumber")+'</label><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong></div>'+
@@ -7393,7 +7451,7 @@ async function viewComplaint(id){
     '<div><label>'+ct("driver")+'</label>'+complaintPerson(x,"driver")+'</div>'+
     '<div><label>'+ct("created")+'</label><strong>'+complaintDate(x.createdAt)+'</strong></div>'+
     '</div>'+
-    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+safetyReview+
+    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+cashIssue+safetyReview+
     '<div class="form-group"><label for="complaint-status">'+ct("status")+'</label><select id="complaint-status" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px">'+["pending","resolved","closed"].map(function(s){return'<option value="'+s+'" '+(x.complaintStatus===s?"selected":"")+'>'+ct(s)+'</option>';}).join("")+'</select></div>'+
     '<div class="form-group"><label for="complaint-admin-note">'+ct("adminReply")+'</label><textarea id="complaint-admin-note" rows="4" maxlength="4000" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;resize:vertical">'+esc(x.adminNote||"")+'</textarea></div>'+
     '<div style="font-size:12px;color:var(--text2);margin-bottom:12px">'+ct("updated")+': '+complaintDate(x.updatedAt)+'</div>'+
@@ -9813,6 +9871,61 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(handleScheduledOutbox, "handleScheduledOutbox");
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
+    async function handleScheduledComplaintEmailAlert(env, accessToken) {
+      // One durable complaint alert per invocation. The existing rotating Cron
+      // cursor prevents a missing recipient or leased alert from hiding others.
+      const item = await cronQueueNext("complaint_email_alerts", "pending", accessToken);
+      if (!item || !phase4aSafeSegment(item._id)) return false;
+      const snapshot = await getFirestoreSnapshot("complaint_email_alerts", item._id, accessToken);
+      const alert = snapshot?.data, nowMs = Date.now(), now = new Date(nowMs).toISOString();
+      if (!alert || alert.status !== "pending" ||
+          alert.leaseUntil && Date.parse(alert.leaseUntil) > nowMs ||
+          alert.nextAttemptAt && Date.parse(alert.nextAttemptAt) > nowMs) return false;
+      const update = (fields) => compareAndSetFirestoreDocument("complaint_email_alerts", item._id,
+        { ...fields, updatedAt: now }, snapshot.updateTime, accessToken);
+      const attempts = Number.isInteger(alert.attempts) && alert.attempts >= 0 ? alert.attempts : 0;
+      if (attempts >= 5 || alert.firstAttemptAt && nowMs - Date.parse(alert.firstAttemptAt) >= 23 * 60 * 60 * 1000)
+        return (await update({ status: "needs_review", lastErrorCode: "retry_window_exhausted", leaseUntil: null })).ok;
+      if (!env.EMAIL_API_KEY) {
+        return (await update({ lastErrorCode: "sender_unavailable", nextAttemptAt: new Date(nowMs + 10 * 60 * 1000).toISOString() })).ok;
+      }
+      let recipient = alert.recipient, subject = alert.subject, html = alert.html, from = alert.from;
+      if (!recipient) {
+        const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+        recipient = publicAppSettingsDto(settings).supportEmail;
+        if (!recipient) return (await update({ lastErrorCode: "recipient_unavailable", nextAttemptAt: new Date(nowMs + 10 * 60 * 1000).toISOString() })).ok;
+        if (typeof alert.complaintId !== "string" || !/^[A-Za-z0-9_-]{1,512}$/.test(alert.complaintId) || !phase4aSafeSegment(alert.orderId) ||
+            !["customer_complaint", "provider_complaint", "delivery_not_confirmed", "customer_rejected_receipt", "participant_safety", "order_chat_report", "cash_funding_issue"].includes(alert.category) ||
+            typeof alert.submittedAt !== "string" || !Number.isFinite(Date.parse(alert.submittedAt)))
+          return (await update({ status: "needs_review", lastErrorCode: "invalid_alert_record" })).ok;
+        from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
+        subject = "New Tabbakheen complaint";
+        html = "<p>A new complaint is available in Tabbakheen Admin.</p>" +
+          "<p>Complaint reference: " + escapeHtml(alert.complaintId) + "<br>Order reference: " + escapeHtml(alert.orderId) +
+          "<br>Category: " + escapeHtml(alert.category) + "<br>Submitted: " + escapeHtml(alert.submittedAt) + "</p>" +
+          '<p><a href="https://tabbakheen-api.tabbakheen.workers.dev/admin#complaints">Open authenticated Admin complaints</a></p>';
+      } else if (publicAppSettingsDto({ supportEmail: recipient }).supportEmail !== recipient ||
+          typeof subject !== "string" || typeof html !== "string" || typeof from !== "string")
+        return (await update({ status: "needs_review", lastErrorCode: "invalid_frozen_alert" })).ok;
+      const leaseOwner = crypto.randomUUID(), leaseUntil = new Date(nowMs + 60 * 1000).toISOString();
+      const claimed = await update({ recipient, subject, html, from, firstAttemptAt: alert.firstAttemptAt || now,
+        attempts: attempts + 1, leaseOwner, leaseUntil, nextAttemptAt: null, lastErrorCode: null });
+      if (!claimed.ok) return false;
+      const result = await sendEmail(recipient, subject, html, env, undefined,
+        { from, idempotencyKey: "complaint-" + item._id, deadlineMs: 8e3 });
+      const finish = (fields) => compareAndSetFirestoreDocument("complaint_email_alerts", item._id,
+        { ...fields, leaseOwner: null, leaseUntil: null, updatedAt: new Date().toISOString() },
+        claimed.document.updateTime, accessToken);
+      if (result.sent) return (await finish({ status: "sent", sentAt: new Date().toISOString(),
+        providerMessageId: typeof result.id === "string" ? result.id.slice(0, 128) : null })).ok;
+      const permanent = result.httpStatus >= 400 && result.httpStatus < 500 && result.httpStatus !== 429;
+      const exhausted = attempts + 1 >= 5;
+      const retryMinutes = Math.min(5 * 2 ** attempts, 120);
+      return (await finish({ status: permanent || exhausted ? "needs_review" : "pending",
+        nextAttemptAt: permanent || exhausted ? null : new Date(Date.now() + retryMinutes * 60 * 1000).toISOString(),
+        lastErrorCode: result.code === "uncertain" ? "uncertain" : result.code === "missing_credentials" ? "sender_unavailable" :
+          result.httpStatus ? "provider_http_" + result.httpStatus : "provider_failure" })).ok;
+    }
     async function handleScheduledMaintenance(env) {
       const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
       return handleScheduledMaintenanceWithAccessToken(env, accessToken);
@@ -9847,6 +9960,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         // transports and their credentials are configured. Legacy Cron is
         // unchanged while this new feature remains DEFAULT OFF.
         try { await handleScheduledTracking(env, accessToken); } catch (error) { failure ||= error; }
+        try { await handleScheduledComplaintEmailAlert(env, accessToken); } catch (error) { failure ||= error; }
         if (failure) throw failure;
       };
       if (lane === "fast") return runFast();
@@ -9906,6 +10020,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         resumeAccountDeletionsWithAccessToken,
         cronQueueNext,
         handleScheduledOutbox,
+        handleScheduledComplaintEmailAlert,
         handleScheduledMaintenance,
         handleScheduledMaintenanceWithAccessToken,
         classifyPhoneIndexBackfill,

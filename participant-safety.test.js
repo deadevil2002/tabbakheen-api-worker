@@ -11,6 +11,8 @@ const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
 let serial = 0, requests = 0, writes = 0, failPublicProfileRead = false, reassignAtCommit = false, createMarkerAtCommit = false;
 let cashOrderRaceAtCommit = false, cashMarkerAtCommit = false, loseCashCommitResponse = false;
 let recoveryAssignmentAtCommit = false, recoveryReceiptAtCommit = false;
+let resendFailure = false, resendLostResponse = false;
+const emails = [], resendAccepted = new Map();
 const encode = (v) => v == null ? { nullValue: null } : typeof v === 'string' ? { stringValue: v } :
   typeof v === 'boolean' ? { booleanValue: v } : typeof v === 'number' ? (Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v }) :
   Array.isArray(v) ? { arrayValue: { values: v.map(encode) } } : { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([k, x]) => [k, encode(x)])) } };
@@ -29,6 +31,17 @@ global.fetch = async (raw, init = {}) => {
   if (url === 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com')
     return reply({ keys: [{ ...rsa.publicKey.export({ format: 'jwk' }), kid: 'offline-kid', alg: 'RS256' }] });
   if (url === 'https://oauth2.googleapis.com/token') return reply({ access_token: 'offline-oauth' });
+  if (url === 'https://api.resend.com/emails') {
+    const payload = JSON.parse(init.body), key = init.headers['Idempotency-Key'];
+    assert(/^complaint-a_[a-f0-9]{48}$/.test(key), 'stable complaint idempotency key');
+    assert(!/PRIVATE|Reported chat|Customer did not pay|Driver was not properly assigned/i.test(JSON.stringify(payload)), 'no complaint narrative or private data in email');
+    if (resendFailure) { resendFailure = false; return reply({ message: 'synthetic provider unavailable' }, 503); }
+    const prior = resendAccepted.get(key);
+    if (prior) assert.deepEqual(prior.payload, payload, 'retry payload remains byte-equivalent');
+    else { resendAccepted.set(key, { payload, id: 'offline-resend-' + (resendAccepted.size + 1) }); emails.push({ key, payload }); }
+    if (resendLostResponse) { resendLostResponse = false; throw Error('synthetic accepted response lost'); }
+    return reply({ id: resendAccepted.get(key).id });
+  }
   if (url === BASE + ':beginTransaction') { const id = 'txn-' + ++serial; txns.set(id, new Map()); return reply({ transaction: id }); }
   if (url === BASE + ':batchGet') {
     const input = JSON.parse(init.body), read = input.transaction ? txns.get(input.transaction) : null;
@@ -71,10 +84,20 @@ global.fetch = async (raw, init = {}) => {
   if (url === BASE + ':runQuery') {
     const q = JSON.parse(init.body).structuredQuery, field = q.where.fieldFilter, expected = decode(field.value);
     assert(q.limit <= 100, 'bounded complaint query');
-    return reply([...docs.values()].filter((item) => item.path.startsWith(q.from[0].collectionId + '/') && item.data[field.field.fieldPath] === expected).slice(0, q.limit).map((item) => ({ document: document(item) })));
+    const cursor = q.startAt?.values?.[0]?.referenceValue;
+    const matches = [...docs.values()].filter((item) => item.path.startsWith(q.from[0].collectionId + '/') &&
+      item.data[field.field.fieldPath] === expected && (!cursor || document(item).name > cursor))
+      .sort((a, b) => a.path.localeCompare(b.path)).slice(0, q.limit).map((item) => ({ document: document(item) }));
+    return reply(matches.length ? matches : [{ readTime: '2026-10-14T00:00:00Z' }]);
   }
   if (url.startsWith(BASE + '/')) {
-    const path = decodeURIComponent(new URL(url).pathname.split('/documents/')[1]);
+    const parsed = new URL(url), path = decodeURIComponent(parsed.pathname.split('/documents/')[1]);
+    if (init.method === 'PATCH') {
+      const prior = docs.get(path);
+      if (!prior || prior.updateTime !== parsed.searchParams.get('currentDocument.updateTime')) return reply({ error: { status: 'FAILED_PRECONDITION' } }, 412);
+      const fields = Object.fromEntries(Object.entries(JSON.parse(init.body).fields).map(([k, v]) => [k, decode(v)]));
+      return reply(document(put(path, { ...prior.data, ...fields })));
+    }
     if (!path.includes('/')) return reply({ documents: [...docs.values()].filter((item) => item.path.startsWith(path + '/')).map(document) });
     if (failPublicProfileRead && path.startsWith('public_profiles/')) { failPublicProfileRead = false; return reply({ error: { status: 'UNAVAILABLE' } }, 503); }
     const item = docs.get(path); return item ? reply(document(item)) : reply({ error: { status: 'NOT_FOUND' } }, 404);
@@ -201,11 +224,12 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
     { type: 'participant_safety', reviewFinding: 'substantiated', targetAccountUid: 'customer-1', orderId: 'two' }
   ]).repeatedSubstantiatedAccountsForManualReview, 1, 'manual pattern flag needs distinct orders');
   assert(!JSON.stringify((await (await run(req('/complaints/mine', 'provider-1'))).json())).includes('substantiated'));
-  assert(writes <= 4, 'bounded writes for report, response and review');
+  assert(writes <= 5, 'bounded writes for report, one durable email alert, response and review');
   const legacy = { orderId: 'order-1', type: 'customer_complaint', target: 'provider', note: 'Existing client complaint' };
   const legacyResponse = await run(req('/complaints/create', 'customer-1', legacy));
   assert.equal(legacyResponse.status, 200, 'legacy complaint request preserved');
   assert(!('reasonCode' in (await legacyResponse.json()).complaint), 'legacy complaint DTO shape preserved');
+  assert.equal((await run(req('/orders/chat/report', 'customer-1', { orderId: 'order-1', note: 'Reported chat' }))).status, 200, 'chat report uses the existing complaint collection');
   const rating = { orderId: 'order-1', type: 'provider', stars: 5, comment: 'Good service' };
   failPublicProfileRead = true;
   const rated = await run(req('/ratings/submit', 'customer-1', rating)); assert.equal(rated.status, 200, 'committed rating is not reported failed when projection read fails');
@@ -352,12 +376,39 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert(docs.get('orders/cash-reject').data.cashFundingDriverConsent, 'consent remains immutable until explicit recovery');
   put('orders/cash-refusal', heldOrder);
   const refusalPath = '/orders/cash-refusal/cash-funding-v1/issue';
+  assert.equal((await run(req(refusalPath, 'customer-1', { kind: 'provider_refusal' }))).status, 403, 'only the provider can report refusal');
   assert.equal((await run(req(refusalPath, 'provider-1', { kind: 'provider_refusal' }))).status, 200);
+  assert(requests <= 12, 'issue creation uses bounded point reads and one transaction');
+  const refusalComplaints = [...docs.values()].filter((item) => item.path.startsWith('delivery_complaints/') && item.data.orderId === 'cash-refusal');
+  assert.equal(refusalComplaints.length, 1, 'hold and actionable Admin case are created together');
+  assert.match(refusalComplaints[0].path, /^delivery_complaints\/cash_[a-f0-9]{48}$/);
+  assert.deepEqual({ type: refusalComplaints[0].data.type, source: refusalComplaints[0].data.source, target: refusalComplaints[0].data.target,
+    reasonCode: refusalComplaints[0].data.reasonCode, complaintStatus: refusalComplaints[0].data.complaintStatus },
+    { type: 'cash_funding_issue', source: 'provider', target: 'admin', reasonCode: 'provider_refusal', complaintStatus: 'pending' });
+  assert(!JSON.stringify(refusalComplaints[0].data).includes('PRIVATE'), 'cash issue case contains no private order data or narrative');
+  assert.equal((await (await run(req(refusalPath, 'provider-1', { kind: 'provider_refusal' }))).json()).idempotent, true);
+  assert.equal([...docs.values()].filter((item) => item.path.startsWith('delivery_complaints/') && item.data.orderId === 'cash-refusal').length, 1, 'retry never duplicates an Admin case');
+  assert.equal((await run(req('/admin/api/complaints', ''))).status, 401);
+  const cashAdminList = await (await run(req('/admin/api/complaints', 'ADMIN'))).json();
+  for (const type of ['participant_safety', 'customer_complaint', 'order_chat_report', 'cash_funding_issue'])
+    assert(cashAdminList.complaints.some((item) => item.type === type), 'existing Admin complaint list includes ' + type);
   assert.equal((await run(req('/delivery-transition', 'driver-1', { orderId: 'cash-refusal', action: 'picked_up' }))).status, 409, 'manual-review hold blocks pickup');
   put('orders/cash-noshow', { ...heldOrder, cashFundingProviderReceipt: docs.get('orders/cash-order').data.cashFundingProviderReceipt, deliveryStatus: 'arrived' });
   assert.equal((await run(req('/orders/cash-noshow/cash-funding-v1/issue', 'driver-1', { kind: 'customer_no_show' }))).status, 200);
+  assert.equal([...docs.values()].filter((item) => item.path.startsWith('delivery_complaints/') && item.data.orderId === 'cash-noshow').length, 1, 'driver no-show reaches Admin');
   assert.equal((await run(req('/orders/cash-noshow/cash-funding-v1/collection-report', 'driver-1', reportBody))).status, 409, 'no-show hold prevents a collection claim');
   assert.equal((await run(req('/delivery-transition', 'driver-1', { orderId: 'cash-noshow', action: 'delivered_pending_confirmation' }))).status, 409, 'manual-review hold blocks legacy delivery-state advancement');
+  put('orders/cash-uncertain-issue', heldOrder);
+  loseCashCommitResponse = true;
+  assert.equal((await run(req('/orders/cash-uncertain-issue/cash-funding-v1/issue', 'provider-1', { kind: 'provider_refusal' }))).status, 200, 'lost issue commit response reconciles hold, event and Admin case');
+  assert.equal([...docs.values()].filter((item) => item.path.startsWith('delivery_complaints/') && item.data.orderId === 'cash-uncertain-issue').length, 1);
+  assert.equal((await (await run(req('/orders/cash-uncertain-issue/cash-funding-v1/issue', 'provider-1', { kind: 'provider_refusal' }))).json()).idempotent, true);
+  put('orders/cash-issue-race', heldOrder);
+  cashMarkerAtCommit = true;
+  assert.equal((await run(req('/orders/cash-issue-race/cash-funding-v1/issue', 'provider-1', { kind: 'provider_refusal' }))).status, 409, 'new deletion marker aborts hold and Admin case together');
+  assert(!docs.get('orders/cash-issue-race').data.cashFundingHold);
+  assert(![...docs.values()].some((item) => item.path.startsWith('delivery_complaints/') && item.data.orderId === 'cash-issue-race'));
+  docs.delete('account_deletion_irreversible_markers/driver-1');
   put('orders/cash-uncertain-receipt', heldOrder);
   loseCashCommitResponse = true;
   assert.equal((await run(req('/orders/cash-uncertain-receipt/cash-funding-v1/provider-receipt', 'provider-1', receiptBody))).status, 200, 'lost receipt commit response reconciles');
@@ -468,6 +519,11 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert.equal((await run(req(conflictingPath + '/release-no-advance', 'driver-1', { termsVersion: conflictingTerms, noAdvanceAttested: true }))).status, 200);
   assert.equal((await run(req(conflictingPath + '/provider-receipt', 'provider-1', { ...receiptBody, termsVersion: conflictingTerms }))).status, 200);
   assert.equal(docs.get('orders/cash-conflicting-paid').data.cashFundingHold.kind, 'conflicting_payment_evidence', 'contradictory receipt enters manual review');
+  const conflictingCases = [...docs.entries()].filter(([path, item]) => path.startsWith('delivery_complaints/') && item.data.orderId === 'cash-conflicting-paid');
+  assert.equal(conflictingCases.length, 1, 'contradictory receipt creates one Admin case');
+  assert.equal(conflictingCases[0][1].data.reasonCode, 'conflicting_payment_evidence');
+  assert.equal((await run(req(conflictingPath + '/provider-receipt', 'provider-1', { ...receiptBody, termsVersion: conflictingTerms }))).status, 200, 'exact receipt retry is idempotent');
+  assert.equal([...docs.entries()].filter(([path, item]) => path.startsWith('delivery_complaints/') && item.data.orderId === 'cash-conflicting-paid').length, 1, 'receipt retry cannot duplicate Admin case');
   assert.equal((await run(req(conflictingPath + '/convert-self-pickup', 'customer-1', { expectedDeliveryStateVersion: 3, confirmSelfPickup: true }))).status, 409);
   put('orders/cash-stale-consent', { ...cashOrder, driverUid: 'driver-1', deliveryStatus: 'driver_assigned', cashFundingDriverConsent: docs.get('orders/cash-order').data.cashFundingDriverConsent });
   assert.equal((await run(req(recoveryPath('cash-stale-consent') + '/release-no-advance', 'driver-1', { termsVersion: terms.termsVersion, noAdvanceAttested: true }))).status, 409, 'consent from a different order cannot authorize release');
@@ -483,5 +539,48 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert.equal((await run(req(uncertainPath + '/accept', 'driver-1', { termsVersion: uncertainTerms, consent: true }))).status, 503, 'flag OFF blocks new acceptance');
   assert.equal((await run(req(uncertainPath, 'provider-1'))).status, 200, 'existing assigned funding order remains readable with creation OFF');
   assert.equal((await run(req(uncertainPath + '/provider-receipt', 'provider-1', { ...receiptBody, termsVersion: uncertainTerms }))).status, 200, 'existing assignment can continue safely after disabling new funding');
-  console.log('participant-safety + cash-funding V1 offline: PASS (classification, no-cap consent, three recovery cases, audit/idempotency, races, privacy, legacy, strict REST Writes)');
+  const alerts = [...docs.entries()].filter(([path]) => path.startsWith('complaint_email_alerts/'));
+  assert(alerts.length >= 6, 'every created legacy, safety, chat and cash case has a durable alert');
+  assert.equal(new Set(alerts.map(([, item]) => item.data.complaintId)).size, alerts.length, 'one alert per complaint');
+  for (const [, item] of alerts) {
+    assert(docs.has('delivery_complaints/' + item.data.complaintId), 'alert always references a persisted Admin complaint');
+    assert.deepEqual(Object.keys(item.data).sort(), ['attempts', 'category', 'complaintId', 'createdAt', 'orderId', 'status', 'submittedAt', 'updatedAt'].sort(), 'alert stores metadata, not narrative or private data');
+  }
+  const emailEnv = { EMAIL_API_KEY: 'offline-resend-key', EMAIL_FROM: 'Tabbakheen <offline@example.invalid>' };
+  requests = 0;
+  assert.equal(await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth'), true);
+  assert(requests <= 12, 'missing-recipient alert attempt is bounded');
+  assert.equal(emails.length, 0, 'missing Support Email cannot send to an invented fallback');
+  assert(alerts.some(([path]) => docs.get(path).data.lastErrorCode === 'recipient_unavailable'), 'missing-recipient failure is durable');
+  put('app_settings/main', { supportEmail: 'not-an-email' });
+  assert.equal(await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth'), true);
+  assert.equal(emails.length, 0, 'invalid Support Email cannot receive a complaint alert');
+  put('app_settings/main', { supportEmail: 'first@example.invalid' });
+  resendFailure = true;
+  requests = 0;
+  assert.equal(await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth'), true);
+  assert(requests <= 12, 'provider-failure attempt is bounded');
+  assert.equal(emails.length, 0, 'provider failure does not claim delivery');
+  assert(alerts.some(([path]) => docs.get(path).data.lastErrorCode === 'provider_http_503'), 'provider failure remains retryable');
+  put('app_settings/main', { supportEmail: 'second@example.invalid' });
+  resendLostResponse = true;
+  assert.equal(await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth'), true);
+  assert.equal(emails.length, 1, 'provider accepted once despite lost response');
+  assert(alerts.some(([path]) => docs.get(path).data.lastErrorCode === 'uncertain'), 'lost response is not reported as success');
+  for (const [path] of alerts) {
+    const item = docs.get(path);
+    if (item.data.status === 'pending') put(path, { ...item.data, nextAttemptAt: '2026-01-01T00:00:00Z', leaseUntil: null });
+  }
+  for (let i = 0; i < alerts.length * 4; i++) {
+    requests = 0;
+    await hooks.handleScheduledComplaintEmailAlert(emailEnv, 'offline-oauth');
+    assert(requests <= 16, 'one bounded email unit per Cron invocation');
+    if (alerts.every(([path]) => docs.get(path).data.status === 'sent')) break;
+  }
+  assert(alerts.every(([path]) => docs.get(path).data.status === 'sent'), 'bounded retries eventually drain every synthetic complaint alert');
+  assert.equal(emails.length, alerts.length, 'one accepted email per genuinely new complaint');
+  assert(emails.some((item) => item.payload.to[0] === 'first@example.invalid'), 'first delivery uses the then-current configured address');
+  assert(emails.some((item) => item.payload.to[0] === 'second@example.invalid'), 'subsequent unfrozen alerts use the changed Admin Support Email');
+  assert(emails.every((item) => item.payload.html.includes('/admin#complaints') && !item.payload.html.includes('PRIVATE')), 'email links to authenticated Admin without narrative');
+  console.log('participant-safety + cash-funding V1 + complaint alerts offline: PASS (Admin routing, dynamic recipient, bounded retries, provider failure/lost response, privacy, legacy, strict REST Writes)');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
