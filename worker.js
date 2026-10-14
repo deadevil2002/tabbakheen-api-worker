@@ -1474,6 +1474,8 @@
       ]);
       if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
       const order = snapshot.data;
+      if (order.cashFundingVersion === CASH_FUNDING_V1 && order.cashFundingHold)
+        return jsonResponse({ success: false, code: "cash_funding_dispute_required", error: "Cash-funding order requires manual review" }, 409);
       const now = new Date().toISOString();
       const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
       let fields;
@@ -1509,6 +1511,10 @@
           deliveryStateVersion: nextVersion,
           updatedAt: now
         };
+        if (order.cashFundingVersion === CASH_FUNDING_V1) {
+          fields.cashFundingVersion = null;
+          fields.cashFundingIntentVersion = null;
+        }
         notificationEvent = "self_pickup_selected";
       } else if (action === "complete_self_pickup") {
         const ownsAsCustomer = actor && actor.role === "customer" && order.customerUid === uid;
@@ -1536,7 +1542,7 @@
         };
         if (ownsAsCustomer) fields.customerConfirmedAt = now;
         if (ownsAsProvider) fields.providerCompletedAt = now;
-        if (order.paymentMethod === "CASH" || order.paymentMethod === "cod") fields.paymentStatus = "PAID_CONFIRMED";
+        if (order.cashFundingVersion !== CASH_FUNDING_V1 && (order.paymentMethod === "CASH" || order.paymentMethod === "cod")) fields.paymentStatus = "PAID_CONFIRMED";
         notificationEvent = "self_pickup_completed";
       } else if (action === "confirm_delivered") {
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
@@ -1556,10 +1562,11 @@
           deliveryStateVersion: nextVersion,
           updatedAt: now
         };
-        if (order.paymentMethod === "CASH" || order.paymentMethod === "cod") fields.paymentStatus = "PAID_CONFIRMED";
+        if (order.cashFundingVersion !== CASH_FUNDING_V1 && (order.paymentMethod === "CASH" || order.paymentMethod === "cod")) fields.paymentStatus = "PAID_CONFIRMED";
         notificationEvent = "delivered";
       } else {
         if (!actor || actor.role !== "driver") return jsonResponse({ success: false, code: "forbidden", error: "Driver role required" }, 403);
+        if (order.cashFundingVersion === CASH_FUNDING_V1 && action === "accept") return jsonResponse({ success: false, code: "cash_funding_consent_required", error: "Review and accept the cash-funding terms", }, 409);
         const driverEntitlement = evaluateSubscriptionEntitlement(actor);
         // Expiry policy: accepting is a new commercial assignment and requires
         // entitlement. Once assigned, reject/pickup/arrival/completion remain
@@ -1584,6 +1591,7 @@
           fields = { driverUid: uid, deliveryStatus: "driver_assigned", driverAssignedAt: now, deliveryStateVersion: nextVersion, updatedAt: now };
           notificationEvent = "driver_assigned";
         } else if (action === "reject") {
+          if (order.cashFundingVersion === CASH_FUNDING_V1 && order.cashFundingProviderReceipt) return jsonResponse({ success: false, code: "cash_funding_dispute_required", error: "Provider receipt has been acknowledged; request manual review", }, 409);
           if (order.deliveryStatus === "ready_for_driver" && !order.driverUid && order.lastRejectedDriverUid === uid) {
             return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
           }
@@ -1602,6 +1610,7 @@
             deliveryStateVersion: nextVersion,
             updatedAt: now
           };
+          if (order.cashFundingVersion === CASH_FUNDING_V1) fields.cashFundingDriverConsent = null;
           notificationEvent = "driver_rejected";
         } else {
           if (order.driverUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Driver is not assigned to this order" }, 403);
@@ -1614,6 +1623,7 @@
           if (order.deliveryStatus !== expected) {
             return jsonResponse({ success: false, code: "transition_not_allowed", error: "Stale or illegal delivery transition" }, 409);
           }
+          if (order.cashFundingVersion === CASH_FUNDING_V1 && action === "picked_up" && (!order.cashFundingProviderReceipt || order.cashFundingHold)) return jsonResponse({ success: false, code: "cash_funding_receipt_required", error: "Provider cash receipt is required before pickup" }, 409);
           fields = { deliveryStatus: action, deliveryStateVersion: nextVersion, updatedAt: now };
           if (action === "picked_up") fields.pickedUpAt = now;
           if (action === "arrived") fields.driverArrivedAt = now;
@@ -3448,7 +3458,7 @@
       if (!addressLine || !city || !district) return null;
       return { success: true, addressLine, city, district, lat: value.lat, lng: value.lng, deliveryNotes: typeof value.deliveryNotes === "string" ? value.deliveryNotes.slice(0, 500) : "" };
     }
-    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, paymentMethod, accessToken, pricingSnapshot) {
+    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, paymentMethod, accessToken, pricingSnapshot, fundingEnabled = false) {
       const uid = orderSnapshot.data.customerUid, providerUid = orderSnapshot.data.providerUid;
       if (!phase4aSafeSegment(uid) || !phase4aSafeSegment(providerUid)) return { ok: false, conflict: true };
       const name = (collection, id) => "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id;
@@ -3478,11 +3488,20 @@
         if (!confirmed.ok || confirmed.pricingVersion !== quote.pricingVersion || confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm || confirmed.deliveryFee !== quote.deliveryFee) return { abort: "STALE_DELIVERY_QUOTE" };
         const subtotal = order.priceSnapshot;
         if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return { abort: "ORDER_PRICE_INVALID" };
+        const fundingIntent = order.cashFundingIntentVersion === CASH_FUNDING_V1;
+        if (fundingIntent && (!fundingEnabled || order.paymentMethod !== "CASH" || paymentMethod !== "cod")) return { abort: "CASH_FUNDING_INELIGIBLE" };
+        if (fundingIntent) {
+          const limit = cashFundingLimitCents(settingsRead?.data);
+          const advance = sarCents(subtotal), fee = sarCents(quote.deliveryFee);
+          if (limit === null || advance === null || fee === null || advance > limit || advance + fee > 1e8) return { abort: "CASH_FUNDING_LIMIT" };
+        }
         const stateVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
         const fields = { deliveryMethod: "driver", dropoffCity: quote.city, dropoffDistrict: quote.district, dropoffConfirmedAt: now,
-          deliveryDistanceKm: quote.deliveryDistanceKm, deliveryFee: quote.deliveryFee, totalAmount: subtotal + quote.deliveryFee,
+          deliveryDistanceKm: quote.deliveryDistanceKm, deliveryFee: quote.deliveryFee,
+          totalAmount: fundingIntent ? (sarCents(subtotal) + sarCents(quote.deliveryFee)) / 100 : subtotal + quote.deliveryFee,
           deliveryQuoteId: quoteId, deliveryPricingVersion: quote.pricingVersion, deliveryPaymentMethod: paymentMethod,
           platformDeliveryCommission: 0, driverGrossDeliveryEarnings: quote.deliveryFee, driverUid: null,
+          ...(fundingIntent ? { cashFundingVersion: CASH_FUNDING_V1 } : {}),
           deliveryStatus: "ready_for_driver", status: "searching_driver", deliveryStateVersion: stateVersion, updatedAt: now };
         const privateFields = { orderId, customerUid: uid, providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng,
           addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "",
@@ -3517,7 +3536,7 @@
         return { event, jobId: expected.jobId, fields: expected.fields, order: order.data, stateVersion: expected.stateVersion };
       }, 2, {}, 12);
       if (["committed", "reconciled"].includes(result.kind)) return { ok: true, ...result.value };
-      return { ok: false, conflict: result.kind !== "uncertain", uncertain: result.kind === "uncertain" };
+      return { ok: false, conflict: result.kind !== "uncertain", uncertain: result.kind === "uncertain", code: result.kind === "aborted" ? result.value : null };
     }
     function parseAppleSubscriptionStatusPayload(payload) {
       if (!payload || typeof payload !== "object") return null;
@@ -4162,6 +4181,182 @@
       return jsonResponse({ success: true });
     }
     const PRIVATE_DESTINATION_ORDER_CONTRACT = "explicit_v2";
+    const CASH_FUNDING_V1 = 1;
+    function cashFundingV1Enabled(env) { return env?.CASH_FUNDING_V1_ENABLED === "true"; }
+    function sarCents(value) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1e6) return null;
+      const cents = Math.round(value * 100);
+      return Number.isSafeInteger(cents) && cents / 100 === value ? cents : null;
+    }
+    function cashFundingLimitCents(settings) {
+      const policy = settings?.cashFundingV1;
+      if (!phase4aKeysOnly(policy, ["maxDriverAdvanceSar"])) return null;
+      const cents = sarCents(policy.maxDriverAdvanceSar);
+      return cents !== null && cents > 0 ? cents : null;
+    }
+    function cashFundingAmounts(order) {
+      if (!order || order.cashFundingVersion !== CASH_FUNDING_V1 || order.cashFundingIntentVersion !== CASH_FUNDING_V1 || order.destinationContract !== PRIVATE_DESTINATION_ORDER_CONTRACT ||
+          order.paymentMethod !== "CASH" || order.deliveryPaymentMethod !== "cod" || !isDriverDeliveryMethod(order.deliveryMethod)) return null;
+      const food = sarCents(order.priceSnapshot), fee = sarCents(order.deliveryFee);
+      if (food === null || food <= 0 || fee === null || food + fee > 1e8 ||
+          sarCents(order.totalAmount) !== food + fee || sarCents(order.driverGrossDeliveryEarnings) !== fee || order.platformDeliveryCommission !== 0) return null;
+      return { foodAdvanceSar: food / 100, deliveryFeeSar: fee / 100, customerCashTotalSar: (food + fee) / 100, currency: "SAR" };
+    }
+    function cashFundingTermsVersion(order, amounts, maxCents) {
+      return JSON.stringify([CASH_FUNDING_V1, order.deliveryStateVersion, order.updatedAt, order.deliveryQuoteId,
+        order.deliveryPricingVersion, sarCents(amounts.foodAdvanceSar), sarCents(amounts.deliveryFeeSar), maxCents]);
+    }
+    function cashFundingPublicState(order, amounts) {
+      return { contractVersion: CASH_FUNDING_V1, orderId: order._id || order.id,
+        ...amounts, platformDeliveryCommissionSar: 0,
+        providerReceiptAcknowledged: !!order.cashFundingProviderReceipt,
+        driverCollectionReported: !!order.cashFundingCollectionReport,
+        customerCollectionAcknowledged: !!order.cashFundingCustomerAcknowledgment,
+        termsVersion: typeof order.cashFundingDriverConsent?.termsVersion === "string" ? order.cashFundingDriverConsent.termsVersion : null,
+        onHold: !!order.cashFundingHold };
+    }
+    async function cashFundingV1Read(request, orderId, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError("account_deletion_blocked", "Account deletion is in progress", 403);
+      const order = await getFirestoreDoc("orders", orderId, accessToken);
+      const role = auth.user.role;
+      const participant = order && ["customer", "provider", "driver"].includes(role) && order[role + "Uid"] === auth.uid;
+      if (!order) return phase4aError("not_found", "Order unavailable", 404);
+      if (order.cashFundingVersion !== CASH_FUNDING_V1) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const amounts = cashFundingAmounts(order);
+      if (!amounts) return phase4aError("cash_funding_invalid", "Cash funding snapshot is invalid", 409);
+      if (participant) return jsonResponse({ success: true, ...cashFundingPublicState(order, amounts) });
+      if (role !== "driver" || !cashFundingV1Enabled(env) || order.cashFundingHold) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const runtime = await getFirestoreDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid, accessToken);
+      if (auth.user.isAvailable !== true || !evaluateSubscriptionEntitlement(auth.user).eligible ||
+          !driverRuntimeLocationStatus(runtime).fresh || !driverOrderMatchV2(order, auth.uid, runtime, driverDistancePreferences(auth.user))) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+      const maxCents = cashFundingLimitCents(settings);
+      if (maxCents === null || sarCents(amounts.foodAdvanceSar) > maxCents) return phase4aError("cash_funding_limit", "Driver advance limit unavailable or exceeded", 409);
+      return jsonResponse({ success: true, ...cashFundingPublicState(order, amounts),
+        termsVersion: cashFundingTermsVersion(order, amounts, maxCents) });
+    }
+    async function cashFundingV1Accept(request, orderId, env, accessToken) {
+      if (!cashFundingV1Enabled(env)) return phase4aError("cash_funding_disabled", "Cash funding is unavailable", 503);
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (auth.user.role !== "driver") return phase4aError("forbidden", "Driver account required", 403);
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid consent"); }
+      if (!phase4aKeysOnly(body, ["termsVersion", "consent"]) || body.consent !== true || typeof body.termsVersion !== "string" || body.termsVersion.length > 300) return phase4aError("invalid_request", "Explicit terms consent is required");
+      const initial = await getFirestoreSnapshot("orders", orderId, accessToken);
+      const order = initial?.data, amounts = cashFundingAmounts(order);
+      if (!amounts || !phase4aSafeSegment(order.customerUid) || !phase4aSafeSegment(order.providerUid)) return phase4aError("not_found", "Cash funding unavailable", 404);
+      if (order.driverUid === auth.uid && order.cashFundingDriverConsent?.termsVersion === body.termsVersion && order.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: order.deliveryStatus });
+      const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
+      const eventId = notificationEventId(orderId, "driver_assigned", nextVersion);
+      const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
+      const orderName = doc("orders", orderId), settingsName = doc("app_settings", "main"), userName = doc("users", auth.uid);
+      const locationName = doc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid), eventName = doc("order_transition_events", eventId);
+      const consentId = orderId + "_driver_consent_" + nextVersion;
+      const consentName = doc("order_cash_funding_events", consentId);
+      const members = [order.customerUid, order.providerUid, auth.uid];
+      const deletionNames = members.flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
+      const now = new Date().toISOString();
+      const result = await firestoreReadWriteTransaction([orderName, settingsName, userName, locationName, eventName, consentName, ...deletionNames], accessToken, (read) => {
+        const current = read.get(orderName), driver = read.get(userName)?.data, settings = read.get(settingsName)?.data;
+        const location = read.get(locationName)?.data;
+        if (!current || current.updateTime !== initial.updateTime || read.get(eventName) || read.get(consentName)) return { abort: "stale_terms" };
+        if (deletionNames.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
+        const active = current.data, exact = cashFundingAmounts(active), maxCents = cashFundingLimitCents(settings);
+        if (!exact || active.cashFundingHold || maxCents === null || sarCents(exact.foodAdvanceSar) > maxCents ||
+            cashFundingTermsVersion(active, exact, maxCents) !== body.termsVersion ||
+            active.driverUid || active.deliveryStatus !== "ready_for_driver" || active.status !== "searching_driver" ||
+            !driver || driver.role !== "driver" || driver.isAvailable !== true || !evaluateSubscriptionEntitlement(driver).eligible ||
+            !driverRuntimeLocationStatus(location).fresh || !driverOrderMatchV2(active, auth.uid, location, driverDistancePreferences(driver))) return { abort: "stale_terms" };
+        const consent = { driverUid: auth.uid, termsVersion: body.termsVersion, ...exact, acceptedAt: now };
+        const fields = { driverUid: auth.uid, deliveryStatus: "driver_assigned", driverAssignedAt: now,
+          deliveryStateVersion: nextVersion, cashFundingDriverConsent: consent, updatedAt: now };
+        const event = { orderId, transition: "driver_assigned", stateVersion: nextVersion, status: "pending", createdAt: now };
+        return { writes: [
+          { update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: current.updateTime } },
+          { update: phase4aDoc("order_transition_events", eventId, event), currentDocument: { exists: false } },
+          { update: phase4aDoc("order_cash_funding_events", consentId, { orderId, type: "driver_consent", actorUid: auth.uid, ...exact, termsVersion: body.termsVersion, createdAt: now }), currentDocument: { exists: false } },
+          ...trackingJobWrite(orderId, eventId, now)
+        ], value: true, expected: true };
+      }, async () => {
+        const [latest, event, consent] = await Promise.all([getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_transition_events", eventId, accessToken), getFirestoreDoc("order_cash_funding_events", consentId, accessToken)]);
+        return !!latest && latest.driverUid === auth.uid && latest.deliveryStatus === "driver_assigned" && latest.cashFundingDriverConsent?.termsVersion === body.termsVersion && event?.orderId === orderId && event.transition === "driver_assigned" && consent?.actorUid === auth.uid && consent.termsVersion === body.termsVersion;
+      }, 2, {}, 12);
+      if (["committed", "reconciled"].includes(result.kind)) {
+        // The atomic outbox event is durable; Cron owns bounded dispatch.
+        return jsonResponse({ success: true, orderId, deliveryStatus: "driver_assigned", ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
+      }
+      if (result.kind === "uncertain") return phase4aError("state_uncertain", "Acceptance outcome uncertain; refresh before retrying", 503);
+      const latest = await getFirestoreDoc("orders", orderId, accessToken);
+      if (latest?.driverUid === auth.uid && latest.cashFundingDriverConsent?.termsVersion === body.termsVersion && latest.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: latest.deliveryStatus });
+      return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" : "stale_terms", "Cash-funding terms or assignment changed", 409);
+    }
+    async function cashFundingV1Record(request, orderId, action, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid cash-funding event"); }
+      const issue = action === "issue";
+      if (issue ? (!phase4aKeysOnly(body, ["kind"]) || !["provider_refusal", "customer_no_show", "dispute"].includes(body.kind))
+        : (!phase4aKeysOnly(body, ["termsVersion", "amountSar", "currency", action === "collection-report" ? "reportedCollected" : "acknowledged"]) ||
+            typeof body.termsVersion !== "string" || body.termsVersion.length > 300 || body.currency !== "SAR" ||
+            sarCents(body.amountSar) === null || body[action === "collection-report" ? "reportedCollected" : "acknowledged"] !== true)) return phase4aError("invalid_request", "Invalid cash-funding event");
+      const field = { "provider-receipt": "cashFundingProviderReceipt", "collection-report": "cashFundingCollectionReport", "customer-ack": "cashFundingCustomerAcknowledgment", issue: "cashFundingHold" }[action];
+      if (!field) return phase4aError("invalid_request", "Invalid cash-funding event");
+      const orderSnapshot = await getFirestoreSnapshot("orders", orderId, accessToken), order = orderSnapshot?.data;
+      const amounts = cashFundingAmounts(order);
+      if (!amounts) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const role = auth.user.role;
+      if (order[role + "Uid"] !== auth.uid || action === "provider-receipt" && role !== "provider" ||
+          action === "collection-report" && role !== "driver" || action === "customer-ack" && role !== "customer" ||
+          issue && !["customer", "provider", "driver"].includes(role)) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const amount = action === "provider-receipt" ? amounts.foodAdvanceSar : amounts.customerCashTotalSar;
+      if (!issue && (sarCents(body.amountSar) !== sarCents(amount) || body.termsVersion !== order.cashFundingDriverConsent?.termsVersion)) return phase4aError("stale_terms", "Cash-funding amount or terms changed", 409);
+      if (issue && (body.kind === "provider_refusal" && role !== "provider" || body.kind === "customer_no_show" && role !== "driver")) return phase4aError("forbidden", "Issue is unavailable", 403);
+      const existing = order[field];
+      const same = (value) => value?.actorUid === auth.uid && (issue ? value.kind === body.kind :
+        value.termsVersion === body.termsVersion && sarCents(value.amountSar) === sarCents(amount));
+      if (existing) return same(existing) ? jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action }) : phase4aError("event_exists", "Cash-funding event already recorded", 409);
+      const eventId = orderId + "_" + (issue ? "issue_" + auth.uid + "_" + body.kind : action);
+      const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
+      const orderName = doc("orders", orderId), eventName = doc("order_cash_funding_events", eventId), userName = doc("users", auth.uid);
+      const members = [order.customerUid, order.providerUid, order.driverUid];
+      if (members.some((uid) => !phase4aSafeSegment(uid))) return phase4aError("state_conflict", "Order participants unavailable", 409);
+      const fences = members.flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
+      const now = new Date().toISOString();
+      const result = await firestoreReadWriteTransaction([orderName, eventName, userName, ...fences], accessToken, (read) => {
+        const current = read.get(orderName), actor = read.get(userName)?.data;
+        if (!current || current.updateTime !== orderSnapshot.updateTime || read.get(eventName) || !actor || actor.role !== role ||
+            ["suspended", "disabled"].includes(actor.accountStatus)) return { abort: "state_conflict" };
+        if (fences.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
+        const latest = current.data, exact = cashFundingAmounts(latest);
+        if (!exact || latest[role + "Uid"] !== auth.uid || latest[field] || !latest.cashFundingDriverConsent ||
+            latest.cashFundingDriverConsent.driverUid !== latest.driverUid ||
+            latest.cashFundingDriverConsent.foodAdvanceSar !== exact.foodAdvanceSar ||
+            latest.cashFundingDriverConsent.deliveryFeeSar !== exact.deliveryFeeSar ||
+            latest.cashFundingDriverConsent.customerCashTotalSar !== exact.customerCashTotalSar) return { abort: "state_conflict" };
+        if (!issue && (body.termsVersion !== latest.cashFundingDriverConsent.termsVersion ||
+            sarCents(body.amountSar) !== sarCents(action === "provider-receipt" ? exact.foodAdvanceSar : exact.customerCashTotalSar))) return { abort: "stale_terms" };
+        if (action === "provider-receipt" && (latest.deliveryStatus !== "driver_assigned" || latest.cashFundingHold) ||
+            action === "collection-report" && (!latest.cashFundingProviderReceipt || latest.cashFundingHold || !["arrived", "delivered_pending_confirmation", "delivered"].includes(latest.deliveryStatus)) ||
+            action === "customer-ack" && (!latest.cashFundingCollectionReport || latest.cashFundingHold || !["delivered_pending_confirmation", "delivered"].includes(latest.deliveryStatus)) ||
+            issue && (body.kind === "provider_refusal" && (!!latest.cashFundingProviderReceipt || latest.deliveryStatus !== "driver_assigned") ||
+              body.kind === "customer_no_show" && (!latest.cashFundingProviderReceipt || !["arrived", "delivered_pending_confirmation"].includes(latest.deliveryStatus)))) return { abort: "transition_not_allowed" };
+        const recorded = issue ? { kind: body.kind, actorUid: auth.uid, actorRole: role, createdAt: now } :
+          { actorUid: auth.uid, actorRole: role, termsVersion: body.termsVersion,
+            amountSar: action === "provider-receipt" ? exact.foodAdvanceSar : exact.customerCashTotalSar,
+            currency: "SAR", createdAt: now, evidenceState: action === "customer-ack" ? "customer_acknowledged" : action === "collection-report" ? "driver_reported" : "provider_acknowledged" };
+        return { writes: [
+          { update: phase4aDoc("orders", orderId, { [field]: recorded, updatedAt: now }), updateMask: { fieldPaths: [field, "updatedAt"] }, currentDocument: { updateTime: current.updateTime } },
+          { update: phase4aDoc("order_cash_funding_events", eventId, { orderId, type: action, ...recorded }), currentDocument: { exists: false } }
+        ], value: true, expected: recorded };
+      }, async (expected) => {
+        const [latest, event] = await Promise.all([getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_cash_funding_events", eventId, accessToken)]);
+        return !!latest && !!event && same(latest[field]) && event.actorUid === auth.uid && event.createdAt === expected.createdAt;
+      }, 2, {}, 9);
+      if (["committed", "reconciled"].includes(result.kind)) return jsonResponse({ success: true, orderId, state: issue ? "manual_review" : action, ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
+      if (result.kind === "uncertain") return phase4aError("state_uncertain", "Event outcome uncertain; refresh before retrying", 503);
+      const latest = await getFirestoreDoc("orders", orderId, accessToken);
+      if (same(latest?.[field])) return jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action });
+      return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" : result.value || "state_conflict", "Cash-funding state changed", 409);
+    }
     // A missing binding is deliberately OFF. Existing V2 orders continue
     // through the V2 delivery paths when new creation is disabled.
     function v2OrderCreationEnabled(env) {
@@ -4176,15 +4371,18 @@
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
       if (auth.user.role !== "customer") return phase4aError("forbidden", "Customer account required", 403);
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
-      if (!phase4aKeysOnly(body, ["requestId", "providerUid", "offerId", "quantity", "paymentMethod", "note"]) || !phase4aSafeSegment(body.requestId) || !phase4aSafeSegment(body.offerId) || !phase4aSafeSegment(body.providerUid)) return phase4aError("invalid_request", "Invalid order request");
+      if (!phase4aKeysOnly(body, ["requestId", "providerUid", "offerId", "quantity", "paymentMethod", "note", ...(privateDestinationCreation ? ["cashFundingVersion"] : [])]) || !phase4aSafeSegment(body.requestId) || !phase4aSafeSegment(body.offerId) || !phase4aSafeSegment(body.providerUid)) return phase4aError("invalid_request", "Invalid order request");
       const quantity = body.quantity, paymentMethod = String(body.paymentMethod || "").trim().toLowerCase();
       if (typeof quantity !== "number" || !Number.isInteger(quantity) || quantity !== 1) return phase4aError("invalid_quantity", "Quantity must be one");
       if (!["cash", "cod", "bank_transfer", "stc", "stc_pay"].includes(paymentMethod)) return phase4aError("invalid_payment_method", "Unsupported payment method");
       const canonicalPaymentMethod = { cash: "CASH", cod: "CASH", bank_transfer: "BANK_TRANSFER", stc: "STC_PAY", stc_pay: "STC_PAY" }[paymentMethod];
+      const fundingIntent = body.cashFundingVersion === CASH_FUNDING_V1;
+      if (body.cashFundingVersion !== undefined && (!fundingIntent || !privateDestinationCreation || canonicalPaymentMethod !== "CASH")) return phase4aError("cash_funding_ineligible", "Cash funding is unavailable for this order", 409);
+      if (fundingIntent && !cashFundingV1Enabled(env)) return phase4aError("cash_funding_disabled", "Cash funding is unavailable", 503);
       const input = { offerId: body.offerId, quantity, paymentMethod: canonicalPaymentMethod, note: typeof body.note === "string" ? body.note.trim().slice(0, 1000) : "" };
       // Keep the legacy hash byte-for-byte compatible with existing request IDs.
       // A request ID cannot replay across the two creation contracts.
-      const intentHash = JSON.stringify(privateDestinationCreation ? { ...input, destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : input);
+      const intentHash = JSON.stringify(privateDestinationCreation ? { ...input, destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT, ...(fundingIntent ? { cashFundingVersion: CASH_FUNDING_V1 } : {}) } : input);
       const idemPath = "order_creation_requests", idemId = auth.uid + "_" + body.requestId.trim();
       const providerUid = body.providerUid, now = new Date().toISOString(), orderId = crypto.randomUUID();
       const orderNumber = "TB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 8).toUpperCase();
@@ -4195,7 +4393,8 @@
         ["users", auth.uid], ["users", providerUid], ["offers", body.offerId],
         ["account_deletion_requests", auth.uid], ["account_deletion_requests", providerUid],
         [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid], [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, providerUid],
-        [idemPath, idemId]
+        [idemPath, idemId],
+        ...(fundingIntent ? [["app_settings", "main"]] : [])
       ];
       const names = paths.map(([collection, id]) => phase4aDoc(collection, id, {}).name);
       let firstVersions = null;
@@ -4208,7 +4407,7 @@
         return parseFirestoreDoc(document);
       };
       const matchesCreationContract = (order) => privateDestinationCreation
-        ? isPrivateDestinationOrder(order) && !ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS.some((field) => Object.prototype.hasOwnProperty.call(order, field))
+        ? isPrivateDestinationOrder(order) && (order.cashFundingIntentVersion === CASH_FUNDING_V1) === fundingIntent && !ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS.some((field) => Object.prototype.hasOwnProperty.call(order, field))
         : order?.destinationContract == null;
       const replay = async (existingOrderId) => {
         if (!phase4aSafeSegment(existingOrderId)) return null;
@@ -4255,6 +4454,11 @@
         if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) return { abort: phase4aError("payment_rejected", "Selected payment method is unavailable", 409) };
         const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
         if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return { abort: phase4aError("invalid_offer", "Offer is malformed") };
+        if (fundingIntent) {
+          const limit = cashFundingLimitCents(read.get(names[8])?.data);
+          const advance = sarCents(offer.price);
+          if (limit === null || advance === null || advance > limit) return { abort: phase4aError("cash_funding_limit", "Driver advance limit is unavailable or exceeded", 409) };
+        }
         const versions = [customerSnap.updateTime, providerSnap.updateTime, offerSnap.updateTime];
         if (firstVersions && versions.some((version, index) => version !== firstVersions[index])) return { abort: phase4aError("state_conflict", "Order inputs changed; retry", 409) };
         firstVersions = versions;
@@ -4269,7 +4473,7 @@
           deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "",
           providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null,
           providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null,
-          ...(privateDestinationCreation ? { destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : {
+          ...(privateDestinationCreation ? { destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT, ...(fundingIntent ? { cashFundingIntentVersion: CASH_FUNDING_V1 } : {}) } : {
             customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null,
             customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null,
             dropoffAddress: typeof customer.address === "string" ? customer.address : ""
@@ -4286,7 +4490,7 @@
           { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } },
           ...trackingJobWrite(orderId, eventId, now)
         ], value: { success: true, orderId, order }, expected: { orderId } };
-      }, reconcile);
+      }, reconcile, 2, {}, fundingIntent ? 9 : 8);
       if (result.kind === "aborted") {
         if (result.value?.replayOrderId) {
           const priorOrder = await replay(result.value.replayOrderId);
@@ -7568,6 +7772,9 @@ async function renderSettings(c){
     '<div><strong>'+(lang==="ar"?"الحد الأدنى الفعلي":"Effective minimum fee")+':</strong> '+v2Amount(v2Policy.minFee)+'</div>'+
     '<div><strong>'+(lang==="ar"?"مصدر السياسة":"Policy source")+':</strong> '+v2Source+'</div>'+
     '<div><strong>'+(lang==="ar"?"مصدر المعدلات":"Rate source")+':</strong> '+v2RateSource+'</div></div></div>'+
+    '<div class="settings-section"><h3>'+(lang==="ar"?"حد تمويل المندوب النقدي V1":"Driver-funded cash V1 limit")+'</h3>'+
+    '<p style="font-size:13px;color:var(--text2)">'+(lang==="ar"?"القيمة فارغة تعني أن التمويل غير متاح. حفظ الحد لا يفعّل الميزة؛ يلزم اعتماد المالك وعلم التشغيل المنفصل.":"A blank limit keeps funding unavailable. Saving a limit does not activate the feature; owner approval and a separate flag are required.")+'</p>'+
+    '<div class="form-group"><label for="s-cashFundingMax">'+(lang==="ar"?"أقصى مبلغ يقدمه المندوب للمطعم (ريال سعودي)":"Maximum driver food advance (SAR)")+'</label><input type="number" min="0.01" max="1000000" step="0.01" id="s-cashFundingMax" value="'+esc(Number.isFinite(appSettings.cashFundingV1?.maxDriverAdvanceSar)?String(appSettings.cashFundingV1.maxDriverAdvanceSar):"")+'" placeholder="'+(lang==="ar"?"غير مُحدد":"Not configured")+'"></div></div>'+
     '<div class="settings-section"><h3>'+t("adminNotifications")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewUser"'+(appSettings.notifyOnNewUser?" checked":"")+'> '+t("notifyNewUser")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewProvider"'+(appSettings.notifyOnNewProvider?" checked":"")+'> '+t("notifyNewProvider")+'</label></div>'+
@@ -7670,6 +7877,12 @@ async function saveSettings(){
   };
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
+  var cashMax=document.getElementById("s-cashFundingMax");
+  if(cashMax&&cashMax.value.trim()){
+    var rawCashMax=cashMax.value.trim(), parsedCashMax=Number(rawCashMax);
+    if(!/^\d+(?:\.\d{1,2})?$/.test(rawCashMax)||!Number.isFinite(parsedCashMax)||parsedCashMax<=0||parsedCashMax>1000000){toast(lang==="ar"?"أدخل حدًا موجبًا حتى منزلتين عشريتين":"Enter a positive limit with at most two decimals","error");return;}
+    fields.cashFundingV1={maxDriverAdvanceSar:parsedCashMax};
+  }else if(cashMax) fields.cashFundingV1=null;
   var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});
   if(data&&data.success){toast(t("settingsSaved"));await renderSettings(document.getElementById("page-content"));}
   else toast(data&&data.error||t("failedSave"),"error");
@@ -8185,7 +8398,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name(destroyFreelanceCertificate, "destroyFreelanceCertificate");
     __name2(destroyFreelanceCertificate, "destroyFreelanceCertificate");
     function orderIsActive(order) {
-      return ACCOUNT_DELETION_ACTIVE_ORDER_STATUSES.includes(order?.status) || ACCOUNT_DELETION_ACTIVE_DELIVERY_STATUSES.includes(order?.deliveryStatus);
+      return ACCOUNT_DELETION_ACTIVE_ORDER_STATUSES.includes(order?.status) || ACCOUNT_DELETION_ACTIVE_DELIVERY_STATUSES.includes(order?.deliveryStatus) ||
+        order?.cashFundingVersion === CASH_FUNDING_V1 && !!order.cashFundingDriverConsent &&
+          (!!order.cashFundingHold || !order.cashFundingProviderReceipt || !order.cashFundingCollectionReport || !order.cashFundingCustomerAcknowledgment);
     }
     __name(orderIsActive, "orderIsActive");
     __name2(orderIsActive, "orderIsActive");
@@ -8199,7 +8414,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         from: [{ collectionId: "orders" }],
         where: { fieldFilter: { field: { fieldPath: roleField }, op: "EQUAL", value: { stringValue: uid } } },
         orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
-        select: { fields: [{ fieldPath: "status" }, { fieldPath: "deliveryStatus" }] },
+        select: { fields: [{ fieldPath: "status" }, { fieldPath: "deliveryStatus" },
+          { fieldPath: "cashFundingVersion" }, { fieldPath: "cashFundingDriverConsent" },
+          { fieldPath: "cashFundingProviderReceipt" }, { fieldPath: "cashFundingCollectionReport" },
+          { fieldPath: "cashFundingCustomerAcknowledgment" }, { fieldPath: "cashFundingHold" }] },
         limit: ACCOUNT_DELETION_PAGE_SIZE
       };
       if (cursor) query.startAt = { values: [{ referenceValue: cursor }], before: false };
@@ -9516,6 +9734,13 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         handleOrderContact,
         handleOrderParticipantSummary,
         handleSafetyReportResponse,
+        cashFundingAmounts,
+        cashFundingLimitCents,
+        cashFundingTermsVersion,
+        cashFundingV1Read,
+        cashFundingV1Accept,
+        cashFundingV1Record,
+        orderIsActive,
         complaintSafetySummary,
         handleOrderPaymentInstructions,
         handlePublicRatings,
@@ -9642,6 +9867,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof V2_ORDER_CREATION_ENABLED !== "undefined") env.V2_ORDER_CREATION_ENABLED = V2_ORDER_CREATION_ENABLED;
       } catch {
       }
+      try { if (typeof CASH_FUNDING_V1_ENABLED !== "undefined") env.CASH_FUNDING_V1_ENABLED = CASH_FUNDING_V1_ENABLED; } catch {}
       try { if (typeof ORDER_TRACKING_IOS_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_IOS_REMOTE_ENABLED = ORDER_TRACKING_IOS_REMOTE_ENABLED; } catch {}
       try { if (typeof ORDER_TRACKING_ANDROID_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_ANDROID_REMOTE_ENABLED = ORDER_TRACKING_ANDROID_REMOTE_ENABLED; } catch {}
       try { if (typeof ORDER_TRACKING_LEASE_SECRET !== "undefined") env.ORDER_TRACKING_LEASE_SECRET = ORDER_TRACKING_LEASE_SECRET; } catch {}
@@ -10702,6 +10928,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
             if ("clientVersionGate" in body) return jsonResponse({ error: "Unsupported settings field" }, 400);
             if ("deliveryPricingV2" in body || "deliveryPricingPolicy" in body) return jsonResponse({ error: "Delivery V2 pricing policy is read-only in Admin" }, 400);
+            if ("cashFundingV1" in body && body.cashFundingV1 !== null && cashFundingLimitCents({ cashFundingV1: body.cashFundingV1 }) === null) return jsonResponse({ error: "Valid maximum driver advance in SAR is required" }, 400);
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -10723,6 +10950,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "supportEmail",
               "supportWhatsapp",
               "deliveryPricing",
+              "cashFundingV1",
               "defaultLanguage",
               "providerDiscoveryRadiusKm",
               "notifyOnNewUser",
@@ -10754,6 +10982,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const oldRadius = [10,25,50,100].includes(before.providerDiscoveryRadiusKm) ? before.providerDiscoveryRadiusKm : null;
             if ("providerDiscoveryRadiusKm" in fields && oldRadius !== fields.providerDiscoveryRadiusKm) {
               audits.push({ setting:"providerDiscoveryRadiusKm", oldValue:oldRadius, newValue:fields.providerDiscoveryRadiusKm });
+            }
+            if ("cashFundingV1" in fields && cashFundingLimitCents(before) !== cashFundingLimitCents(fields)) {
+              audits.push({ setting: "cashFundingV1.maxDriverAdvanceSar", oldValue: before.cashFundingV1?.maxDriverAdvanceSar ?? null, newValue: fields.cashFundingV1?.maxDriverAdvanceSar ?? null });
             }
             if (audits.length) {
               const writes=[{ update: phase4aDoc("app_settings","main",fields), updateMask:{ fieldPaths:Object.keys(fields) } }];
@@ -11180,6 +11411,19 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return phase4aError('internal_error', 'Unable to load participant summary', 500);
         }
       }
+      const cashFundingMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/cash-funding-v1(?:\/(accept|provider-receipt|collection-report|customer-ack|issue))?$/);
+      if (cashFundingMatch && (request.method === "GET" && !cashFundingMatch[2] || request.method === "POST" && !!cashFundingMatch[2])) {
+        if (hasServiceKey) return phase4aError("forbidden", "User authentication required", 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return request.method === "GET" ? await cashFundingV1Read(request, cashFundingMatch[1], env, accessToken) :
+            cashFundingMatch[2] === "accept" ? await cashFundingV1Accept(request, cashFundingMatch[1], env, accessToken) :
+            await cashFundingV1Record(request, cashFundingMatch[1], cashFundingMatch[2], accessToken);
+        } catch {
+          console.error("[CashFundingV1] Request failed");
+          return phase4aError("internal_error", "Cash funding unavailable", 500);
+        }
+      }
       const receivedSafetyReportsMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/complaints\/received$/);
       if (receivedSafetyReportsMatch && request.method === 'GET') {
         if (hasServiceKey) return phase4aError('forbidden', 'User authentication required', 403);
@@ -11552,6 +11796,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const order = orderSnapshot.data;
           if (order.customerUid !== auth.uid) return phase4aError("FORBIDDEN", "Forbidden", 403);
           if (deliveryFinalizationV2IsIdempotent(order, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(order, true));
+          if (order.cashFundingIntentVersion === CASH_FUNDING_V1 && (!cashFundingV1Enabled(env) || order.paymentMethod !== "CASH" || body.deliveryPaymentMethod !== "cod")) return phase4aError("CASH_FUNDING_INELIGIBLE", "Cash funding is unavailable for this delivery", 409);
           if (!quoteSnapshot || quoteSnapshot.data.customerUid !== auth.uid || quoteSnapshot.data.orderId !== body.orderId || quoteSnapshot.data.providerUid !== order.providerUid) return phase4aError("STALE_DELIVERY_QUOTE", "Quote does not belong to this order", 409);
           const quote = quoteSnapshot.data;
           if (quote.status === "used" || quote.usedAt) return phase4aError("DELIVERY_QUOTE_ALREADY_USED", "Delivery quote was already used", 409);
@@ -11567,6 +11812,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
           const subtotal = order.priceSnapshot;
           if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return phase4aError("ORDER_PRICE_INVALID", "Order subtotal cannot be combined safely with delivery fee", 409);
+          const fundingFoodCents = sarCents(subtotal), fundingFeeCents = sarCents(quote.deliveryFee);
+          if (order.cashFundingIntentVersion === CASH_FUNDING_V1 && (fundingFoodCents === null || fundingFeeCents === null || fundingFoodCents + fundingFeeCents > 1e8)) return phase4aError("ORDER_PRICE_INVALID", "Cash-funding amount is invalid", 409);
           const fields = {
             deliveryMethod: "driver",
             dropoffCity: quote.city,
@@ -11574,7 +11821,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             dropoffConfirmedAt: now,
             deliveryDistanceKm: quote.deliveryDistanceKm,
             deliveryFee: quote.deliveryFee,
-            totalAmount: subtotal + quote.deliveryFee,
+            totalAmount: order.cashFundingIntentVersion === CASH_FUNDING_V1 ? (fundingFoodCents + fundingFeeCents) / 100 : subtotal + quote.deliveryFee,
             deliveryQuoteId: body.quoteId,
             deliveryPricingVersion: quote.pricingVersion,
             deliveryPaymentMethod: body.deliveryPaymentMethod,
@@ -11589,9 +11836,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const privateDestination = { customerUid: auth.uid, providerUid: order.providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng, addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "" };
           const participants = await newActiveWorkDeletionFences([auth.uid, order.providerUid], accessToken, new Map([[auth.uid, auth.deletionSnapshot]]));
           if (participants.blocked) return phase4aError("ACCOUNT_DELETION_BLOCKED", "A participant has requested account deletion", 409);
-          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, body.deliveryPaymentMethod, accessToken, pricing);
+          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, body.deliveryPaymentMethod, accessToken, pricing, cashFundingV1Enabled(env));
           if (!committed.ok) {
             if (committed.uncertain) return phase4aError("STATE_UNCERTAIN", "Delivery finalization outcome is uncertain; check the order before retrying", 503);
+            if (committed.code === "CASH_FUNDING_LIMIT" || committed.code === "CASH_FUNDING_INELIGIBLE") return phase4aError(committed.code, "Cash funding is unavailable or exceeds the approved limit", 409);
             const latest = await getFirestoreDoc("orders", body.orderId, accessToken);
             if (latest && deliveryFinalizationV2IsIdempotent(latest, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(latest, true));
             return phase4aError("STALE_DELIVERY_QUOTE", "Order or quote changed; request a new quote", 409);
@@ -11641,6 +11889,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           const order = snapshot.data;
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+          if (order.cashFundingIntentVersion === CASH_FUNDING_V1) return jsonResponse({ success: false, code: "cash_funding_ineligible", error: "Use the explicit V2 cash-delivery flow" }, 409);
           // A V2-created order has no legacy location snapshot. Self-pickup
           // remains valid, but driver delivery must use an explicit V2 quote.
           if (method === "driver" && isPrivateDestinationOrder(order)) return jsonResponse({ success: false, code: "explicit_destination_required", error: "Use an explicit V2 delivery quote" }, 409);
