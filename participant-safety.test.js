@@ -122,6 +122,9 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   docs.delete('account_deletion_irreversible_markers/customer-1');
   put('orders/order-1', { ...docs.get('orders/order-1').data, status: 'completed' });
   const safety = { orderId: 'order-1', type: 'participant_safety', reasonCode: 'customer_received_unpaid', target: 'customer', note: 'Customer did not pay after delivery.' };
+  const longOrderId = 'order-' + 'x'.repeat(110);
+  put('orders/' + longOrderId, { providerUid: 'provider-1', customerUid: 'customer-1', status: 'completed' });
+  assert.equal((await run(req('/complaints/create', 'provider-1', { ...safety, orderId: longOrderId }))).status, 400, 'do not create an ID the target cannot use to respond');
   assert.equal((await run(req('/complaints/create', 'provider-1', { ...safety, targetUid: 'customer-1' }))).status, 400);
   assert.equal((await run(req('/complaints/create', 'customer-1', safety))).status, 400);
   const created = await run(req('/complaints/create', 'provider-1', safety)); assert.equal(created.status, 200);
@@ -144,9 +147,35 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   const mine = await (await run(req('/complaints/mine', 'provider-1'))).json();
   assert.equal(mine.complaints.length, 1); assert(!JSON.stringify(mine).includes('reviewFinding'));
   assert(!JSON.stringify(mine).includes('targetAccountUid'));
-  const responsePath = '/complaints/' + encodeURIComponent(createdDto.id) + '/respond';
+  const receivedPath = '/orders/order-1/complaints/received';
+  put('delivery_complaints/' + createdDto.id, { ...report, reviewNote: 'PRIVATE REVIEW', adminNote: 'PRIVATE ADMIN', internalRiskCount: 9, customerPhone: 'PRIVATE PHONE', deviceToken: 'PRIVATE TOKEN' });
+  assert.equal((await run(req(receivedPath, ''))).status, 401);
+  assert.equal((await run(req(receivedPath, 'provider-2'))).status, 404, 'unrelated provider cannot discover reports');
+  put('users/customer-1', { ...docs.get('users/customer-1').data, role: 'provider' });
+  assert.equal((await run(req(receivedPath, 'customer-1'))).status, 404, 'a changed role cannot impersonate the order customer');
+  put('users/customer-1', { ...docs.get('users/customer-1').data, role: 'customer' });
+  assert.equal((await run(req('/orders/order-missing/complaints/received', 'customer-1'))).status, 404);
+  assert.deepEqual((await (await run(req(receivedPath, 'provider-1'))).json()).complaints, [], 'reporter cannot read the received report');
+  const received = await run(req(receivedPath, 'customer-1'));
+  assert.equal(received.status, 200);
+  assert(requests <= 9, 'received reports use bounded order-derived point reads');
+  const receivedDto = await received.json();
+  assert.deepEqual(receivedDto, { success: true, orderId: 'order-1', complaints: [{
+    id: createdDto.id, orderId: 'order-1', source: 'provider', reasonCode: safety.reasonCode,
+    note: safety.note, complaintStatus: 'pending', createdAt: report.createdAt, hasResponded: false
+  }] });
+  assert(!/PRIVATE|reviewFinding|reviewNote|adminNote|internalRiskCount|targetAccountUid|reporterUid|phone|token/i.test(JSON.stringify(receivedDto)), 'only the allowlisted complaint fields reach the target');
+  put('orders/order-4', { providerUid: 'provider-1', customerUid: 'customer-1', status: 'completed' });
+  put('delivery_complaints/safety_order-4_provider-1_customer', { ...report, orderId: 'order-4', targetAccountUid: 'unrelated-1' });
+  assert.deepEqual((await (await run(req('/orders/order-4/complaints/received', 'customer-1'))).json()).complaints, [], 'forged target linkage does not disclose a report');
+  docs.delete('delivery_complaints/safety_order-4_provider-1_customer');
+  put('account_deletion_irreversible_markers/customer-1', { status: 'started' });
+  assert.equal((await run(req(receivedPath, 'customer-1'))).status, 403);
+  docs.delete('account_deletion_irreversible_markers/customer-1');
+  const responsePath = '/complaints/' + encodeURIComponent(receivedDto.complaints[0].id) + '/respond';
   assert.equal((await run(req(responsePath, 'provider-1', { response: 'I did not receive a payment.' }))).status, 404);
   assert.equal((await run(req(responsePath, 'customer-1', { response: 'I paid and have a receipt.' }))).status, 200);
+  assert.equal((await (await run(req(receivedPath, 'customer-1'))).json()).complaints[0].hasResponded, true);
   assert.equal((await (await run(req(responsePath, 'customer-1', { response: 'I paid and have a receipt.' }))).json()).idempotent, true);
   assert.equal((await run(req(responsePath, 'customer-1', { response: 'Another response from the customer.' }))).status, 409);
   assert.equal((await run(req('/admin/api/complaints/' + createdDto.id + '/review', '', { finding: 'substantiated', reviewNote: 'Reviewed the evidence.' }))).status, 401);
@@ -156,6 +185,7 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   const adminList = await (await run(req('/admin/api/complaints', 'ADMIN'))).json();
   assert.equal(adminList.safetySummary.substantiated, 1); assert.equal(adminList.safetySummary.distinctOrders, 1);
   assert.equal(adminList.safetySummary.repeatedSubstantiatedAccountsForManualReview, 0);
+  assert(!JSON.stringify((await (await run(req(receivedPath, 'customer-1'))).json())).includes('substantiated'), 'private Admin finding stays hidden after review');
   assert.equal(hooks.complaintSafetySummary([{ type: 'participant_safety', reviewFinding: 'pending', reasonCode: 'abuse_or_threats', orderId: 'order-3', complaintStatus: 'pending', createdAt: new Date().toISOString() }]).seriousPendingForManualReview, 1);
   assert.equal(hooks.complaintSafetySummary([
     { type: 'participant_safety', reviewFinding: 'substantiated', targetAccountUid: 'customer-1', orderId: 'one' },

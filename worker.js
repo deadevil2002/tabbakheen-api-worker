@@ -2098,6 +2098,36 @@
       const unique = new Map(refs.map((ref) => [ref.id || ref.orderId + "_" + ref.source + "_" + ref.type, ref]));
       return jsonResponse({ success: true, complaints: [...unique.values()] });
     }
+    async function handleReceivedSafetyReports(request, orderId, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      const role = auth.user.role;
+      if (!['customer', 'provider', 'driver'].includes(role)) return phase4aError('forbidden', 'Safety reports unavailable', 403);
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+      const order = await getFirestoreDoc('orders', orderId, accessToken);
+      if (!order || order[role + 'Uid'] !== auth.uid) return phase4aError('not_found', 'Safety reports unavailable', 404);
+      // At most two point reads, derived from the authoritative order. Never
+      // query the complaint collection or accept a reporter UID from the client.
+      const reporters = ['customer', 'provider', 'driver']
+        .filter((source) => source !== role && phase4aSafeSegment(order[source + 'Uid']) && order[source + 'Uid'] !== auth.uid);
+      const complaints = [];
+      for (const source of reporters) {
+        const reporterUid = order[source + 'Uid'];
+        const id = 'safety_' + orderId + '_' + reporterUid + '_' + role;
+        if (!phase4aSafeSegment(id)) continue;
+        const report = await getFirestoreDoc('delivery_complaints', id, accessToken);
+        if (!report || report.type !== 'participant_safety' || report.orderId !== orderId || report.source !== source || report.reporterUid !== reporterUid || report.target !== role || report.targetAccountUid !== auth.uid) continue;
+        complaints.push({
+          id, orderId, source,
+          reasonCode: typeof report.reasonCode === 'string' ? report.reasonCode : '',
+          note: typeof report.note === 'string' ? report.note : '',
+          complaintStatus: typeof report.complaintStatus === 'string' ? report.complaintStatus : '',
+          createdAt: typeof report.createdAt === 'string' ? report.createdAt : '',
+          hasResponded: typeof report.targetResponse === 'string' && !!report.targetResponse
+        });
+      }
+      return jsonResponse({ success: true, orderId, complaints });
+    }
     async function handleComplaintCreate(request, accessToken) {
       const auth = await phase4aAuth(request, accessToken);
       if (auth.response) return auth.response;
@@ -2112,6 +2142,7 @@
         const targetUid = order[body.target + 'Uid'];
         if (!phase4aSafeSegment(targetUid) || targetUid === auth.uid || body.target === 'driver' && orderAssignedDriverUid(order) !== targetUid) return phase4aError('forbidden', 'Report target unavailable', 403);
         const id = 'safety_' + body.orderId + '_' + auth.uid + '_' + body.target;
+        if (!phase4aSafeSegment(id)) return phase4aError('invalid_request', 'Invalid safety report');
         const report = {
           orderId: body.orderId, reporterUid: auth.uid, targetAccountUid: targetUid,
           source: role, target: body.target, type: 'participant_safety', reasonCode: body.reasonCode,
@@ -11147,6 +11178,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch {
           console.error('[ParticipantSummary] Read failed');
           return phase4aError('internal_error', 'Unable to load participant summary', 500);
+        }
+      }
+      const receivedSafetyReportsMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/complaints\/received$/);
+      if (receivedSafetyReportsMatch && request.method === 'GET') {
+        if (hasServiceKey) return phase4aError('forbidden', 'User authentication required', 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleReceivedSafetyReports(request, receivedSafetyReportsMatch[1], accessToken);
+        } catch {
+          console.error('[Complaints] Received read failed');
+          return phase4aError('internal_error', 'Unable to load safety reports', 500);
         }
       }
       if (path === "/order-payment-instructions" && request.method === "POST") {
