@@ -3491,9 +3491,8 @@
         const fundingIntent = order.cashFundingIntentVersion === CASH_FUNDING_V1;
         if (fundingIntent && (!fundingEnabled || order.paymentMethod !== "CASH" || paymentMethod !== "cod")) return { abort: "CASH_FUNDING_INELIGIBLE" };
         if (fundingIntent) {
-          const limit = cashFundingLimitCents(settingsRead?.data);
           const advance = sarCents(subtotal), fee = sarCents(quote.deliveryFee);
-          if (limit === null || advance === null || fee === null || advance > limit || advance + fee > 1e8) return { abort: "CASH_FUNDING_LIMIT" };
+          if (advance === null || advance <= 0 || fee === null || !Number.isSafeInteger(advance + fee)) return { abort: "ORDER_PRICE_INVALID" };
         }
         const stateVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
         const fields = { deliveryMethod: "driver", dropoffCity: quote.city, dropoffDistrict: quote.district, dropoffConfirmedAt: now,
@@ -4182,33 +4181,35 @@
     }
     const PRIVATE_DESTINATION_ORDER_CONTRACT = "explicit_v2";
     const CASH_FUNDING_V1 = 1;
+    // Rev this code whenever the financial-risk notice changes after release;
+    // it is part of the driver's amount-specific consent terms.
+    const CASH_FUNDING_RISK_CODE = "DRIVER_ADVANCES_OWN_CASH_V1";
+    const CASH_FUNDING_RISK_NOTICE = Object.freeze({ code: CASH_FUNDING_RISK_CODE,
+      ar: "ستدفع قيمة الطعام من مالك للمزوّد. قد يتأخر أو يتعذّر تحصيل المبلغ من العميل، ولا يوجد تعويض تلقائي. لك حرية رفض الطلب دون التزام؛ اقبله فقط إذا وافقت على تحمّل هذه المخاطرة.",
+      en: "You pay the provider for the food with your own money. Customer cash collection may be delayed or fail, and there is no automatic reimbursement. You may decline without obligation; accept only if you choose this risk." });
     function cashFundingV1Enabled(env) { return env?.CASH_FUNDING_V1_ENABLED === "true"; }
     function sarCents(value) {
-      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1e6) return null;
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER / 100) return null;
       const cents = Math.round(value * 100);
       return Number.isSafeInteger(cents) && cents / 100 === value ? cents : null;
-    }
-    function cashFundingLimitCents(settings) {
-      const policy = settings?.cashFundingV1;
-      if (!phase4aKeysOnly(policy, ["maxDriverAdvanceSar"])) return null;
-      const cents = sarCents(policy.maxDriverAdvanceSar);
-      return cents !== null && cents > 0 ? cents : null;
     }
     function cashFundingAmounts(order) {
       if (!order || order.cashFundingVersion !== CASH_FUNDING_V1 || order.cashFundingIntentVersion !== CASH_FUNDING_V1 || order.destinationContract !== PRIVATE_DESTINATION_ORDER_CONTRACT ||
           order.paymentMethod !== "CASH" || order.deliveryPaymentMethod !== "cod" || !isDriverDeliveryMethod(order.deliveryMethod)) return null;
       const food = sarCents(order.priceSnapshot), fee = sarCents(order.deliveryFee);
-      if (food === null || food <= 0 || fee === null || food + fee > 1e8 ||
+      if (food === null || food <= 0 || fee === null || !Number.isSafeInteger(food + fee) ||
           sarCents(order.totalAmount) !== food + fee || sarCents(order.driverGrossDeliveryEarnings) !== fee || order.platformDeliveryCommission !== 0) return null;
       return { foodAdvanceSar: food / 100, deliveryFeeSar: fee / 100, customerCashTotalSar: (food + fee) / 100, currency: "SAR" };
     }
-    function cashFundingTermsVersion(order, amounts, maxCents) {
-      return JSON.stringify([CASH_FUNDING_V1, order.deliveryStateVersion, order.updatedAt, order.deliveryQuoteId,
-        order.deliveryPricingVersion, sarCents(amounts.foodAdvanceSar), sarCents(amounts.deliveryFeeSar), maxCents]);
+    function cashFundingTermsVersion(order, amounts) {
+      return JSON.stringify([CASH_FUNDING_V1, CASH_FUNDING_RISK_CODE, order._id || order.id,
+        order.status, order.deliveryStatus, order.deliveryStateVersion, order.updatedAt, order.deliveryQuoteId,
+        order.deliveryPricingVersion, sarCents(amounts.foodAdvanceSar), sarCents(amounts.deliveryFeeSar),
+        sarCents(amounts.customerCashTotalSar)]);
     }
     function cashFundingPublicState(order, amounts) {
       return { contractVersion: CASH_FUNDING_V1, orderId: order._id || order.id,
-        ...amounts, platformDeliveryCommissionSar: 0,
+        ...amounts, platformDeliveryCommissionSar: 0, financialRiskNotice: CASH_FUNDING_RISK_NOTICE,
         providerReceiptAcknowledged: !!order.cashFundingProviderReceipt,
         driverCollectionReported: !!order.cashFundingCollectionReport,
         customerCollectionAcknowledged: !!order.cashFundingCustomerAcknowledgment,
@@ -4230,18 +4231,15 @@
       const runtime = await getFirestoreDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid, accessToken);
       if (auth.user.isAvailable !== true || !evaluateSubscriptionEntitlement(auth.user).eligible ||
           !driverRuntimeLocationStatus(runtime).fresh || !driverOrderMatchV2(order, auth.uid, runtime, driverDistancePreferences(auth.user))) return phase4aError("not_found", "Cash funding unavailable", 404);
-      const settings = await getFirestoreDoc("app_settings", "main", accessToken);
-      const maxCents = cashFundingLimitCents(settings);
-      if (maxCents === null || sarCents(amounts.foodAdvanceSar) > maxCents) return phase4aError("cash_funding_limit", "Driver advance limit unavailable or exceeded", 409);
       return jsonResponse({ success: true, ...cashFundingPublicState(order, amounts),
-        termsVersion: cashFundingTermsVersion(order, amounts, maxCents) });
+        termsVersion: cashFundingTermsVersion(order, amounts) });
     }
     async function cashFundingV1Accept(request, orderId, env, accessToken) {
       if (!cashFundingV1Enabled(env)) return phase4aError("cash_funding_disabled", "Cash funding is unavailable", 503);
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
       if (auth.user.role !== "driver") return phase4aError("forbidden", "Driver account required", 403);
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid consent"); }
-      if (!phase4aKeysOnly(body, ["termsVersion", "consent"]) || body.consent !== true || typeof body.termsVersion !== "string" || body.termsVersion.length > 300) return phase4aError("invalid_request", "Explicit terms consent is required");
+      if (!phase4aKeysOnly(body, ["termsVersion", "consent"]) || body.consent !== true || typeof body.termsVersion !== "string" || body.termsVersion.length > 1024) return phase4aError("invalid_request", "Explicit terms consent is required");
       const initial = await getFirestoreSnapshot("orders", orderId, accessToken);
       const order = initial?.data, amounts = cashFundingAmounts(order);
       if (!amounts || !phase4aSafeSegment(order.customerUid) || !phase4aSafeSegment(order.providerUid)) return phase4aError("not_found", "Cash funding unavailable", 404);
@@ -4249,21 +4247,20 @@
       const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
       const eventId = notificationEventId(orderId, "driver_assigned", nextVersion);
       const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
-      const orderName = doc("orders", orderId), settingsName = doc("app_settings", "main"), userName = doc("users", auth.uid);
+      const orderName = doc("orders", orderId), userName = doc("users", auth.uid);
       const locationName = doc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid), eventName = doc("order_transition_events", eventId);
       const consentId = orderId + "_driver_consent_" + nextVersion;
       const consentName = doc("order_cash_funding_events", consentId);
       const members = [order.customerUid, order.providerUid, auth.uid];
       const deletionNames = members.flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
       const now = new Date().toISOString();
-      const result = await firestoreReadWriteTransaction([orderName, settingsName, userName, locationName, eventName, consentName, ...deletionNames], accessToken, (read) => {
-        const current = read.get(orderName), driver = read.get(userName)?.data, settings = read.get(settingsName)?.data;
+      const result = await firestoreReadWriteTransaction([orderName, userName, locationName, eventName, consentName, ...deletionNames], accessToken, (read) => {
+        const current = read.get(orderName), driver = read.get(userName)?.data;
         const location = read.get(locationName)?.data;
         if (!current || current.updateTime !== initial.updateTime || read.get(eventName) || read.get(consentName)) return { abort: "stale_terms" };
         if (deletionNames.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
-        const active = current.data, exact = cashFundingAmounts(active), maxCents = cashFundingLimitCents(settings);
-        if (!exact || active.cashFundingHold || maxCents === null || sarCents(exact.foodAdvanceSar) > maxCents ||
-            cashFundingTermsVersion(active, exact, maxCents) !== body.termsVersion ||
+        const active = current.data, exact = cashFundingAmounts(active);
+        if (!exact || active.cashFundingHold || cashFundingTermsVersion(active, exact) !== body.termsVersion ||
             active.driverUid || active.deliveryStatus !== "ready_for_driver" || active.status !== "searching_driver" ||
             !driver || driver.role !== "driver" || driver.isAvailable !== true || !evaluateSubscriptionEntitlement(driver).eligible ||
             !driverRuntimeLocationStatus(location).fresh || !driverOrderMatchV2(active, auth.uid, location, driverDistancePreferences(driver))) return { abort: "stale_terms" };
@@ -4280,7 +4277,7 @@
       }, async () => {
         const [latest, event, consent] = await Promise.all([getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_transition_events", eventId, accessToken), getFirestoreDoc("order_cash_funding_events", consentId, accessToken)]);
         return !!latest && latest.driverUid === auth.uid && latest.deliveryStatus === "driver_assigned" && latest.cashFundingDriverConsent?.termsVersion === body.termsVersion && event?.orderId === orderId && event.transition === "driver_assigned" && consent?.actorUid === auth.uid && consent.termsVersion === body.termsVersion;
-      }, 2, {}, 12);
+      }, 2, {}, 11);
       if (["committed", "reconciled"].includes(result.kind)) {
         // The atomic outbox event is durable; Cron owns bounded dispatch.
         return jsonResponse({ success: true, orderId, deliveryStatus: "driver_assigned", ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
@@ -4393,8 +4390,7 @@
         ["users", auth.uid], ["users", providerUid], ["offers", body.offerId],
         ["account_deletion_requests", auth.uid], ["account_deletion_requests", providerUid],
         [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid], [ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, providerUid],
-        [idemPath, idemId],
-        ...(fundingIntent ? [["app_settings", "main"]] : [])
+        [idemPath, idemId]
       ];
       const names = paths.map(([collection, id]) => phase4aDoc(collection, id, {}).name);
       let firstVersions = null;
@@ -4454,11 +4450,7 @@
         if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) return { abort: phase4aError("payment_rejected", "Selected payment method is unavailable", 409) };
         const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
         if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return { abort: phase4aError("invalid_offer", "Offer is malformed") };
-        if (fundingIntent) {
-          const limit = cashFundingLimitCents(read.get(names[8])?.data);
-          const advance = sarCents(offer.price);
-          if (limit === null || advance === null || advance > limit) return { abort: phase4aError("cash_funding_limit", "Driver advance limit is unavailable or exceeded", 409) };
-        }
+        if (fundingIntent && (sarCents(offer.price) === null || sarCents(offer.price) <= 0)) return { abort: phase4aError("cash_funding_invalid_amount", "Food amount must use valid SAR cents", 409) };
         const versions = [customerSnap.updateTime, providerSnap.updateTime, offerSnap.updateTime];
         if (firstVersions && versions.some((version, index) => version !== firstVersions[index])) return { abort: phase4aError("state_conflict", "Order inputs changed; retry", 409) };
         firstVersions = versions;
@@ -4490,7 +4482,7 @@
           { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } },
           ...trackingJobWrite(orderId, eventId, now)
         ], value: { success: true, orderId, order }, expected: { orderId } };
-      }, reconcile, 2, {}, fundingIntent ? 9 : 8);
+      }, reconcile, 2, {}, 8);
       if (result.kind === "aborted") {
         if (result.value?.replayOrderId) {
           const priorOrder = await replay(result.value.replayOrderId);
@@ -7772,9 +7764,6 @@ async function renderSettings(c){
     '<div><strong>'+(lang==="ar"?"الحد الأدنى الفعلي":"Effective minimum fee")+':</strong> '+v2Amount(v2Policy.minFee)+'</div>'+
     '<div><strong>'+(lang==="ar"?"مصدر السياسة":"Policy source")+':</strong> '+v2Source+'</div>'+
     '<div><strong>'+(lang==="ar"?"مصدر المعدلات":"Rate source")+':</strong> '+v2RateSource+'</div></div></div>'+
-    '<div class="settings-section"><h3>'+(lang==="ar"?"حد تمويل المندوب النقدي V1":"Driver-funded cash V1 limit")+'</h3>'+
-    '<p style="font-size:13px;color:var(--text2)">'+(lang==="ar"?"القيمة فارغة تعني أن التمويل غير متاح. حفظ الحد لا يفعّل الميزة؛ يلزم اعتماد المالك وعلم التشغيل المنفصل.":"A blank limit keeps funding unavailable. Saving a limit does not activate the feature; owner approval and a separate flag are required.")+'</p>'+
-    '<div class="form-group"><label for="s-cashFundingMax">'+(lang==="ar"?"أقصى مبلغ يقدمه المندوب للمطعم (ريال سعودي)":"Maximum driver food advance (SAR)")+'</label><input type="number" min="0.01" max="1000000" step="0.01" id="s-cashFundingMax" value="'+esc(Number.isFinite(appSettings.cashFundingV1?.maxDriverAdvanceSar)?String(appSettings.cashFundingV1.maxDriverAdvanceSar):"")+'" placeholder="'+(lang==="ar"?"غير مُحدد":"Not configured")+'"></div></div>'+
     '<div class="settings-section"><h3>'+t("adminNotifications")+'</h3>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewUser"'+(appSettings.notifyOnNewUser?" checked":"")+'> '+t("notifyNewUser")+'</label></div>'+
     '<div class="form-group"><label class="toggle"><input type="checkbox" id="s-notifyNewProvider"'+(appSettings.notifyOnNewProvider?" checked":"")+'> '+t("notifyNewProvider")+'</label></div>'+
@@ -7877,12 +7866,6 @@ async function saveSettings(){
   };
   var dp=fields.deliveryPricing;if(dp&&dp.minFee>dp.maxFee&&dp.maxFee>0){toast(t("invalidMinMax"),"error");return;}
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
-  var cashMax=document.getElementById("s-cashFundingMax");
-  if(cashMax&&cashMax.value.trim()){
-    var rawCashMax=cashMax.value.trim(), parsedCashMax=Number(rawCashMax);
-    if(!/^\d+(?:\.\d{1,2})?$/.test(rawCashMax)||!Number.isFinite(parsedCashMax)||parsedCashMax<=0||parsedCashMax>1000000){toast(lang==="ar"?"أدخل حدًا موجبًا حتى منزلتين عشريتين":"Enter a positive limit with at most two decimals","error");return;}
-    fields.cashFundingV1={maxDriverAdvanceSar:parsedCashMax};
-  }else if(cashMax) fields.cashFundingV1=null;
   var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});
   if(data&&data.success){toast(t("settingsSaved"));await renderSettings(document.getElementById("page-content"));}
   else toast(data&&data.error||t("failedSave"),"error");
@@ -9735,7 +9718,6 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         handleOrderParticipantSummary,
         handleSafetyReportResponse,
         cashFundingAmounts,
-        cashFundingLimitCents,
         cashFundingTermsVersion,
         cashFundingV1Read,
         cashFundingV1Accept,
@@ -10928,7 +10910,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
             if ("clientVersionGate" in body) return jsonResponse({ error: "Unsupported settings field" }, 400);
             if ("deliveryPricingV2" in body || "deliveryPricingPolicy" in body) return jsonResponse({ error: "Delivery V2 pricing policy is read-only in Admin" }, 400);
-            if ("cashFundingV1" in body && body.cashFundingV1 !== null && cashFundingLimitCents({ cashFundingV1: body.cashFundingV1 }) === null) return jsonResponse({ error: "Valid maximum driver advance in SAR is required" }, 400);
+            if ("cashFundingV1" in body) return jsonResponse({ error: "Driver cash-advance maximum is retired" }, 400);
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -10950,7 +10932,6 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               "supportEmail",
               "supportWhatsapp",
               "deliveryPricing",
-              "cashFundingV1",
               "defaultLanguage",
               "providerDiscoveryRadiusKm",
               "notifyOnNewUser",
@@ -10982,9 +10963,6 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const oldRadius = [10,25,50,100].includes(before.providerDiscoveryRadiusKm) ? before.providerDiscoveryRadiusKm : null;
             if ("providerDiscoveryRadiusKm" in fields && oldRadius !== fields.providerDiscoveryRadiusKm) {
               audits.push({ setting:"providerDiscoveryRadiusKm", oldValue:oldRadius, newValue:fields.providerDiscoveryRadiusKm });
-            }
-            if ("cashFundingV1" in fields && cashFundingLimitCents(before) !== cashFundingLimitCents(fields)) {
-              audits.push({ setting: "cashFundingV1.maxDriverAdvanceSar", oldValue: before.cashFundingV1?.maxDriverAdvanceSar ?? null, newValue: fields.cashFundingV1?.maxDriverAdvanceSar ?? null });
             }
             if (audits.length) {
               const writes=[{ update: phase4aDoc("app_settings","main",fields), updateMask:{ fieldPaths:Object.keys(fields) } }];
@@ -11813,7 +11791,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const subtotal = order.priceSnapshot;
           if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return phase4aError("ORDER_PRICE_INVALID", "Order subtotal cannot be combined safely with delivery fee", 409);
           const fundingFoodCents = sarCents(subtotal), fundingFeeCents = sarCents(quote.deliveryFee);
-          if (order.cashFundingIntentVersion === CASH_FUNDING_V1 && (fundingFoodCents === null || fundingFeeCents === null || fundingFoodCents + fundingFeeCents > 1e8)) return phase4aError("ORDER_PRICE_INVALID", "Cash-funding amount is invalid", 409);
+          if (order.cashFundingIntentVersion === CASH_FUNDING_V1 && (fundingFoodCents === null || fundingFoodCents <= 0 || fundingFeeCents === null || !Number.isSafeInteger(fundingFoodCents + fundingFeeCents))) return phase4aError("ORDER_PRICE_INVALID", "Cash-funding amount is invalid", 409);
           const fields = {
             deliveryMethod: "driver",
             dropoffCity: quote.city,
@@ -11839,7 +11817,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, body.deliveryPaymentMethod, accessToken, pricing, cashFundingV1Enabled(env));
           if (!committed.ok) {
             if (committed.uncertain) return phase4aError("STATE_UNCERTAIN", "Delivery finalization outcome is uncertain; check the order before retrying", 503);
-            if (committed.code === "CASH_FUNDING_LIMIT" || committed.code === "CASH_FUNDING_INELIGIBLE") return phase4aError(committed.code, "Cash funding is unavailable or exceeds the approved limit", 409);
+            if (committed.code === "CASH_FUNDING_INELIGIBLE" || committed.code === "ORDER_PRICE_INVALID") return phase4aError(committed.code, "Cash funding is unavailable or the amount is invalid", 409);
             const latest = await getFirestoreDoc("orders", body.orderId, accessToken);
             if (latest && deliveryFinalizationV2IsIdempotent(latest, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(latest, true));
             return phase4aError("STALE_DELIVERY_QUOTE", "Order or quote changed; request a new quote", 409);

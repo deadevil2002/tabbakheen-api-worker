@@ -217,12 +217,9 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   put('users/driver-1', { ...docs.get('users/driver-1').data, activatedByAdmin: true, isAvailable: true });
   put('users/provider-1', { ...docs.get('users/provider-1').data, activatedByAdmin: true });
   assert.equal((await run(req('/admin/api/settings', '', { cashFundingV1: { maxDriverAdvanceSar: 50 } }))).status, 401);
-  assert.equal((await run(req('/admin/api/settings', 'ADMIN', { cashFundingV1: { maxDriverAdvanceSar: 0 } }))).status, 400);
-  assert.equal((await run(req('/admin/api/settings', 'ADMIN', { cashFundingV1: { maxDriverAdvanceSar: 50 } }))).status, 200);
-  assert.equal(docs.get('app_settings/main').data.cashFundingV1.maxDriverAdvanceSar, 50, 'Admin-configured limit has no default monetary value');
-  assert.equal((await run(req('/admin/api/settings', 'ADMIN', { cashFundingV1: null }))).status, 200, 'Admin can disable the limit without enabling any flag');
-  assert.equal(hooks.cashFundingLimitCents(docs.get('app_settings/main').data), null, 'cleared limit fails closed');
-  assert.equal((await run(req('/admin/api/settings', 'ADMIN', { cashFundingV1: { maxDriverAdvanceSar: 50 } }))).status, 200);
+  assert.equal((await run(req('/admin/api/settings', 'ADMIN', { cashFundingV1: { maxDriverAdvanceSar: 50 } }))).status, 400, 'retired Admin maximum cannot be configured');
+  assert.equal((await run(req('/admin/api/settings', 'ADMIN', { cashFundingV1: null }))).status, 400, 'retired setting cannot be rewritten');
+  assert.equal(docs.has('app_settings/main'), false, 'no Admin maximum or settings document is required');
   const nowMs = Date.now();
   put('driver_runtime_locations/driver-1', { lat: 24.7, lng: 46.7, accuracyM: 10, updatedAt: new Date(nowMs).toISOString(), expiresAt: new Date(nowMs + 300000).toISOString() });
   const cashOrder = { customerUid: 'customer-1', providerUid: 'provider-1', driverUid: null,
@@ -236,6 +233,9 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert.equal(hooks.cashFundingAmounts({ ...cashOrder, paymentMethod: 'STC_PAY' }), null, 'prepaid food is never driver-funded');
   assert.equal(hooks.cashFundingAmounts({ ...cashOrder, deliveryPaymentMethod: 'arrange_with_driver' }), null, 'delivery-fee arrangements are not funded');
   assert.equal(hooks.cashFundingAmounts({ ...cashOrder, deliveryMethod: 'self_pickup' }), null);
+  assert.equal(hooks.cashFundingAmounts({ ...cashOrder, priceSnapshot: 999999.99, totalAmount: 1000007.24 }).foodAdvanceSar, 999999.99, 'valid existing offer-price range is not narrowed by a cash-advance cap');
+  assert.equal(hooks.cashFundingAmounts({ ...cashOrder, priceSnapshot: 25.501, totalAmount: 32.751 }), null, 'fractional SAR cents fail closed');
+  assert.equal(hooks.cashFundingAmounts({ ...cashOrder, totalAmount: Number.MAX_SAFE_INTEGER }), null, 'unsafe total fails closed');
   global.V2_ORDER_CREATION_ENABLED = 'true';
   const fundingCreate = { requestId: 'cash-req-1', providerUid: 'provider-1', offerId: 'offer-cash', quantity: 1, paymentMethod: 'cash', cashFundingVersion: 1 };
   assert.equal((await run(req('/orders/create', 'customer-1', fundingCreate))).status, 400, 'legacy creation never accepts a funding mode');
@@ -244,7 +244,7 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert.equal((await run(req('/orders/create-v2', 'customer-1', { ...fundingCreate, paymentMethod: 'stc_pay' }))).status, 409);
   put('offers/offer-cash', { providerUid: 'provider-1', title: 'Synthetic meal', price: 25.5, isAvailable: true, availabilityType: 'immediate' });
   const createdCash = await run(req('/orders/create-v2', 'customer-1', fundingCreate));
-  assert.equal(createdCash.status, 200, 'new-client opt-in order is created atomically');
+  assert.equal(createdCash.status, 200, 'new-client opt-in order is created atomically without an Admin maximum');
   const createdCashDto = await createdCash.json();
   assert.equal(createdCashDto.order.cashFundingIntentVersion, 1);
   assert.equal(createdCashDto.order.deliveryPaymentMethod, null, 'food and delivery fee methods stay separate');
@@ -254,6 +254,7 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   put('orders/' + createdOrderId, readyCash);
   assert.equal((await run(req('/finalize-delivery', 'customer-1', { orderId: createdOrderId, method: 'self_pickup' }))).status, 409, 'legacy self-pickup cannot silently retain a funding intent');
   assert.equal((await run(req('/finalize-delivery', 'customer-1', { orderId: createdOrderId, method: 'driver' }))).status, 409, 'legacy driver finalization cannot bypass the cash/cod quote contract');
+  put('app_settings/main', {});
   const priced = hooks.calculateDeliveryPricing({ ...readyCash, customerLat: 24.75, customerLng: 46.75 }, docs.get('app_settings/main').data);
   assert.equal(priced.ok, true);
   put('delivery_quotes/cash-quote', { customerUid: 'customer-1', providerUid: 'provider-1', orderId: createdOrderId,
@@ -262,7 +263,7 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
     deliveryDistanceKm: priced.deliveryDistanceKm, deliveryFee: priced.deliveryFee, pricingVersion: priced.pricingVersion });
   assert.equal((await run(req('/finalize-delivery-v2', 'customer-1', { orderId: createdOrderId, quoteId: 'cash-quote', deliveryPaymentMethod: 'arrange_with_driver' }))).status, 409, 'funding intent cannot silently become a different payment arrangement');
   const finalizedCash = await run(req('/finalize-delivery-v2', 'customer-1', { orderId: createdOrderId, quoteId: 'cash-quote', deliveryPaymentMethod: 'cod' }));
-  assert.equal(finalizedCash.status, 200);
+  assert.equal(finalizedCash.status, 200, 'finalization requires no Admin maximum');
   assert.equal(docs.get('orders/' + createdOrderId).data.cashFundingVersion, 1, 'only the eligible cash/cod finalization activates the versioned order mode');
   assert.equal(docs.get('orders/' + createdOrderId).data.driverGrossDeliveryEarnings, priced.deliveryFee);
   global.CASH_FUNDING_V1_ENABLED = 'false';
@@ -279,6 +280,9 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert.equal(terms.foodAdvanceSar, 25.5); assert.equal(terms.deliveryFeeSar, 7.25);
   assert.equal(terms.customerCashTotalSar, 32.75); assert.equal(terms.currency, 'SAR');
   assert.equal(terms.platformDeliveryCommissionSar, 0);
+  assert.equal(terms.financialRiskNotice.code, 'DRIVER_ADVANCES_OWN_CASH_V1');
+  assert.match(terms.financialRiskNotice.ar, /من مالك/);
+  assert.match(terms.financialRiskNotice.en, /own money/);
   assert(!/PRIVATE|customerUid|customerPhone|dropoffAddress|customerLat/i.test(JSON.stringify(terms)), 'financial terms do not disclose private destination or account fields');
   const available = await (await run(req('/deliveries/available-v2', 'driver-1'))).json();
   assert(available.deliveries.some((delivery) => delivery.id === 'cash-order'));
@@ -286,12 +290,18 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert.equal((await run(req(cashPath + '/accept', 'provider-1', { termsVersion: terms.termsVersion, consent: true }))).status, 403);
   assert.equal((await run(req(cashPath + '/accept', 'driver-1', { termsVersion: terms.termsVersion, consent: false }))).status, 400);
   assert.equal((await run(req(cashPath + '/accept', 'driver-1', { termsVersion: 'stale', consent: true }))).status, 409);
-  put('app_settings/main', { cashFundingV1: { maxDriverAdvanceSar: 20 } });
-  assert.equal((await run(req(cashPath + '/accept', 'driver-1', { termsVersion: terms.termsVersion, consent: true }))).status, 409, 'policy limit and terms are rechecked atomically');
-  put('app_settings/main', { cashFundingV1: { maxDriverAdvanceSar: 50 } });
+  put('orders/cash-order', { ...cashOrder, priceSnapshot: 26.5, totalAmount: 33.75 });
+  assert.equal((await run(req(cashPath + '/accept', 'driver-1', { termsVersion: terms.termsVersion, consent: true }))).status, 409, 'stale food amount is rejected atomically');
+  put('orders/cash-order', { ...cashOrder, deliveryPricingVersion: 'revised-price' });
+  assert.equal((await run(req(cashPath + '/accept', 'driver-1', { termsVersion: terms.termsVersion, consent: true }))).status, 409, 'stale pricing snapshot is rejected atomically');
+  put('orders/cash-order', cashOrder);
+  const settingsWithoutCap = docs.get('app_settings/main').data;
+  put('app_settings/main', { ...settingsWithoutCap, cashFundingV1: { maxDriverAdvanceSar: 1 } });
+  assert.equal((await (await run(req(cashPath, 'driver-1'))).json()).termsVersion, terms.termsVersion, 'retired stored maximum does not alter terms');
   assert.equal((await run(req('/delivery-transition', 'driver-1', { orderId: 'cash-order', action: 'accept' }))).status, 409, 'legacy accept cannot bypass consent');
   const accepted = await run(req(cashPath + '/accept', 'driver-1', { termsVersion: terms.termsVersion, consent: true }));
-  assert.equal(accepted.status, 200); assert(requests <= 12, 'acceptance has bounded transaction subrequests');
+  assert.equal(accepted.status, 200, 'driver can consent despite a retired stored maximum'); assert(requests <= 11, 'acceptance has bounded transaction subrequests');
+  put('app_settings/main', settingsWithoutCap);
   assert.equal(docs.get('orders/cash-order').data.driverUid, 'driver-1');
   assert.equal([...docs.keys()].filter((path) => path.startsWith('order_cash_funding_events/cash-order_driver_consent_')).length, 1);
   assert.equal((await (await run(req(cashPath + '/accept', 'driver-1', { termsVersion: terms.termsVersion, consent: true }))).json()).idempotent, true);
@@ -352,6 +362,12 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   loseCashCommitResponse = true;
   assert.equal((await run(req(uncertainPath + '/accept', 'driver-1', { termsVersion: uncertainTerms, consent: true }))).status, 200, 'lost commit response reconciles from order and outbox');
   assert.equal([...docs.keys()].filter((path) => path.startsWith('order_cash_funding_events/cash-uncertain_driver_consent_')).length, 1);
+  put('orders/cash-high', { ...cashOrder, priceSnapshot: 999999.99, totalAmount: 1000007.24 });
+  const highPath = '/orders/cash-high/cash-funding-v1';
+  const highTerms = await (await run(req(highPath, 'driver-1'))).json();
+  assert.equal(highTerms.foodAdvanceSar, 999999.99);
+  assert.equal(highTerms.customerCashTotalSar, 1000007.24);
+  assert.equal((await run(req(highPath + '/accept', 'driver-1', { termsVersion: highTerms.termsVersion, consent: true }))).status, 200, 'driver may voluntarily accept a valid high-price order without an extra platform cap');
   global.CASH_FUNDING_V1_ENABLED = 'false';
   assert.equal((await run(req(uncertainPath + '/accept', 'driver-1', { termsVersion: uncertainTerms, consent: true }))).status, 503, 'flag OFF blocks new acceptance');
   assert.equal((await run(req(uncertainPath, 'provider-1'))).status, 200, 'existing assigned funding order remains readable with creation OFF');
