@@ -10,6 +10,7 @@ const docs = new Map(), txns = new Map();
 const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
 let serial = 0, requests = 0, writes = 0, failPublicProfileRead = false, reassignAtCommit = false, createMarkerAtCommit = false;
 let cashOrderRaceAtCommit = false, cashMarkerAtCommit = false, loseCashCommitResponse = false;
+let recoveryAssignmentAtCommit = false, recoveryReceiptAtCommit = false;
 const encode = (v) => v == null ? { nullValue: null } : typeof v === 'string' ? { stringValue: v } :
   typeof v === 'boolean' ? { booleanValue: v } : typeof v === 'number' ? (Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v }) :
   Array.isArray(v) ? { arrayValue: { values: v.map(encode) } } : { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([k, x]) => [k, encode(x)])) } };
@@ -44,6 +45,8 @@ global.fetch = async (raw, init = {}) => {
       if (createMarkerAtCommit) { createMarkerAtCommit = false; put('account_deletion_irreversible_markers/provider-1', { status: 'started' }); }
       if (cashOrderRaceAtCommit) { cashOrderRaceAtCommit = false; put('orders/cash-race', { ...docs.get('orders/cash-race').data, driverUid: 'driver-2' }); }
       if (cashMarkerAtCommit) { cashMarkerAtCommit = false; put('account_deletion_irreversible_markers/driver-1', { status: 'started' }); }
+      if (recoveryAssignmentAtCommit) { recoveryAssignmentAtCommit = false; put('orders/cash-recovery-race', { ...docs.get('orders/cash-recovery-race').data, driverUid: 'driver-2', deliveryStatus: 'driver_assigned' }); }
+      if (recoveryReceiptAtCommit) { recoveryReceiptAtCommit = false; put('order_cash_funding_events/cash-recovery-paid_provider-receipt', { orderId: 'cash-recovery-paid', type: 'provider-receipt', actorUid: 'provider-1' }); }
       for (const [path, time] of read) if ((docs.get(path)?.updateTime || null) !== time) return reply({ error: { status: 'ABORTED' } }, 409);
     }
     for (const write of operations) {
@@ -287,6 +290,18 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   const available = await (await run(req('/deliveries/available-v2', 'driver-1'))).json();
   assert(available.deliveries.some((delivery) => delivery.id === 'cash-order'));
   assert(!available.deliveries.some((delivery) => 'foodAdvanceSar' in delivery), 'strict legacy V2 discovery DTO remains unchanged');
+  const classificationPath = '/orders/cash-order/delivery-classification-v1';
+  assert.equal((await run(req(classificationPath, ''))).status, 401);
+  assert.equal((await run(req(classificationPath, 'provider-1'))).status, 403);
+  assert.equal((await run(req(classificationPath, 'provider-2'))).status, 403);
+  const fundedClassification = await (await run(req(classificationPath, 'driver-1'))).json();
+  assert.deepEqual(fundedClassification, { success: true, contractVersion: 1, orderId: 'cash-order', kind: 'funded_cash_v1', acceptanceEnabled: true });
+  assert(requests <= 14, '10,000 unrelated users do not cause a classification scan');
+  assert(!/PRIVATE|customerUid|providerUid|destination|address|phone|lat|lng/i.test(JSON.stringify(fundedClassification)), 'classification is private-data-free');
+  const { cashFundingVersion: _funded, cashFundingIntentVersion: _intent, ...ordinaryCash } = cashOrder;
+  put('orders/ordinary-cod', ordinaryCash);
+  assert.equal((await (await run(req('/orders/ordinary-cod/delivery-classification-v1', 'driver-1'))).json()).kind, 'ordinary_cod');
+  assert(!('kind' in available.deliveries[0]), 'strict availability DTO has no surprise classification field');
   assert.equal((await run(req(cashPath + '/accept', 'provider-1', { termsVersion: terms.termsVersion, consent: true }))).status, 403);
   assert.equal((await run(req(cashPath + '/accept', 'driver-1', { termsVersion: terms.termsVersion, consent: false }))).status, 400);
   assert.equal((await run(req(cashPath + '/accept', 'driver-1', { termsVersion: 'stale', consent: true }))).status, 409);
@@ -333,8 +348,8 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   const heldOrder = { ...cashOrder, driverUid: 'driver-1', deliveryStatus: 'driver_assigned',
     cashFundingDriverConsent: docs.get('orders/cash-order').data.cashFundingDriverConsent };
   put('orders/cash-reject', heldOrder);
-  assert.equal((await run(req('/delivery-transition', 'driver-1', { orderId: 'cash-reject', action: 'reject' }))).status, 200, 'driver may decline before paying the provider');
-  assert.equal(docs.get('orders/cash-reject').data.cashFundingDriverConsent, null, 'rejection clears the current assignment consent');
+  assert.equal((await run(req('/delivery-transition', 'driver-1', { orderId: 'cash-reject', action: 'reject' }))).status, 409, 'legacy rejection cannot erase an accepted funding obligation');
+  assert(docs.get('orders/cash-reject').data.cashFundingDriverConsent, 'consent remains immutable until explicit recovery');
   put('orders/cash-refusal', heldOrder);
   const refusalPath = '/orders/cash-refusal/cash-funding-v1/issue';
   assert.equal((await run(req(refusalPath, 'provider-1', { kind: 'provider_refusal' }))).status, 200);
@@ -368,9 +383,105 @@ const run = async (request) => { requests = 0; return hooks.handleRequest(reques
   assert.equal(highTerms.foodAdvanceSar, 999999.99);
   assert.equal(highTerms.customerCashTotalSar, 1000007.24);
   assert.equal((await run(req(highPath + '/accept', 'driver-1', { termsVersion: highTerms.termsVersion, consent: true }))).status, 200, 'driver may voluntarily accept a valid high-price order without an extra platform cap');
+  const convertBody = { expectedDeliveryStateVersion: 2, confirmSelfPickup: true };
+  const recoveryPath = (id) => '/orders/' + id + '/cash-funding-v1';
+  put('orders/cash-unassigned', cashOrder);
+  put('order_delivery_private/cash-unassigned', { dropoffAddress: 'PRIVATE ADDRESS' });
+  assert.equal((await run(req('/delivery-transition', 'customer-1', { orderId: 'cash-unassigned', action: 'cancel_driver_search' }))).status, 409, 'legacy cancel cannot erase funded mode');
+  assert.equal((await run(req(recoveryPath('cash-unassigned') + '/convert-self-pickup', 'provider-1', convertBody))).status, 404);
+  assert.equal((await run(req(recoveryPath('cash-unassigned') + '/convert-self-pickup', 'customer-1', { ...convertBody, confirmSelfPickup: false }))).status, 400);
+  assert.equal((await run(req(recoveryPath('cash-unassigned') + '/convert-self-pickup', 'customer-1', { ...convertBody, expectedDeliveryStateVersion: 1 }))).status, 409);
+  assert.equal((await run(req(recoveryPath('cash-unassigned') + '/convert-self-pickup', 'customer-1', convertBody))).status, 200, 'unassigned funded order converts by explicit customer action');
+  assert(requests <= 16, 'conversion uses bounded point reads and one transaction, not a driver scan');
+  const selfOrder = docs.get('orders/cash-unassigned').data;
+  assert.equal(selfOrder.deliveryMethod, 'self_pickup'); assert.equal(selfOrder.totalAmount, 25.5);
+  assert.equal(selfOrder.deliveryFee, 0); assert.equal(selfOrder.driverUid, null);
+  assert.equal(selfOrder.cashFundingVersion, 1, 'funded history remains authoritative after conversion');
+  assert.equal(selfOrder.paymentStatus, 'PENDING', 'conversion is not a payment receipt');
+  assert(!('dropoffAddress' in selfOrder) && !('customerPhone' in selfOrder), 'conversion scrubs any stray public-order private fields');
+  assert.equal(docs.has('order_delivery_private/cash-unassigned'), false, 'private delivery destination is atomically removed');
+  assert.equal((await (await run(req(recoveryPath('cash-unassigned') + '/convert-self-pickup', 'customer-1', convertBody))).json()).idempotent, true);
+  put('orders/cash-orphan-marker', { ...cashOrder, cashFundingSelfPickupConversion: { actorUid: 'customer-1', expectedDeliveryStateVersion: 2, createdAt: new Date().toISOString() } });
+  assert.equal((await run(req(recoveryPath('cash-orphan-marker') + '/convert-self-pickup', 'customer-1', convertBody))).status, 409, 'marker without immutable audit is not accepted as an idempotent success');
+  assert.equal([...docs.keys()].filter((path) => path === 'order_transition_events/cash-unassigned_self_pickup_selected_3').length, 1);
+  assert.equal((await run(req('/delivery-transition', 'customer-1', { orderId: 'cash-unassigned', action: 'complete_self_pickup' }))).status, 200);
+  assert.equal(docs.get('orders/cash-unassigned').data.paymentStatus, 'PENDING', 'food collection does not imply cash collection');
+  assert.equal(hooks.orderIsActive(docs.get('orders/cash-unassigned').data), true, 'unreceipted self-pickup blocks account deletion');
+  const selfReceipt = { amountSar: 25.5, currency: 'SAR', acknowledged: true };
+  assert.equal((await run(req(recoveryPath('cash-unassigned') + '/self-pickup-receipt', 'customer-1', selfReceipt))).status, 404);
+  assert.equal((await run(req(recoveryPath('cash-unassigned') + '/self-pickup-receipt', 'provider-1', { ...selfReceipt, amountSar: 32.75 }))).status, 409);
+  assert.equal((await run(req(recoveryPath('cash-unassigned') + '/self-pickup-receipt', 'provider-1', selfReceipt))).status, 200);
+  assert.equal((await (await run(req(recoveryPath('cash-unassigned') + '/self-pickup-receipt', 'provider-1', selfReceipt))).json()).idempotent, true);
+  assert.equal(docs.get('orders/cash-unassigned').data.paymentStatus, 'PAID_CONFIRMED', 'only authenticated provider receipt confirms self-pickup cash');
+  assert.equal(hooks.orderIsActive(docs.get('orders/cash-unassigned').data), false);
+  assert.deepEqual(await (await run(req(recoveryPath('cash-unassigned'), 'customer-1'))).json(), {
+    success: true, contractVersion: 1, orderId: 'cash-unassigned', recoveryState: 'self_pickup',
+    foodAmountSar: 25.5, currency: 'SAR', providerSelfPickupReceiptAcknowledged: true, paymentStatus: 'PAID_CONFIRMED'
+  });
+  put('orders/cash-recovery-race', cashOrder);
+  recoveryAssignmentAtCommit = true;
+  assert.equal((await run(req(recoveryPath('cash-recovery-race') + '/convert-self-pickup', 'customer-1', convertBody))).status, 409, 'assignment during conversion aborts atomically');
+  assert(!docs.has('order_cash_funding_events/cash-recovery-race_convert-self-pickup'));
+  assert(![...docs.keys()].some((path) => path.startsWith('order_transition_events/cash-recovery-race_self_pickup_selected')));
+  put('orders/cash-recovery-marker-race', cashOrder);
+  createMarkerAtCommit = true;
+  assert.equal((await run(req(recoveryPath('cash-recovery-marker-race') + '/convert-self-pickup', 'customer-1', convertBody))).status, 409, 'new provider deletion marker aborts recovery');
+  docs.delete('account_deletion_irreversible_markers/provider-1');
+  put('orders/cash-recovery-assigned', cashOrder);
+  const assignedPath = recoveryPath('cash-recovery-assigned');
+  const assignedVersion = (await (await run(req(assignedPath, 'driver-1'))).json()).termsVersion;
+  assert.equal((await run(req(assignedPath + '/accept', 'driver-1', { termsVersion: assignedVersion, consent: true }))).status, 200);
+  const assignedState = docs.get('orders/cash-recovery-assigned').data.deliveryStateVersion;
+  const assignedConvert = { expectedDeliveryStateVersion: assignedState, confirmSelfPickup: true };
+  assert.equal((await run(req(assignedPath + '/convert-self-pickup', 'customer-1', assignedConvert))).status, 409, 'missing receipt acknowledgment is not evidence that no money changed hands');
+  assert.equal((await run(req(assignedPath + '/provider-no-receipt', 'provider-1', { termsVersion: assignedVersion, noCashReceived: true }))).status, 409, 'provider attestation requires driver release');
+  assert.equal((await run(req(assignedPath + '/release-no-advance', 'customer-1', { termsVersion: assignedVersion, noAdvanceAttested: true }))).status, 404);
+  assert.equal((await run(req(assignedPath + '/release-no-advance', 'driver-1', { termsVersion: 'stale', noAdvanceAttested: true }))).status, 409);
+  assert.equal((await run(req(assignedPath + '/release-no-advance', 'driver-1', { termsVersion: assignedVersion, noAdvanceAttested: true }))).status, 200);
+  assert.equal((await (await run(req(assignedPath + '/release-no-advance', 'driver-1', { termsVersion: assignedVersion, noAdvanceAttested: true }))).json()).idempotent, true);
+  assert.equal((await run(req(assignedPath + '/accept', 'driver-1', { termsVersion: assignedVersion, consent: true }))).status, 409, 'released consent cannot appear active on retry');
+  assert.equal((await run(req('/delivery-transition', 'driver-1', { orderId: 'cash-recovery-assigned', action: 'picked_up' }))).status, 409, 'released driver cannot progress order');
+  assert.equal((await run(req(assignedPath + '/convert-self-pickup', 'customer-1', assignedConvert))).status, 409, 'driver attestation alone is insufficient');
+  assert.equal((await run(req(assignedPath + '/provider-no-receipt', 'provider-1', { termsVersion: assignedVersion, noCashReceived: true }))).status, 200);
+  assert.equal((await (await run(req(assignedPath + '/provider-no-receipt', 'provider-1', { termsVersion: assignedVersion, noCashReceived: true }))).json()).idempotent, true);
+  loseCashCommitResponse = true;
+  assert.equal((await run(req(assignedPath + '/convert-self-pickup', 'customer-1', assignedConvert))).status, 200, 'lost conversion commit reconciles without a second event');
+  assert.equal(docs.get('orders/cash-recovery-assigned').data.totalAmount, 25.5);
+  assert.equal(docs.get('orders/cash-recovery-assigned').data.driverUid, null);
+  assert.equal([...docs.keys()].filter((path) => path === 'order_cash_funding_events/cash-recovery-assigned_convert-self-pickup').length, 1);
+  assert.equal((await run(req(assignedPath + '/self-pickup-receipt', 'provider-1', selfReceipt))).status, 200);
+  assert.equal((await run(req(assignedPath + '/accept', 'driver-1', { termsVersion: assignedVersion, consent: true }))).status, 404, 'stale driver cannot claim converted order');
+  assert.equal((await run(req('/orders/cash-recovery-assigned/delivery-classification-v1', 'driver-1'))).status, 404, 'converted order disappears from driver classification');
+  put('orders/cash-recovery-paid', cashOrder);
+  const paidPath = recoveryPath('cash-recovery-paid');
+  const paidVersion = (await (await run(req(paidPath, 'driver-1'))).json()).termsVersion;
+  assert.equal((await run(req(paidPath + '/accept', 'driver-1', { termsVersion: paidVersion, consent: true }))).status, 200);
+  assert.equal((await run(req(paidPath + '/release-no-advance', 'driver-1', { termsVersion: paidVersion, noAdvanceAttested: true }))).status, 200);
+  recoveryReceiptAtCommit = true;
+  assert.equal((await run(req(paidPath + '/provider-no-receipt', 'provider-1', { termsVersion: paidVersion, noCashReceived: true }))).status, 409, 'concurrent receipt evidence defeats no-receipt attestation');
+  assert.equal((await run(req(paidPath + '/convert-self-pickup', 'customer-1', { expectedDeliveryStateVersion: 3, confirmSelfPickup: true }))).status, 409, 'even unacknowledged order field cannot hide immutable receipt evidence');
+  assert(!docs.has('order_cash_funding_events/cash-recovery-paid_convert-self-pickup'));
+  put('orders/cash-conflicting-paid', cashOrder);
+  const conflictingPath = recoveryPath('cash-conflicting-paid');
+  const conflictingTerms = (await (await run(req(conflictingPath, 'driver-1'))).json()).termsVersion;
+  assert.equal((await run(req(conflictingPath + '/accept', 'driver-1', { termsVersion: conflictingTerms, consent: true }))).status, 200);
+  assert.equal((await run(req(conflictingPath + '/release-no-advance', 'driver-1', { termsVersion: conflictingTerms, noAdvanceAttested: true }))).status, 200);
+  assert.equal((await run(req(conflictingPath + '/provider-receipt', 'provider-1', { ...receiptBody, termsVersion: conflictingTerms }))).status, 200);
+  assert.equal(docs.get('orders/cash-conflicting-paid').data.cashFundingHold.kind, 'conflicting_payment_evidence', 'contradictory receipt enters manual review');
+  assert.equal((await run(req(conflictingPath + '/convert-self-pickup', 'customer-1', { expectedDeliveryStateVersion: 3, confirmSelfPickup: true }))).status, 409);
+  put('orders/cash-stale-consent', { ...cashOrder, driverUid: 'driver-1', deliveryStatus: 'driver_assigned', cashFundingDriverConsent: docs.get('orders/cash-order').data.cashFundingDriverConsent });
+  assert.equal((await run(req(recoveryPath('cash-stale-consent') + '/release-no-advance', 'driver-1', { termsVersion: terms.termsVersion, noAdvanceAttested: true }))).status, 409, 'consent from a different order cannot authorize release');
   global.CASH_FUNDING_V1_ENABLED = 'false';
+  assert.equal((await (await run(req('/orders/ordinary-cod/delivery-classification-v1', 'driver-1'))).json()).kind, 'ordinary_cod');
+  put('orders/cash-disabled', cashOrder);
+  assert.deepEqual(await (await run(req('/orders/cash-disabled/delivery-classification-v1', 'driver-1'))).json(),
+    { success: true, contractVersion: 1, orderId: 'cash-disabled', kind: 'funded_cash_v1', acceptanceEnabled: false },
+    'driver can distinguish a pre-existing funded order while new funding acceptance is disabled');
+  assert.equal((await run(req(recoveryPath('cash-disabled') + '/convert-self-pickup', 'customer-1', convertBody))).status, 200,
+    'disabling new funding does not strand existing unassigned funded-order recovery');
+  assert.equal((await (await run(req('/orders/cash-order/delivery-classification-v1', 'driver-1'))).status), 404, 'assigned funded order is not discoverable');
   assert.equal((await run(req(uncertainPath + '/accept', 'driver-1', { termsVersion: uncertainTerms, consent: true }))).status, 503, 'flag OFF blocks new acceptance');
   assert.equal((await run(req(uncertainPath, 'provider-1'))).status, 200, 'existing assigned funding order remains readable with creation OFF');
   assert.equal((await run(req(uncertainPath + '/provider-receipt', 'provider-1', { ...receiptBody, termsVersion: uncertainTerms }))).status, 200, 'existing assignment can continue safely after disabling new funding');
-  console.log('participant-safety + cash-funding V1 offline: PASS (auth, amount snapshots, consent, receipts, collection, privacy, legacy, races, uncertain commits, REST Writes)');
+  console.log('participant-safety + cash-funding V1 offline: PASS (classification, no-cap consent, three recovery cases, audit/idempotency, races, privacy, legacy, strict REST Writes)');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

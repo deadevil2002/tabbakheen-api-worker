@@ -1476,6 +1476,9 @@
       const order = snapshot.data;
       if (order.cashFundingVersion === CASH_FUNDING_V1 && order.cashFundingHold)
         return jsonResponse({ success: false, code: "cash_funding_dispute_required", error: "Cash-funding order requires manual review" }, 409);
+      if (order.cashFundingVersion === CASH_FUNDING_V1 && order.cashFundingDriverRelease &&
+          action !== "complete_self_pickup")
+        return jsonResponse({ success: false, code: "cash_funding_recovery_required", error: "Driver released funding; use the recovery contract" }, 409);
       const now = new Date().toISOString();
       const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
       let fields;
@@ -1485,6 +1488,8 @@
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
           return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
         }
+        if (order.cashFundingVersion === CASH_FUNDING_V1)
+          return jsonResponse({ success: false, code: "cash_funding_recovery_required", error: "Use explicit funded-order self-pickup recovery" }, 409);
         if (order.deliveryMethod === "self_pickup" && order.deliveryStatus === "self_pickup_selected" && !order.driverUid) {
           return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
         }
@@ -1511,10 +1516,6 @@
           deliveryStateVersion: nextVersion,
           updatedAt: now
         };
-        if (order.cashFundingVersion === CASH_FUNDING_V1) {
-          fields.cashFundingVersion = null;
-          fields.cashFundingIntentVersion = null;
-        }
         notificationEvent = "self_pickup_selected";
       } else if (action === "complete_self_pickup") {
         const ownsAsCustomer = actor && actor.role === "customer" && order.customerUid === uid;
@@ -1591,7 +1592,7 @@
           fields = { driverUid: uid, deliveryStatus: "driver_assigned", driverAssignedAt: now, deliveryStateVersion: nextVersion, updatedAt: now };
           notificationEvent = "driver_assigned";
         } else if (action === "reject") {
-          if (order.cashFundingVersion === CASH_FUNDING_V1 && order.cashFundingProviderReceipt) return jsonResponse({ success: false, code: "cash_funding_dispute_required", error: "Provider receipt has been acknowledged; request manual review", }, 409);
+          if (order.cashFundingVersion === CASH_FUNDING_V1) return jsonResponse({ success: false, code: "cash_funding_recovery_required", error: "Explicit no-advance release is required", }, 409);
           if (order.deliveryStatus === "ready_for_driver" && !order.driverUid && order.lastRejectedDriverUid === uid) {
             return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
           }
@@ -1610,7 +1611,6 @@
             deliveryStateVersion: nextVersion,
             updatedAt: now
           };
-          if (order.cashFundingVersion === CASH_FUNDING_V1) fields.cashFundingDriverConsent = null;
           notificationEvent = "driver_rejected";
         } else {
           if (order.driverUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Driver is not assigned to this order" }, 403);
@@ -4207,6 +4207,18 @@
         order.deliveryPricingVersion, sarCents(amounts.foodAdvanceSar), sarCents(amounts.deliveryFeeSar),
         sarCents(amounts.customerCashTotalSar)]);
     }
+    function cashFundingConsentMatches(order, orderId, amounts) {
+      const consent = order?.cashFundingDriverConsent;
+      if (!consent || typeof consent.termsVersion !== "string") return false;
+      let terms; try { terms = JSON.parse(consent.termsVersion); } catch { return false; }
+      return Array.isArray(terms) && terms.length === 12 && terms[0] === CASH_FUNDING_V1 &&
+        terms[1] === CASH_FUNDING_RISK_CODE && terms[2] === orderId &&
+        terms[7] === order.deliveryQuoteId && terms[8] === order.deliveryPricingVersion &&
+        terms[9] === sarCents(amounts.foodAdvanceSar) && terms[10] === sarCents(amounts.deliveryFeeSar) &&
+        terms[11] === sarCents(amounts.customerCashTotalSar) &&
+        consent.foodAdvanceSar === amounts.foodAdvanceSar && consent.deliveryFeeSar === amounts.deliveryFeeSar &&
+        consent.customerCashTotalSar === amounts.customerCashTotalSar;
+    }
     function cashFundingPublicState(order, amounts) {
       return { contractVersion: CASH_FUNDING_V1, orderId: order._id || order.id,
         ...amounts, platformDeliveryCommissionSar: 0, financialRiskNotice: CASH_FUNDING_RISK_NOTICE,
@@ -4214,7 +4226,9 @@
         driverCollectionReported: !!order.cashFundingCollectionReport,
         customerCollectionAcknowledged: !!order.cashFundingCustomerAcknowledgment,
         termsVersion: typeof order.cashFundingDriverConsent?.termsVersion === "string" ? order.cashFundingDriverConsent.termsVersion : null,
-        onHold: !!order.cashFundingHold };
+        onHold: !!order.cashFundingHold, deliveryStateVersion: order.deliveryStateVersion,
+        driverReleasedNoAdvance: !!order.cashFundingDriverRelease,
+        providerAttestedNoReceipt: !!order.cashFundingProviderNoReceipt };
     }
     async function cashFundingV1Read(request, orderId, env, accessToken) {
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
@@ -4224,6 +4238,11 @@
       const participant = order && ["customer", "provider", "driver"].includes(role) && order[role + "Uid"] === auth.uid;
       if (!order) return phase4aError("not_found", "Order unavailable", 404);
       if (order.cashFundingVersion !== CASH_FUNDING_V1) return phase4aError("not_found", "Cash funding unavailable", 404);
+      if (participant && order.cashFundingSelfPickupConversion && order.deliveryMethod === "self_pickup")
+        return jsonResponse({ success: true, contractVersion: CASH_FUNDING_V1, orderId,
+          recoveryState: "self_pickup", foodAmountSar: order.cashFundingSelfPickupConversion.foodAmountSar,
+          currency: "SAR", providerSelfPickupReceiptAcknowledged: !!order.cashFundingSelfPickupReceipt,
+          paymentStatus: order.cashFundingSelfPickupReceipt ? "PAID_CONFIRMED" : "PENDING" });
       const amounts = cashFundingAmounts(order);
       if (!amounts) return phase4aError("cash_funding_invalid", "Cash funding snapshot is invalid", 409);
       if (participant) return jsonResponse({ success: true, ...cashFundingPublicState(order, amounts) });
@@ -4234,6 +4253,32 @@
       return jsonResponse({ success: true, ...cashFundingPublicState(order, amounts),
         termsVersion: cashFundingTermsVersion(order, amounts) });
     }
+    async function deliveryClassificationV1(request, orderId, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (auth.user.role !== "driver") return phase4aError("forbidden", "Driver account required", 403);
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken))
+        return phase4aError("account_deletion_blocked", "Account deletion is in progress", 403);
+      const [order, runtime] = await Promise.all([
+        getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid, accessToken)
+      ]);
+      if (!order || auth.user.isAvailable !== true || !evaluateSubscriptionEntitlement(auth.user).eligible ||
+          !driverRuntimeLocationStatus(runtime).fresh || !driverOrderMatchV2(order, auth.uid, runtime, driverDistancePreferences(auth.user)) ||
+          order.cashFundingHold || order.cashFundingDriverRelease) return phase4aError("not_found", "Delivery unavailable", 404);
+      if (!phase4aSafeSegment(order.customerUid) || !phase4aSafeSegment(order.providerUid)) return phase4aError("not_found", "Delivery unavailable", 404);
+      const members = [order.customerUid, order.providerUid];
+      const guards = await Promise.all(members.flatMap((uid) => [
+        getFirestoreDoc("account_deletion_requests", uid, accessToken),
+        getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken)
+      ]));
+      if (guards.some(Boolean)) return phase4aError("not_found", "Delivery unavailable", 404);
+      if ((order.cashFundingIntentVersion === CASH_FUNDING_V1 && order.cashFundingVersion !== CASH_FUNDING_V1) ||
+          (order.cashFundingVersion === CASH_FUNDING_V1 && !cashFundingAmounts(order)))
+        return phase4aError("cash_funding_invalid", "Funding snapshot is invalid", 409);
+      const kind = order.cashFundingVersion === CASH_FUNDING_V1 ? "funded_cash_v1" :
+        order.paymentMethod === "CASH" && order.deliveryPaymentMethod === "cod" ? "ordinary_cod" : "other";
+      return jsonResponse({ success: true, contractVersion: 1, orderId, kind,
+        acceptanceEnabled: kind !== "funded_cash_v1" || cashFundingV1Enabled(env) });
+    }
     async function cashFundingV1Accept(request, orderId, env, accessToken) {
       if (!cashFundingV1Enabled(env)) return phase4aError("cash_funding_disabled", "Cash funding is unavailable", 503);
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
@@ -4243,7 +4288,7 @@
       const initial = await getFirestoreSnapshot("orders", orderId, accessToken);
       const order = initial?.data, amounts = cashFundingAmounts(order);
       if (!amounts || !phase4aSafeSegment(order.customerUid) || !phase4aSafeSegment(order.providerUid)) return phase4aError("not_found", "Cash funding unavailable", 404);
-      if (order.driverUid === auth.uid && order.cashFundingDriverConsent?.termsVersion === body.termsVersion && order.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: order.deliveryStatus });
+      if (order.driverUid === auth.uid && !order.cashFundingDriverRelease && order.cashFundingDriverConsent?.termsVersion === body.termsVersion && order.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: order.deliveryStatus });
       const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
       const eventId = notificationEventId(orderId, "driver_assigned", nextVersion);
       const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
@@ -4284,7 +4329,7 @@
       }
       if (result.kind === "uncertain") return phase4aError("state_uncertain", "Acceptance outcome uncertain; refresh before retrying", 503);
       const latest = await getFirestoreDoc("orders", orderId, accessToken);
-      if (latest?.driverUid === auth.uid && latest.cashFundingDriverConsent?.termsVersion === body.termsVersion && latest.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: latest.deliveryStatus });
+      if (latest?.driverUid === auth.uid && !latest.cashFundingDriverRelease && latest.cashFundingDriverConsent?.termsVersion === body.termsVersion && latest.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: latest.deliveryStatus });
       return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" : "stale_terms", "Cash-funding terms or assignment changed", 409);
     }
     async function cashFundingV1Record(request, orderId, action, accessToken) {
@@ -4340,8 +4385,11 @@
           { actorUid: auth.uid, actorRole: role, termsVersion: body.termsVersion,
             amountSar: action === "provider-receipt" ? exact.foodAdvanceSar : exact.customerCashTotalSar,
             currency: "SAR", createdAt: now, evidenceState: action === "customer-ack" ? "customer_acknowledged" : action === "collection-report" ? "driver_reported" : "provider_acknowledged" };
+        const fields = { [field]: recorded, updatedAt: now };
+        if (action === "provider-receipt" && (latest.cashFundingDriverRelease || latest.cashFundingProviderNoReceipt))
+          fields.cashFundingHold = { kind: "conflicting_payment_evidence", actorUid: auth.uid, actorRole: role, createdAt: now };
         return { writes: [
-          { update: phase4aDoc("orders", orderId, { [field]: recorded, updatedAt: now }), updateMask: { fieldPaths: [field, "updatedAt"] }, currentDocument: { updateTime: current.updateTime } },
+          { update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: current.updateTime } },
           { update: phase4aDoc("order_cash_funding_events", eventId, { orderId, type: action, ...recorded }), currentDocument: { exists: false } }
         ], value: true, expected: recorded };
       }, async (expected) => {
@@ -4353,6 +4401,156 @@
       const latest = await getFirestoreDoc("orders", orderId, accessToken);
       if (same(latest?.[field])) return jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action });
       return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" : result.value || "state_conflict", "Cash-funding state changed", 409);
+    }
+    async function cashFundingV1Recovery(request, orderId, action, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid recovery request"); }
+      const release = action === "release-no-advance", noReceipt = action === "provider-no-receipt";
+      const convert = action === "convert-self-pickup", receipt = action === "self-pickup-receipt";
+      if (!release && !noReceipt && !convert && !receipt) return phase4aError("invalid_request", "Invalid recovery action");
+      if (release || noReceipt) {
+        if (!phase4aKeysOnly(body, ["termsVersion", release ? "noAdvanceAttested" : "noCashReceived"]) ||
+            typeof body.termsVersion !== "string" || body.termsVersion.length > 300 || body[release ? "noAdvanceAttested" : "noCashReceived"] !== true)
+          return phase4aError("invalid_request", "Explicit attestation required");
+      } else if (convert) {
+        if (!phase4aKeysOnly(body, ["expectedDeliveryStateVersion", "confirmSelfPickup"]) ||
+            !Number.isSafeInteger(body.expectedDeliveryStateVersion) || body.confirmSelfPickup !== true)
+          return phase4aError("invalid_request", "Explicit self-pickup request required");
+      } else if (!phase4aKeysOnly(body, ["amountSar", "currency", "acknowledged"]) ||
+          body.currency !== "SAR" || body.acknowledged !== true || sarCents(body.amountSar) === null)
+        return phase4aError("invalid_request", "Explicit provider receipt required");
+      const role = release ? "driver" : noReceipt || receipt ? "provider" : "customer";
+      const initial = await getFirestoreSnapshot("orders", orderId, accessToken), order = initial?.data;
+      if (!order || auth.user.role !== role || (release && order.driverUid !== auth.uid) ||
+          (!release && order[role + "Uid"] !== auth.uid)) return phase4aError("not_found", "Recovery unavailable", 404);
+      if (order.cashFundingVersion !== CASH_FUNDING_V1 || order.cashFundingIntentVersion !== CASH_FUNDING_V1)
+        return phase4aError("not_found", "Cash-funding recovery unavailable", 404);
+      const field = release ? "cashFundingDriverRelease" : noReceipt ? "cashFundingProviderNoReceipt" :
+        convert ? "cashFundingSelfPickupConversion" : "cashFundingSelfPickupReceipt";
+      const same = (value) => value?.actorUid === auth.uid &&
+        (release || noReceipt ? value.termsVersion === body.termsVersion :
+          convert ? value.expectedDeliveryStateVersion === body.expectedDeliveryStateVersion :
+            sarCents(value.amountSar) === sarCents(body.amountSar));
+      const auditId = orderId + "_" + action;
+      const auditConsistent = async (value) => {
+        if (!same(value) || typeof value.createdAt !== "string") return false;
+        const audit = await getFirestoreDoc("order_cash_funding_events", auditId, accessToken);
+        if (!audit || audit.actorUid !== auth.uid || audit.createdAt !== value.createdAt || audit.type !== action) return false;
+        if (convert) {
+          const outbox = await getFirestoreDoc("order_transition_events",
+            notificationEventId(orderId, "self_pickup_selected", body.expectedDeliveryStateVersion + 1), accessToken);
+          if (!outbox || outbox.transition !== "self_pickup_selected" || outbox.orderId !== orderId) return false;
+        }
+        return true;
+      };
+      if (order[field]) return await auditConsistent(order[field]) ?
+        jsonResponse({ success: true, idempotent: true, orderId, state: action }) :
+        phase4aError("event_exists", "Recovery action or audit conflicts", 409);
+      if (convert && order.cashFundingVersion === CASH_FUNDING_V1 &&
+          Number(order.deliveryStateVersion) !== body.expectedDeliveryStateVersion)
+        return phase4aError("stale_terms", "Order changed; refresh before conversion", 409);
+      const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
+      const orderName = doc("orders", orderId), eventId = auditId;
+      const auditName = doc("order_cash_funding_events", eventId), userName = doc("users", auth.uid);
+      const providerReceiptName = doc("order_cash_funding_events", orderId + "_provider-receipt");
+      const releaseName = doc("order_cash_funding_events", orderId + "_release-no-advance");
+      const transitionId = convert ? notificationEventId(orderId, "self_pickup_selected", (Number(order.deliveryStateVersion) || 0) + 1) : null;
+      const transitionName = transitionId ? doc("order_transition_events", transitionId) : null;
+      const members = [order.customerUid, order.providerUid, ...(!receipt && order.driverUid ? [order.driverUid] : [])];
+      if (members.some((uid) => !phase4aSafeSegment(uid))) return phase4aError("state_conflict", "Order participants unavailable", 409);
+      const fences = [...new Set(members)].flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
+      const names = [...new Set([orderName, auditName, userName, providerReceiptName,
+        ...(convert ? [releaseName, transitionName] : noReceipt ? [releaseName] : []), ...fences])];
+      const now = new Date().toISOString();
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const current = read.get(orderName), actor = read.get(userName)?.data;
+        if (!current || current.updateTime !== initial.updateTime || read.get(auditName) ||
+            !actor || actor.role !== role || ["suspended", "disabled"].includes(actor.accountStatus)) return { abort: "state_conflict" };
+        if (fences.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
+        const latest = current.data, exact = cashFundingAmounts(latest);
+        if (latest[field] || latest.cashFundingHold || latest.paymentStatus !== "PENDING" ||
+            latest.cashFundingProviderReceipt || latest.cashFundingCollectionReport || latest.cashFundingCustomerAcknowledgment ||
+            read.get(providerReceiptName)) return { abort: "manual_review_required" };
+        if (release || noReceipt || convert) {
+          if (!exact || latest.status !== "searching_driver" ||
+              !["ready_for_driver", "driver_assigned"].includes(latest.deliveryStatus) ||
+              latest.pickedUpAt || latest.completedAt) return { abort: "transition_not_allowed" };
+        }
+        if (release || noReceipt) {
+          if (latest.driverUid !== order.driverUid || !latest.driverUid || latest.deliveryStatus !== "driver_assigned" ||
+              !cashFundingConsentMatches(latest, orderId, exact) || latest.cashFundingDriverConsent.driverUid !== latest.driverUid ||
+              latest.cashFundingDriverConsent.termsVersion !== body.termsVersion ||
+              latest.cashFundingDriverConsent.foodAdvanceSar !== exact.foodAdvanceSar ||
+              latest.cashFundingDriverConsent.deliveryFeeSar !== exact.deliveryFeeSar ||
+              latest.cashFundingDriverConsent.customerCashTotalSar !== exact.customerCashTotalSar ||
+              (release && latest.driverUid !== auth.uid) || (noReceipt &&
+                (latest.providerUid !== auth.uid || latest.cashFundingDriverRelease?.actorUid !== latest.driverUid ||
+                  latest.cashFundingDriverRelease?.termsVersion !== body.termsVersion || !read.get(releaseName))))
+            return { abort: "stale_terms" };
+        }
+        if (convert) {
+          if (latest.customerUid !== auth.uid || Number(latest.deliveryStateVersion) !== body.expectedDeliveryStateVersion ||
+              latest.driverUid && (latest.deliveryStatus !== "driver_assigned" ||
+                latest.cashFundingDriverRelease?.actorUid !== latest.driverUid ||
+                !cashFundingConsentMatches(latest, orderId, exact) ||
+                latest.cashFundingDriverRelease?.termsVersion !== latest.cashFundingDriverConsent.termsVersion ||
+                latest.cashFundingProviderNoReceipt?.termsVersion !== latest.cashFundingDriverConsent.termsVersion ||
+                latest.cashFundingProviderNoReceipt?.actorUid !== latest.providerUid ||
+                !read.get(releaseName)) ||
+              !latest.driverUid && (latest.deliveryStatus !== "ready_for_driver" ||
+                latest.cashFundingDriverConsent || latest.cashFundingDriverRelease || latest.cashFundingProviderNoReceipt) ||
+              read.get(transitionName)) return { abort: "state_conflict" };
+        }
+        if (receipt) {
+          if (latest.providerUid !== auth.uid || latest.cashFundingVersion !== CASH_FUNDING_V1 ||
+              !latest.cashFundingSelfPickupConversion || latest.deliveryMethod !== "self_pickup" ||
+              !["self_pickup_selected", "delivered"].includes(latest.deliveryStatus) ||
+              sarCents(latest.cashFundingSelfPickupConversion.foodAmountSar) !== sarCents(body.amountSar) ||
+              sarCents(latest.totalAmount) !== sarCents(body.amountSar)) return { abort: "stale_terms" };
+        }
+        const recorded = { actorUid: auth.uid, actorRole: role, createdAt: now,
+          ...(release || noReceipt ? { termsVersion: body.termsVersion, foodAmountSar: exact.foodAdvanceSar } :
+            convert ? { expectedDeliveryStateVersion: body.expectedDeliveryStateVersion, foodAmountSar: exact.foodAdvanceSar,
+              driverWasAssigned: !!latest.driverUid } : { amountSar: body.amountSar, currency: "SAR" }) };
+        const fields = { [field]: recorded, updatedAt: now };
+        const writes = [];
+        if (convert) {
+          const stateVersion = (Number(latest.deliveryStateVersion) || 0) + 1;
+          Object.assign(fields, { deliveryMethod: "self_pickup", deliveryStatus: "self_pickup_selected",
+            status: "ready_for_pickup", driverUid: null, deliveryQuoteId: null, deliveryPricingVersion: null,
+            deliveryFee: 0, deliveryDistanceKm: 0, driverGrossDeliveryEarnings: 0,
+            totalAmount: exact.foodAdvanceSar, deliveryPaymentMethod: null, dropoffCity: null,
+            dropoffDistrict: null, dropoffConfirmedAt: null, driverStatus: null,
+            driverAssignedAt: null, driverSearchCancelledAt: now, deliveryStateVersion: stateVersion });
+          writes.push({ update: phase4aDoc("order_transition_events", transitionId,
+            { orderId, transition: "self_pickup_selected", stateVersion, status: "pending", createdAt: now }),
+            currentDocument: { exists: false } });
+          writes.push({ delete: doc(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId) });
+          writes.push(...trackingJobWrite(orderId, transitionId, now));
+        }
+        if (receipt) fields.paymentStatus = "PAID_CONFIRMED";
+        writes.unshift({ update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: Object.keys(fields) },
+          currentDocument: { updateTime: current.updateTime } });
+        if (convert) writes[0].updateMask.fieldPaths.push(...ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS);
+        writes.push({ update: phase4aDoc("order_cash_funding_events", eventId,
+          { orderId, type: action, ...recorded }), currentDocument: { exists: false } });
+        return { writes, value: true, expected: recorded };
+      }, async (expected) => {
+        const [latest, event] = await Promise.all([
+          getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_cash_funding_events", eventId, accessToken)
+        ]);
+        return !!latest && !!event && same(latest[field]) && event.actorUid === auth.uid && event.createdAt === expected.createdAt &&
+          (!convert || latest.deliveryMethod === "self_pickup" && latest.driverUid === null &&
+            sarCents(latest.totalAmount) === sarCents(expected.foodAmountSar)) &&
+          (!receipt || latest.paymentStatus === "PAID_CONFIRMED");
+      }, 2, {}, 12);
+      if (["committed", "reconciled"].includes(result.kind)) return jsonResponse({ success: true, orderId, state: action,
+        ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
+      if (result.kind === "uncertain") return phase4aError("state_uncertain", "Recovery outcome uncertain; refresh before retrying", 503);
+      const latest = await getFirestoreDoc("orders", orderId, accessToken);
+      if (await auditConsistent(latest?.[field])) return jsonResponse({ success: true, idempotent: true, orderId, state: action });
+      return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" :
+        result.value || "state_conflict", "Recovery blocked; refresh or request manual review", 409);
     }
     // A missing binding is deliberately OFF. Existing V2 orders continue
     // through the V2 delivery paths when new creation is disabled.
@@ -8382,8 +8580,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name2(destroyFreelanceCertificate, "destroyFreelanceCertificate");
     function orderIsActive(order) {
       return ACCOUNT_DELETION_ACTIVE_ORDER_STATUSES.includes(order?.status) || ACCOUNT_DELETION_ACTIVE_DELIVERY_STATUSES.includes(order?.deliveryStatus) ||
+        (order?.cashFundingSelfPickupConversion ? !order.cashFundingSelfPickupReceipt :
         order?.cashFundingVersion === CASH_FUNDING_V1 && !!order.cashFundingDriverConsent &&
-          (!!order.cashFundingHold || !order.cashFundingProviderReceipt || !order.cashFundingCollectionReport || !order.cashFundingCustomerAcknowledgment);
+          (!!order.cashFundingHold || !order.cashFundingProviderReceipt || !order.cashFundingCollectionReport || !order.cashFundingCustomerAcknowledgment));
     }
     __name(orderIsActive, "orderIsActive");
     __name2(orderIsActive, "orderIsActive");
@@ -8400,7 +8599,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         select: { fields: [{ fieldPath: "status" }, { fieldPath: "deliveryStatus" },
           { fieldPath: "cashFundingVersion" }, { fieldPath: "cashFundingDriverConsent" },
           { fieldPath: "cashFundingProviderReceipt" }, { fieldPath: "cashFundingCollectionReport" },
-          { fieldPath: "cashFundingCustomerAcknowledgment" }, { fieldPath: "cashFundingHold" }] },
+          { fieldPath: "cashFundingCustomerAcknowledgment" }, { fieldPath: "cashFundingHold" },
+          { fieldPath: "cashFundingSelfPickupConversion" }, { fieldPath: "cashFundingSelfPickupReceipt" }] },
         limit: ACCOUNT_DELETION_PAGE_SIZE
       };
       if (cursor) query.startAt = { values: [{ referenceValue: cursor }], before: false };
@@ -11389,14 +11589,27 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return phase4aError('internal_error', 'Unable to load participant summary', 500);
         }
       }
-      const cashFundingMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/cash-funding-v1(?:\/(accept|provider-receipt|collection-report|customer-ack|issue))?$/);
+      const classificationMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/delivery-classification-v1$/);
+      if (classificationMatch && request.method === "GET") {
+        if (hasServiceKey) return phase4aError("forbidden", "User authentication required", 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await deliveryClassificationV1(request, classificationMatch[1], env, accessToken);
+        } catch {
+          console.error("[DeliveryClassificationV1] Read failed");
+          return phase4aError("internal_error", "Delivery classification unavailable", 500);
+        }
+      }
+      const cashFundingMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/cash-funding-v1(?:\/(accept|provider-receipt|collection-report|customer-ack|issue|release-no-advance|provider-no-receipt|convert-self-pickup|self-pickup-receipt))?$/);
       if (cashFundingMatch && (request.method === "GET" && !cashFundingMatch[2] || request.method === "POST" && !!cashFundingMatch[2])) {
         if (hasServiceKey) return phase4aError("forbidden", "User authentication required", 403);
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
           return request.method === "GET" ? await cashFundingV1Read(request, cashFundingMatch[1], env, accessToken) :
             cashFundingMatch[2] === "accept" ? await cashFundingV1Accept(request, cashFundingMatch[1], env, accessToken) :
-            await cashFundingV1Record(request, cashFundingMatch[1], cashFundingMatch[2], accessToken);
+            ["release-no-advance", "provider-no-receipt", "convert-self-pickup", "self-pickup-receipt"].includes(cashFundingMatch[2]) ?
+              await cashFundingV1Recovery(request, cashFundingMatch[1], cashFundingMatch[2], accessToken) :
+              await cashFundingV1Record(request, cashFundingMatch[1], cashFundingMatch[2], accessToken);
         } catch {
           console.error("[CashFundingV1] Request failed");
           return phase4aError("internal_error", "Cash funding unavailable", 500);
