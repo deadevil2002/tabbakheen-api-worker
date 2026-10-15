@@ -241,6 +241,70 @@
     function validClientSemver(value) {
       return typeof value === "string" && value.length <= 64 && (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/).test(value);
     }
+    const DISABLED_CLIENT_VERSION_GATE = {
+      enabled: false,
+      ios: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
+      android: { minimumVersion: "", minimumBuild: "", storeUrl: "" }
+    };
+    const CLIENT_GATE_VERSION = /^\d+\.\d+\.\d+$/;
+    const CLIENT_GATE_BUILD = /^(0|[1-9]\d{0,8})$/;
+    function validClientGateStoreUrl(platform, value) {
+      if (typeof value !== "string") return false;
+      if (!value) return true;
+      // Use the same raw-string constraints as the Mobile parser. URL() alone
+      // normalizes whitespace, backslashes and dot segments before checking.
+      if (value.length > 2048 || /[\s\\#]/u.test(value)) return false;
+      const parts = /^https:\/\/([^/?#]+)(\/[^?#]*)(?:\?([^#]*))?$/iu.exec(value);
+      if (!parts) return false;
+      const authority = parts[1].toLowerCase().replace(/:0*443$/u, "");
+      if (platform === "ios") return authority === "apps.apple.com" && !parts[3]
+        && /^\/(?:[a-z]{2}(?:-[A-Z]{2})?\/)?app\/(?:[^/]+\/)?id6777899848$/u.test(parts[2]);
+      if (authority !== "play.google.com" || parts[2] !== "/store/apps/details") return false;
+      const params = (parts[3] ?? "").split("&").filter(Boolean);
+      if (params.length !== 1) return false;
+      const separator = params[0].indexOf("=");
+      if (separator < 0) return false;
+      try {
+        return decodeURIComponent(params[0].slice(0, separator).replace(/\+/gu, " ")) === "id"
+          && decodeURIComponent(params[0].slice(separator + 1).replace(/\+/gu, " ")) === "com.tabbakheen.app";
+      } catch { return false; }
+    }
+    function parseClientVersionGatePolicy(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+          Object.keys(value).sort().join(",") !== "android,enabled,ios" || typeof value.enabled !== "boolean") return null;
+      const policy = { enabled: value.enabled };
+      for (const platform of ["ios", "android"]) {
+        const part = value[platform];
+        if (!part || typeof part !== "object" || Array.isArray(part) ||
+            Object.keys(part).sort().join(",") !== "minimumBuild,minimumVersion,storeUrl" ||
+            typeof part.minimumVersion !== "string" || typeof part.minimumBuild !== "string" || typeof part.storeUrl !== "string" ||
+            (part.minimumVersion && !CLIENT_GATE_VERSION.test(part.minimumVersion)) ||
+            (part.minimumBuild && (!part.minimumVersion || !CLIENT_GATE_BUILD.test(part.minimumBuild))) ||
+            !validClientGateStoreUrl(platform, part.storeUrl)) return null;
+        policy[platform] = { minimumVersion: part.minimumVersion, minimumBuild: part.minimumBuild, storeUrl: part.storeUrl };
+      }
+      if (policy.enabled && [policy.ios, policy.android].some((part) => !part.minimumVersion || !part.minimumBuild || !part.storeUrl)) return null;
+      return policy;
+    }
+    function clientVersionGateFromSettings(settings) {
+      if (!settings || !Object.prototype.hasOwnProperty.call(settings, "clientVersionGate")) return structuredClone(DISABLED_CLIENT_VERSION_GATE);
+      const policy = parseClientVersionGatePolicy(settings.clientVersionGate);
+      if (!policy) throw new Error("CLIENT_VERSION_GATE_INVALID");
+      return policy;
+    }
+    function effectiveClientVersionGate(settings, env) {
+      const policy = clientVersionGateFromSettings(settings);
+      // Removing the separately approved activation binding releases clients
+      // even if a previously enabled policy remains in private storage.
+      return policy.enabled && env.CLIENT_VERSION_GATE_ACTIVATION_READY !== "true"
+        ? { ...policy, enabled: false } : policy;
+    }
+    function clientVersionGateResponse(data, status = 200) {
+      const response = jsonResponse(data, status);
+      response.headers.set("Cache-Control", "no-store, max-age=0");
+      response.headers.set("Pragma", "no-cache");
+      return response;
+    }
     const PUBLIC_APP_SETTINGS_DEFAULT = {
       bannerImageUrl: "",
       bannerEnabled: false,
@@ -6148,6 +6212,38 @@
     }
     __name(verifyFirebaseIdToken, "verifyFirebaseIdToken");
     __name2(verifyFirebaseIdToken, "verifyFirebaseIdToken");
+    async function verifyOwnerVersionGateToken(idToken, env) {
+      // The shared Admin token does not establish owner identity.
+      if (!phase4aSafeSegment(env.OWNER_FIREBASE_UID) || !idToken || idToken.length > 8192) return null;
+      let claims;
+      try { claims = await verifyFirebaseIdToken(idToken, true); } catch { return null; }
+      const now = Math.floor(Date.now() / 1e3);
+      if (claims.sub !== env.OWNER_FIREBASE_UID ||
+          !Number.isInteger(claims.exp) || claims.exp <= now ||
+          !Number.isInteger(claims.iat) || claims.iat > now + 30 ||
+          !Number.isInteger(claims.auth_time) || claims.auth_time > now ||
+          now - claims.auth_time > 300) return null;
+      return { uid: claims.sub };
+    }
+    async function reauthenticateOwnerVersionGate(credentials, env) {
+      if (!phase4aSafeSegment(env.OWNER_FIREBASE_UID) || !env.FIREBASE_WEB_API_KEY ||
+          !credentials || typeof credentials !== "object" || Array.isArray(credentials) ||
+          Object.keys(credentials).sort().join(",") !== "email,password" ||
+          typeof credentials.email !== "string" || credentials.email.length > 320 || !credentials.email.includes("@") ||
+          typeof credentials.password !== "string" || !credentials.password || credentials.password.length > 1024) return null;
+      const controller = new AbortController();
+      const deadline = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + encodeURIComponent(env.FIREBASE_WEB_API_KEY), {
+          method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+          body: JSON.stringify({ email: credentials.email, password: credentials.password, returnSecureToken: true })
+        });
+        if (!response.ok) { await response.body?.cancel(); return null; }
+        const result = await response.json();
+        return verifyOwnerVersionGateToken(result?.idToken, env);
+      } catch { return null; }
+      finally { clearTimeout(deadline); }
+    }
     function isCrActive(data) {
       const status = data && typeof data === "object" ? data.status : null;
       if (!status || typeof status !== "object") {
@@ -7651,10 +7747,60 @@ async function renderReleaseIntelligence(c){
     '<select id="f-role" aria-label="تصفية الدور" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
     '<select id="f-release" aria-label="تصفية فئة الإصدار" onchange="filterUsers()"><option value="">فئة الإصدار: الكل</option><option value="TEST_RELEASE">1.0.7 · تجريبي</option><option value="PUBLIC_RELEASE">1.0.6 · عام</option><option value="OLDER">أقدم من 1.0.6</option><option value="UNKNOWN">لم يُبلّغ</option><option value="OTHER_REPORTED">إصدار آخر</option></select>'+
     '<select id="f-version" aria-label="تصفية الإصدار الدقيق" onchange="filterUsers()"></select><input type="text" id="f-search" aria-label="تصفية الحساب بالاسم أو المعرّف" placeholder="ابحث باسم الحساب أو معرّفه" oninput="filterUsers()"></div>'+
-    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>آخر إصدار أبلغ عنه الحساب</th><th>فئة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>';
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>آخر إصدار أبلغ عنه الحساب</th><th>فئة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>'+
+    '<section class="surface-panel" id="version-gate-panel" aria-label="سياسة التحديث الإجباري"><div class="surface-head"><div><h2>التحديث الإجباري للتطبيق</h2><p>إعداد منفصل عن تذكيرات الإصدارات. السياسة معطّلة افتراضيًا، ولا تُفعّل قبل توفر الإصدار العام المتوافق في المتجرين وموافقة المالك المستقلة.</p></div></div><div id="version-gate-content" role="status">جارٍ تحميل السياسة…</div></section>';
   refreshReleaseVersionFilter();
   paintReleaseIntelligence();
   startReleasePolling();
+  loadClientVersionGatePanel();
+}
+var clientVersionGateRevision=null;
+function clientVersionGateForm(){
+  function value(id){var el=document.getElementById(id);return el?el.value.trim():"";}
+  return {enabled:!!(document.getElementById("vg-enabled")||{}).checked,
+    ios:{minimumVersion:value("vg-ios-version"),minimumBuild:value("vg-ios-build"),storeUrl:value("vg-ios-url")},
+    android:{minimumVersion:value("vg-android-version"),minimumBuild:value("vg-android-build"),storeUrl:value("vg-android-url")}};
+}
+async function loadClientVersionGatePanel(){
+  var target=document.getElementById("version-gate-content");if(!target)return;
+  var result;try{result=await api("/client-version-gate");}catch(e){}
+  if(!target.isConnected)return;
+  if(!result||(!result.success&&result.code!=="CLIENT_VERSION_GATE_INVALID")){
+    target.innerHTML='<p role="alert">تعذّر تحميل السياسة. أعد فتح الصفحة قبل التعديل.</p>';return;
+  }
+  clientVersionGateRevision=result.revision||null;
+  var policy=result.clientVersionGate||{enabled:false,ios:{minimumVersion:"",minimumBuild:"",storeUrl:""},android:{minimumVersion:"",minimumBuild:"",storeUrl:""}};
+  var editable=result.ownerAuthorizationAvailable===true;
+  function field(id,label,value,hint){return '<div class="form-group"><label for="'+id+'">'+label+'</label><input id="'+id+'" type="'+(id==='vg-owner-email'?'email':'text')+'"'+(id==='vg-owner-email'?' autocomplete="username"':'')+' value="'+esc(value||"")+'"'+(editable?'':' readonly')+' aria-describedby="'+id+'-hint"><small id="'+id+'-hint">'+hint+'</small></div>';}
+  target.innerHTML=(result.code==="CLIENT_VERSION_GATE_INVALID"?'<p role="alert">الإعداد المخزن غير صالح؛ ستبقى سياسة المحمول معطّلة حتى يصححها المالك.</p>':'')+
+    '<p role="status">'+(policy.enabled?'الحالة المحفوظة: مفعّل':'الحالة المحفوظة: معطّل')+' · '+(result.activationReady?'بوابة موافقة النشر متاحة':'بوابة موافقة النشر غير مفعّلة؛ لا يمكن تشغيل الحظر')+'</p>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="vg-enabled"'+(policy.enabled?' checked':'')+(editable?'':' disabled')+'> تفعيل التحديث الإجباري</label></div>'+
+    '<div class="grid-2">'+
+    field('vg-ios-version','الحد الأدنى لإصدار iOS',policy.ios.minimumVersion,'إصدار عام ثابت، مثل 1.0.6')+
+    field('vg-ios-build','الحد الأدنى لرقم بناء iOS',policy.ios.minimumBuild,'رقم البناء الأصلي المنشور')+
+    field('vg-ios-url','رابط App Store الرسمي',policy.ios.storeUrl,'يجب أن يشير إلى تطبيق طباخين فقط')+
+    field('vg-android-version','الحد الأدنى لإصدار Android',policy.android.minimumVersion,'إصدار عام ثابت، مثل 1.0.6')+
+    field('vg-android-build','الحد الأدنى لرقم بناء Android',policy.android.minimumBuild,'رقم البناء الأصلي المنشور')+
+    field('vg-android-url','رابط Google Play الرسمي',policy.android.storeUrl,'يجب أن يشير إلى تطبيق طباخين فقط')+'</div>'+
+    (editable?'<div class="grid-2">'+field('vg-owner-email','بريد Firebase للمالك','','يستخدم للتحقق عند الحفظ فقط')+
+      '<div class="form-group"><label for="vg-owner-password">كلمة مرور Firebase للمالك</label><input id="vg-owner-password" type="password" autocomplete="current-password" aria-describedby="vg-password-hint"><small id="vg-password-hint">لا تُحفظ في إعدادات التطبيق.</small></div></div>'+
+      '<label class="toggle"><input type="checkbox" id="vg-store-confirm"> تحققت من توفر الإصدار المطلوب في App Store وGoogle Play</label><div class="page-actions"><button class="btn btn-primary" id="vg-save" onclick="saveClientVersionGate()">حفظ السياسة</button></div>':
+      '<p role="status">للعرض فقط حتى تُضبط هوية مالك Firebase وإعدادات إعادة المصادقة.</p>');
+}
+async function saveClientVersionGate(){
+  var policy=clientVersionGateForm(),emailEl=document.getElementById('vg-owner-email'),passwordEl=document.getElementById('vg-owner-password');
+  var email=emailEl?emailEl.value.trim():'',password=passwordEl?passwordEl.value:'';
+  if(passwordEl)passwordEl.value='';
+  if(!email||!password){toast('يلزم التحقق من هوية مالك Firebase','error');return;}
+  if(policy.enabled&&!(document.getElementById('vg-store-confirm')||{}).checked){toast('أكّد توفر الإصدار في المتجرين قبل التفعيل','error');return;}
+  if(!confirm('هل تريد حفظ سياسة التحديث؟ لا تفعّل الحظر دون موافقة نشر مستقلة.'))return;
+  var button=document.getElementById('vg-save');if(button){button.disabled=true;button.textContent='جارٍ الحفظ…';}
+  try{
+    var result=await api('/client-version-gate',{method:'POST',body:JSON.stringify({confirm:true,baseUpdateTime:clientVersionGateRevision,clientVersionGate:policy,ownerCredentials:{email:email,password:password}})});
+    if(result&&result.success){toast('حُفظت سياسة التحديث');await loadClientVersionGatePanel();}
+    else toast(result&&result.error||'تعذّر حفظ السياسة؛ راجع الحقول وحالة موافقة النشر','error');
+  }catch(e){toast('تعذّر الاتصال؛ أعد تحميل السياسة قبل المحاولة','error');}
+  finally{if(button&&button.isConnected){button.disabled=false;button.textContent='حفظ السياسة';}}
 }
 function paintReleaseIntelligence(){
   var rc=releaseIntelligence.counts||{};
@@ -10128,6 +10274,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
          readBoundedOfferJson,
          phase4aHasEnabledPublicLocation,
          publicAppSettingsDto,
+         parseClientVersionGatePolicy,
+         validClientGateStoreUrl,
          publicOfferDto,
          handlePublicOffers,
         orderChatInput,
@@ -10251,6 +10399,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof FIREBASE_WEB_API_KEY !== "undefined") env.FIREBASE_WEB_API_KEY = FIREBASE_WEB_API_KEY;
       } catch {
       }
+      try { if (typeof OWNER_FIREBASE_UID !== "undefined") env.OWNER_FIREBASE_UID = OWNER_FIREBASE_UID; } catch {}
+      try { if (typeof CLIENT_VERSION_GATE_ACTIVATION_READY !== "undefined") env.CLIENT_VERSION_GATE_ACTIVATION_READY = CLIENT_VERSION_GATE_ACTIVATION_READY; } catch {}
       try {
         if (typeof PHONE_INDEX_BACKFILL_APPROVED !== "undefined") env.PHONE_INDEX_BACKFILL_APPROVED = PHONE_INDEX_BACKFILL_APPROVED;
       } catch {
@@ -10294,10 +10444,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/app-settings" && request.method === "GET") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          await getFirestoreDoc("app_settings", "main", accessToken);
-          return jsonResponse({ success: true, settings: {} });
+          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+          try {
+            return clientVersionGateResponse({ success: true, settings: { clientVersionGate: effectiveClientVersionGate(settings, env) } });
+          } catch {
+            return clientVersionGateResponse({ success: true, code: "CLIENT_VERSION_GATE_INVALID", settings: { clientVersionGate: structuredClone(DISABLED_CLIENT_VERSION_GATE) } });
+          }
         } catch {
-          return jsonResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
+          return clientVersionGateResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
         }
       }
       if (path === "/app-settings/public" && request.method === "GET") {
@@ -11255,6 +11409,60 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               phonePasswordLoginEnabled: false
             };
             return jsonResponse({ success: true, settings: adminSettings, deliveryPricingPolicy: adminDeliveryPricingPolicy(settings) });
+          }
+          if (path === "/admin/api/client-version-gate" && request.method === "GET") {
+            const snapshot = await getFirestoreSnapshot("app_settings", "main", accessToken);
+            try {
+              return clientVersionGateResponse({ success: true, clientVersionGate: clientVersionGateFromSettings(snapshot?.data), revision: snapshot?.updateTime || null,
+                ownerAuthorizationAvailable: !!(phase4aSafeSegment(env.OWNER_FIREBASE_UID) && env.FIREBASE_WEB_API_KEY),
+                activationReady: env.CLIENT_VERSION_GATE_ACTIVATION_READY === "true" });
+            } catch {
+              return clientVersionGateResponse({ success: false, code: "CLIENT_VERSION_GATE_INVALID", error: "Saved version policy is invalid", revision: snapshot?.updateTime || null,
+                ownerAuthorizationAvailable: !!(phase4aSafeSegment(env.OWNER_FIREBASE_UID) && env.FIREBASE_WEB_API_KEY),
+                activationReady: env.CLIENT_VERSION_GATE_ACTIVATION_READY === "true" }, 409);
+            }
+          }
+          if (path === "/admin/api/client-version-gate" && request.method === "POST") {
+            let body;
+            try { body = await readBoundedOfferJson(request); }
+            catch (error) { return clientVersionGateResponse({ success: false, error: error?.code === "REQUEST_TOO_LARGE" ? "Policy request is too large" : "Valid JSON required" }, error?.code === "REQUEST_TOO_LARGE" ? 413 : 400); }
+            const hasCredentials = body && Object.prototype.hasOwnProperty.call(body, "ownerCredentials");
+            const headerToken = request.headers.get("X-Owner-Firebase-Id-Token");
+            const owner = hasCredentials && !headerToken
+              ? await reauthenticateOwnerVersionGate(body.ownerCredentials, env)
+              : !hasCredentials ? await verifyOwnerVersionGateToken(headerToken, env) : null;
+            if (!owner) return clientVersionGateResponse({ success: false, code: "OWNER_AUTH_REQUIRED", error: "Recent verified owner authorization is required" }, 403);
+            if (!body || typeof body !== "object" || Array.isArray(body) ||
+                Object.keys(body).sort().join(",") !== (hasCredentials ? "baseUpdateTime,clientVersionGate,confirm,ownerCredentials" : "baseUpdateTime,clientVersionGate,confirm") ||
+                body.confirm !== true || !(body.baseUpdateTime === null || typeof body.baseUpdateTime === "string")) {
+              return clientVersionGateResponse({ success: false, error: "Explicit policy confirmation is required" }, 400);
+            }
+            const policy = parseClientVersionGatePolicy(body.clientVersionGate);
+            if (!policy) return clientVersionGateResponse({ success: false, error: "Invalid or incomplete version policy" }, 400);
+            const snapshot = await getFirestoreSnapshot("app_settings", "main", accessToken);
+            if (body.baseUpdateTime !== (snapshot?.updateTime || null)) return clientVersionGateResponse({ success: false, error: "Settings changed since review; reload before saving" }, 409);
+            let previous, previousInvalid = false;
+            try { previous = clientVersionGateFromSettings(snapshot?.data); }
+            catch { previousInvalid = true; previous = null; }
+            if (!previousInvalid && JSON.stringify(previous) === JSON.stringify(policy))
+              return clientVersionGateResponse({ success: true, changed: false, clientVersionGate: policy });
+            // Store availability is verified outside this Worker. This separate
+            // owner-approved deployment binding is absent by default. Disabling
+            // an active policy never depends on it.
+            if (policy.enabled && env.CLIENT_VERSION_GATE_ACTIVATION_READY !== "true")
+              return clientVersionGateResponse({ success: false, code: "RELEASE_NOT_VERIFIED", error: "Compatible releases must be verified in both stores before activation" }, 409);
+            const auditId = "client-version-gate-" + crypto.randomUUID();
+            const writes = [{
+              update: phase4aDoc("app_settings", "main", { clientVersionGate: policy }),
+              updateMask: { fieldPaths: ["clientVersionGate"] },
+              currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false }
+            }, {
+              update: phase4aDoc("admin_audit_logs", auditId, { action: "client_version_gate_changed", actorFirebaseUid: owner.uid,
+                oldValue: previousInvalid ? "INVALID_CONFIG_REPLACED" : previous, newValue: policy, changedAt: new Date().toISOString() }),
+              currentDocument: { exists: false }
+            }];
+            if (!await phase4aCommit(writes, accessToken)) return clientVersionGateResponse({ success: false, error: "Settings changed concurrently; retry" }, 409);
+            return clientVersionGateResponse({ success: true, changed: true, clientVersionGate: policy });
           }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();

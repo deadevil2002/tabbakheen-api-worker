@@ -176,7 +176,7 @@ assert(hooks, "release intelligence hooks unavailable");
   assert(admin.includes("ضمن مهلة الانتظار") && admin.includes("المستهدفون"));
   assert(admin.includes('data-page="advertisements"') && admin.includes('data-page="releases"'));
   const adminScript = [...admin.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map((match) => match[1]).join("\n");
-  const releaseRenderer = adminScript.slice(adminScript.indexOf("async function renderReleaseIntelligence("), adminScript.indexOf("function paintReleaseIntelligence("));
+  const releaseRenderer = adminScript.slice(adminScript.indexOf("async function renderReleaseIntelligence("), adminScript.indexOf("var clientVersionGateRevision="));
   assert(releaseRenderer.includes('id="users-tbody"') && releaseRenderer.includes("refreshReleaseVersionFilter()"), "App Releases renders the per-account table and exact-version filter");
   const metricSource = adminScript.slice(adminScript.indexOf("function releaseMetric("), adminScript.indexOf("async function renderReleaseIntelligence("));
   const categoryMetric = new Function("releaseIntelligence", "allUsers", "document", "esc", metricSource + ";return releaseCategoryMetric;")(
@@ -187,8 +187,8 @@ assert(hooks, "release intelligence hooks unavailable");
   const distributionSource = adminScript.slice(adminScript.indexOf("function releaseDistributionHtml()"), adminScript.indexOf("function filterUsers(){", adminScript.indexOf("function releaseDistributionHtml()")));
   const distribution = new Function("releaseIntelligence", "esc", distributionSource + ";return releaseDistributionHtml;")({ distribution: { "1.0.6": 2 }, totalUsers: 2 }, String)();
   assert(distribution.includes("1.0.7") && distribution.includes("1.0.6") && distribution.includes("100%"), "chart keeps the zero-count 1.0.7 test release visible alongside public 1.0.6");
-  const renderRelease = new Function("api", "allUsers", "releaseIntelligence", "setReleaseIntelligence", "releaseMetric", "releaseCategoryMetric", "releaseDistributionHtml", "refreshReleaseVersionFilter", "paintReleaseIntelligence", "startReleasePolling", "t", "esc", releaseRenderer + ";return renderReleaseIntelligence;")(
-    async () => intelligence, [], intelligence, () => {}, (key, count) => key + ":" + count, categoryMetric, () => "distribution", () => {}, () => {}, () => {}, String, String,
+  const renderRelease = new Function("api", "allUsers", "releaseIntelligence", "setReleaseIntelligence", "releaseMetric", "releaseCategoryMetric", "releaseDistributionHtml", "refreshReleaseVersionFilter", "paintReleaseIntelligence", "startReleasePolling", "loadClientVersionGatePanel", "t", "esc", releaseRenderer + ";return renderReleaseIntelligence;")(
+    async () => intelligence, [], intelligence, () => {}, (key, count) => key + ":" + count, categoryMetric, () => "distribution", () => {}, () => {}, () => {}, () => {}, String, String,
   );
   const releaseContainer = { innerHTML: "" };
   await renderRelease(releaseContainer);
