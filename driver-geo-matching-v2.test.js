@@ -100,6 +100,19 @@ test("saved-location DTO allowlist", () => {
   const dto = hooks.customerDeliveryPreferenceDto({ _id: "customer-secret", customerUid: "other", ...savedLocation, updatedAt: "2026-10-09T00:00:00Z", schemaVersion: 1, token: "secret" });
   assert.deepEqual(Object.keys(dto), ["lat", "lng", "addressLine", "city", "district", "label", "updatedAt", "schemaVersion"]);
 });
+test("optional Saudi short address is private and backward compatible", () => {
+  assert.deepEqual(hooks.validateCustomerDropoff(savedLocation, true).value, savedLocation, "1.0.6 request remains unchanged");
+  const withShortAddress = { ...savedLocation, shortAddress: "ENAB2500" };
+  assert.deepEqual(hooks.validateCustomerDropoff(withShortAddress, true).value, withShortAddress);
+  assert.equal(hooks.customerDeliveryPreferenceDto(withShortAddress).shortAddress, "ENAB2500");
+  for (const invalid of ["enab2500", "ENAB25", "ENAB25000", " ENAB2500", "ENAB2500 ", "ABCD٢٥٠٠", "<script>", null, 2500])
+    assert.equal(hooks.validateCustomerDropoff({ ...savedLocation, shortAddress: invalid }, true).code, "CUSTOMER_DROPOFF_INVALID");
+  assert.equal(hooks.validateCustomerDropoff({ ...savedLocation, extra: "x" }, true).code, "CUSTOMER_DROPOFF_INVALID");
+  assert.equal(hooks.validateCustomerDropoff(withShortAddress, false).code, "CUSTOMER_DROPOFF_INVALID", "quote DTO remains unchanged");
+  assert(!("shortAddress" in hooks.customerDeliveryPreferenceDto({ ...savedLocation, shortAddress: "INVALID" })), "invalid stored values are not returned");
+  assert(quoteV2Transaction.includes("sameAddress") && quoteV2Transaction.includes("saved.shortAddress"), "quote save-as-default retains the code only for the same saved address");
+  assert(!discoveryV2Route.includes("shortAddress") && !deliveryDetailsRoute.includes("shortAddress"), "not exposed in public discovery or order delivery details");
+});
 
 test("14 valid quote contract", () => {
   assert(quoteV2Route.includes('exactObjectKeys(body, ["orderId", "dropoff", "saveAsDefault"])'));

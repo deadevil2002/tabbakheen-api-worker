@@ -176,19 +176,21 @@ assert(hooks, "release intelligence hooks unavailable");
   assert(admin.includes("ضمن مهلة الانتظار") && admin.includes("المستهدفون"));
   assert(admin.includes('data-page="advertisements"') && admin.includes('data-page="releases"'));
   const adminScript = [...admin.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map((match) => match[1]).join("\n");
-  const releaseRenderer = adminScript.slice(adminScript.indexOf("async function renderReleaseIntelligence("), adminScript.indexOf("function paintReleaseIntelligence("));
+  const uiSource = adminScript.slice(adminScript.indexOf("var adminUiText="), adminScript.indexOf("function formatAdminDate("));
+  const ui = new Function("lang", uiSource + ";return ui;")("ar");
+  const releaseRenderer = adminScript.slice(adminScript.indexOf("async function renderReleaseIntelligence("), adminScript.indexOf("var clientVersionGateRevision="));
   assert(releaseRenderer.includes('id="users-tbody"') && releaseRenderer.includes("refreshReleaseVersionFilter()"), "App Releases renders the per-account table and exact-version filter");
   const metricSource = adminScript.slice(adminScript.indexOf("function releaseMetric("), adminScript.indexOf("async function renderReleaseIntelligence("));
-  const categoryMetric = new Function("releaseIntelligence", "allUsers", "document", "esc", metricSource + ";return releaseCategoryMetric;")(
-    intelligence, intelligence.users, {}, String,
+  const categoryMetric = new Function("releaseIntelligence", "allUsers", "document", "esc", "ui", metricSource + ";return releaseCategoryMetric;")(
+    intelligence, intelligence.users, {}, String, ui,
   );
   assert(categoryMetric("TEST_RELEASE").includes("20%"), "category card shows count share of all accounts");
   assert(categoryMetric("PUBLIC_RELEASE").includes("20%"));
   const distributionSource = adminScript.slice(adminScript.indexOf("function releaseDistributionHtml()"), adminScript.indexOf("function filterUsers(){", adminScript.indexOf("function releaseDistributionHtml()")));
-  const distribution = new Function("releaseIntelligence", "esc", distributionSource + ";return releaseDistributionHtml;")({ distribution: { "1.0.6": 2 }, totalUsers: 2 }, String)();
+  const distribution = new Function("releaseIntelligence", "esc", "ui", distributionSource + ";return releaseDistributionHtml;")({ distribution: { "1.0.6": 2 }, totalUsers: 2 }, String, ui)();
   assert(distribution.includes("1.0.7") && distribution.includes("1.0.6") && distribution.includes("100%"), "chart keeps the zero-count 1.0.7 test release visible alongside public 1.0.6");
-  const renderRelease = new Function("api", "allUsers", "releaseIntelligence", "setReleaseIntelligence", "releaseMetric", "releaseCategoryMetric", "releaseDistributionHtml", "refreshReleaseVersionFilter", "paintReleaseIntelligence", "startReleasePolling", "t", "esc", releaseRenderer + ";return renderReleaseIntelligence;")(
-    async () => intelligence, [], intelligence, () => {}, (key, count) => key + ":" + count, categoryMetric, () => "distribution", () => {}, () => {}, () => {}, String, String,
+  const renderRelease = new Function("api", "allUsers", "releaseIntelligence", "setReleaseIntelligence", "releaseMetric", "releaseCategoryMetric", "releaseDistributionHtml", "refreshReleaseVersionFilter", "paintReleaseIntelligence", "startReleasePolling", "loadClientVersionGatePanel", "t", "esc", "ui", releaseRenderer + ";return renderReleaseIntelligence;")(
+    async () => intelligence, [], intelligence, () => {}, (key, count) => key + ":" + count, categoryMetric, () => "distribution", () => {}, () => {}, () => {}, () => {}, String, String, ui,
   );
   const releaseContainer = { innerHTML: "" };
   await renderRelease(releaseContainer);
@@ -198,8 +200,8 @@ assert(hooks, "release intelligence hooks unavailable");
   const renderFiltered = (page, values) => {
     const fields = Object.fromEntries(Object.entries({ "f-role": "", "f-status": "", "f-release": "", "f-version": "", "f-search": "", ...values }).map(([key, value]) => [key, { value }]));
     fields["users-tbody"] = { innerHTML: "" };
-    const filter = new Function("document", "allUsers", "currentPage", "roleBadge", "statusBadge", "releaseStatusBadge", "esc", "t", filterSource + ";return filterUsers;")(
-      { getElementById: (key) => fields[key] || null }, intelligence.users, page, String, String, String, String, String,
+    const filter = new Function("document", "allUsers", "currentPage", "roleBadge", "statusBadge", "releaseStatusBadge", "esc", "t", "ui", filterSource + ";return filterUsers;")(
+      { getElementById: (key) => fields[key] || null }, intelligence.users, page, String, String, String, String, String, ui,
     );
     filter();
     return fields["users-tbody"].innerHTML;

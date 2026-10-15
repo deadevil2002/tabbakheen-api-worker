@@ -241,6 +241,70 @@
     function validClientSemver(value) {
       return typeof value === "string" && value.length <= 64 && (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/).test(value);
     }
+    const DISABLED_CLIENT_VERSION_GATE = {
+      enabled: false,
+      ios: { minimumVersion: "", minimumBuild: "", storeUrl: "" },
+      android: { minimumVersion: "", minimumBuild: "", storeUrl: "" }
+    };
+    const CLIENT_GATE_VERSION = /^\d+\.\d+\.\d+$/;
+    const CLIENT_GATE_BUILD = /^(0|[1-9]\d{0,8})$/;
+    function validClientGateStoreUrl(platform, value) {
+      if (typeof value !== "string") return false;
+      if (!value) return true;
+      // Use the same raw-string constraints as the Mobile parser. URL() alone
+      // normalizes whitespace, backslashes and dot segments before checking.
+      if (value.length > 2048 || /[\s\\#]/u.test(value)) return false;
+      const parts = /^https:\/\/([^/?#]+)(\/[^?#]*)(?:\?([^#]*))?$/iu.exec(value);
+      if (!parts) return false;
+      const authority = parts[1].toLowerCase().replace(/:0*443$/u, "");
+      if (platform === "ios") return authority === "apps.apple.com" && !parts[3]
+        && /^\/(?:[a-z]{2}(?:-[A-Z]{2})?\/)?app\/(?:[^/]+\/)?id6777899848$/u.test(parts[2]);
+      if (authority !== "play.google.com" || parts[2] !== "/store/apps/details") return false;
+      const params = (parts[3] ?? "").split("&").filter(Boolean);
+      if (params.length !== 1) return false;
+      const separator = params[0].indexOf("=");
+      if (separator < 0) return false;
+      try {
+        return decodeURIComponent(params[0].slice(0, separator).replace(/\+/gu, " ")) === "id"
+          && decodeURIComponent(params[0].slice(separator + 1).replace(/\+/gu, " ")) === "com.tabbakheen.app";
+      } catch { return false; }
+    }
+    function parseClientVersionGatePolicy(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+          Object.keys(value).sort().join(",") !== "android,enabled,ios" || typeof value.enabled !== "boolean") return null;
+      const policy = { enabled: value.enabled };
+      for (const platform of ["ios", "android"]) {
+        const part = value[platform];
+        if (!part || typeof part !== "object" || Array.isArray(part) ||
+            Object.keys(part).sort().join(",") !== "minimumBuild,minimumVersion,storeUrl" ||
+            typeof part.minimumVersion !== "string" || typeof part.minimumBuild !== "string" || typeof part.storeUrl !== "string" ||
+            (part.minimumVersion && !CLIENT_GATE_VERSION.test(part.minimumVersion)) ||
+            (part.minimumBuild && (!part.minimumVersion || !CLIENT_GATE_BUILD.test(part.minimumBuild))) ||
+            !validClientGateStoreUrl(platform, part.storeUrl)) return null;
+        policy[platform] = { minimumVersion: part.minimumVersion, minimumBuild: part.minimumBuild, storeUrl: part.storeUrl };
+      }
+      if (policy.enabled && [policy.ios, policy.android].some((part) => !part.minimumVersion || !part.minimumBuild || !part.storeUrl)) return null;
+      return policy;
+    }
+    function clientVersionGateFromSettings(settings) {
+      if (!settings || !Object.prototype.hasOwnProperty.call(settings, "clientVersionGate")) return structuredClone(DISABLED_CLIENT_VERSION_GATE);
+      const policy = parseClientVersionGatePolicy(settings.clientVersionGate);
+      if (!policy) throw new Error("CLIENT_VERSION_GATE_INVALID");
+      return policy;
+    }
+    function effectiveClientVersionGate(settings, env) {
+      const policy = clientVersionGateFromSettings(settings);
+      // Removing the separately approved activation binding releases clients
+      // even if a previously enabled policy remains in private storage.
+      return policy.enabled && env.CLIENT_VERSION_GATE_ACTIVATION_READY !== "true"
+        ? { ...policy, enabled: false } : policy;
+    }
+    function clientVersionGateResponse(data, status = 200) {
+      const response = jsonResponse(data, status);
+      response.headers.set("Cache-Control", "no-store, max-age=0");
+      response.headers.set("Pragma", "no-cache");
+      return response;
+    }
     const PUBLIC_APP_SETTINGS_DEFAULT = {
       bannerImageUrl: "",
       bannerEnabled: false,
@@ -452,6 +516,32 @@
     }
     __name(listAllComplaints, "listAllComplaints");
     __name2(listAllComplaints, "listAllComplaints");
+    async function complaintOrderNumbers(complaints, accessToken) {
+      const ids = [...new Set(complaints.filter((item) => (!item.orderNumber || item.orderNumber === item.orderId) && phase4aSafeSegment(item.orderId)).map((item) => item.orderId))];
+      const numbers = new Map();
+      // Read only the display-number field, in bounded batches. No order data is
+      // copied into complaints or exposed by this Admin-only presentation read.
+      for (let offset = 0; offset < ids.length; offset += 100) {
+        const batch = ids.slice(offset, offset + 100);
+        const response = await fetch(FIRESTORE_BASE + ":batchGet", {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+          body: JSON.stringify({ documents: batch.map((id) => FIRESTORE_BASE.slice(FIRESTORE_BASE.indexOf("projects/")) + "/orders/" + id), mask: { fieldPaths: ["orderNumber"] } })
+        });
+        if (!response.ok) { await response.text(); throw new Error("Complaint order reference lookup failed: " + response.status); }
+        const text = await response.text();
+        let entries;
+        try { const parsed = JSON.parse(text); entries = Array.isArray(parsed) ? parsed : [parsed]; }
+        catch { entries = text.split("\n").map((line) => line.trim().replace(/^,\s*|\s*,$/g, "")).filter((line) => line && line !== "[" && line !== "]").map((line) => JSON.parse(line)); }
+        for (const entry of entries) {
+          if (entry.error) throw new Error("Complaint order reference lookup returned an error");
+          const order = parseFirestoreDoc(entry.found);
+          if (order && batch.includes(order._id) && typeof order.orderNumber === "string" && order.orderNumber.trim().length <= 80)
+            numbers.set(order._id, order.orderNumber.trim());
+        }
+      }
+      return numbers;
+    }
     async function listAllVerificationRequests(accessToken) {
       const requests = [];
       let pageToken = null;
@@ -903,8 +993,10 @@
       return normalized && normalized.length <= maximum ? normalized : null;
     }
     function validateCustomerDropoff(value, requireLabel = false) {
-      const expected = requireLabel ? ["lat", "lng", "addressLine", "city", "district", "label"] : ["lat", "lng", "addressLine", "city", "district"];
+      const hasShortAddress = requireLabel && value && Object.prototype.hasOwnProperty.call(value, "shortAddress");
+      const expected = requireLabel ? ["lat", "lng", "addressLine", "city", "district", "label", ...(hasShortAddress ? ["shortAddress"] : [])] : ["lat", "lng", "addressLine", "city", "district"];
       if (!exactObjectKeys(value, expected)) return { ok: false, code: value == null ? "CUSTOMER_DROPOFF_REQUIRED" : "CUSTOMER_DROPOFF_INVALID" };
+      if (hasShortAddress && (typeof value.shortAddress !== "string" || !/^[A-Z]{4}[0-9]{4}$/.test(value.shortAddress))) return { ok: false, code: "CUSTOMER_DROPOFF_INVALID" };
       if (!validSaudiCoordinatePair(value.lat, value.lng)) return { ok: false, code: "CUSTOMER_COORDINATES_REQUIRED" };
       const addressLine = boundedRequiredString(value.addressLine, 300);
       const city = boundedRequiredString(value.city, 120);
@@ -915,7 +1007,7 @@
         if (typeof value.label !== "string" || value.label.trim().length > 80) return { ok: false, code: "CUSTOMER_DROPOFF_INVALID" };
         label = value.label.trim();
       }
-      return { ok: true, value: { lat: value.lat, lng: value.lng, addressLine, city, district, ...(requireLabel ? { label } : {}) } };
+      return { ok: true, value: { lat: value.lat, lng: value.lng, addressLine, city, district, ...(requireLabel ? { label } : {}), ...(hasShortAddress ? { shortAddress: value.shortAddress } : {}) } };
     }
     function customerDeliveryPreferenceDto(value) {
       if (!value) return null;
@@ -926,6 +1018,7 @@
         city: typeof value.city === "string" ? value.city : "",
         district: typeof value.district === "string" ? value.district : "",
         label: typeof value.label === "string" ? value.label : "",
+        ...(typeof value.shortAddress === "string" && /^[A-Z]{4}[0-9]{4}$/.test(value.shortAddress) ? { shortAddress: value.shortAddress } : {}),
         updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : "",
         schemaVersion: Number.isInteger(value.schemaVersion) ? value.schemaVersion : 1
       };
@@ -1474,6 +1567,11 @@
       ]);
       if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
       const order = snapshot.data;
+      if (order.cashFundingVersion === CASH_FUNDING_V1 && order.cashFundingHold)
+        return jsonResponse({ success: false, code: "cash_funding_dispute_required", error: "Cash-funding order requires manual review" }, 409);
+      if (order.cashFundingVersion === CASH_FUNDING_V1 && order.cashFundingDriverRelease &&
+          action !== "complete_self_pickup")
+        return jsonResponse({ success: false, code: "cash_funding_recovery_required", error: "Driver released funding; use the recovery contract" }, 409);
       const now = new Date().toISOString();
       const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
       let fields;
@@ -1483,6 +1581,8 @@
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
           return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
         }
+        if (order.cashFundingVersion === CASH_FUNDING_V1)
+          return jsonResponse({ success: false, code: "cash_funding_recovery_required", error: "Use explicit funded-order self-pickup recovery" }, 409);
         if (order.deliveryMethod === "self_pickup" && order.deliveryStatus === "self_pickup_selected" && !order.driverUid) {
           return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
         }
@@ -1536,7 +1636,7 @@
         };
         if (ownsAsCustomer) fields.customerConfirmedAt = now;
         if (ownsAsProvider) fields.providerCompletedAt = now;
-        if (order.paymentMethod === "CASH" || order.paymentMethod === "cod") fields.paymentStatus = "PAID_CONFIRMED";
+        if (order.cashFundingVersion !== CASH_FUNDING_V1 && (order.paymentMethod === "CASH" || order.paymentMethod === "cod")) fields.paymentStatus = "PAID_CONFIRMED";
         notificationEvent = "self_pickup_completed";
       } else if (action === "confirm_delivered") {
         if (!actor || actor.role !== "customer" || order.customerUid !== uid) {
@@ -1556,10 +1656,11 @@
           deliveryStateVersion: nextVersion,
           updatedAt: now
         };
-        if (order.paymentMethod === "CASH" || order.paymentMethod === "cod") fields.paymentStatus = "PAID_CONFIRMED";
+        if (order.cashFundingVersion !== CASH_FUNDING_V1 && (order.paymentMethod === "CASH" || order.paymentMethod === "cod")) fields.paymentStatus = "PAID_CONFIRMED";
         notificationEvent = "delivered";
       } else {
         if (!actor || actor.role !== "driver") return jsonResponse({ success: false, code: "forbidden", error: "Driver role required" }, 403);
+        if (order.cashFundingVersion === CASH_FUNDING_V1 && action === "accept") return jsonResponse({ success: false, code: "cash_funding_consent_required", error: "Review and accept the cash-funding terms", }, 409);
         const driverEntitlement = evaluateSubscriptionEntitlement(actor);
         // Expiry policy: accepting is a new commercial assignment and requires
         // entitlement. Once assigned, reject/pickup/arrival/completion remain
@@ -1584,6 +1685,7 @@
           fields = { driverUid: uid, deliveryStatus: "driver_assigned", driverAssignedAt: now, deliveryStateVersion: nextVersion, updatedAt: now };
           notificationEvent = "driver_assigned";
         } else if (action === "reject") {
+          if (order.cashFundingVersion === CASH_FUNDING_V1) return jsonResponse({ success: false, code: "cash_funding_recovery_required", error: "Explicit no-advance release is required", }, 409);
           if (order.deliveryStatus === "ready_for_driver" && !order.driverUid && order.lastRejectedDriverUid === uid) {
             return jsonResponse({ success: true, idempotent: true, deliveryMethod: order.deliveryMethod, deliveryStatus: order.deliveryStatus, driverUid: null });
           }
@@ -1614,6 +1716,7 @@
           if (order.deliveryStatus !== expected) {
             return jsonResponse({ success: false, code: "transition_not_allowed", error: "Stale or illegal delivery transition" }, 409);
           }
+          if (order.cashFundingVersion === CASH_FUNDING_V1 && action === "picked_up" && (!order.cashFundingProviderReceipt || order.cashFundingHold)) return jsonResponse({ success: false, code: "cash_funding_receipt_required", error: "Provider cash receipt is required before pickup" }, 409);
           fields = { deliveryStatus: action, deliveryStateVersion: nextVersion, updatedAt: now };
           if (action === "picked_up") fields.pickedUpAt = now;
           if (action === "arrived") fields.driverArrivedAt = now;
@@ -1990,8 +2093,16 @@
       const report = { orderId: body.orderId, reporterUid: auth.uid, source: auth.user.role, target: auth.user.role === "customer" ? "provider" : "customer", type: "order_chat_report", messageId: body.messageId || "", note: typeof body.note === "string" ? body.note.trim() : "", complaintStatus: "pending", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
       const saved = await getFirestoreDoc("delivery_complaints", reportId, accessToken);
       if (saved) return saved.orderId === report.orderId && saved.source === report.source ? jsonResponse({ success: true, idempotent: true, reportId }) : phase4aError("idempotency_conflict", "Report already exists", 409);
-      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", reportId, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, auth.deletionFence], accessToken);
+      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", reportId, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, await complaintEmailAlertWrite(reportId, report), auth.deletionFence], accessToken);
       return created ? jsonResponse({ success: true, reportId }) : phase4aError("state_conflict", "Report changed; retry", 409);
+    }
+    async function complaintEmailAlertWrite(complaintId, complaint) {
+      const id = "a_" + (await sha256Hex("complaint-email:" + complaintId)).slice(0, 48);
+      return { update: phase4aDoc("complaint_email_alerts", id, {
+        complaintId, orderId: complaint.orderId, category: complaint.type,
+        submittedAt: complaint.createdAt, status: "pending", attempts: 0,
+        createdAt: complaint.createdAt, updatedAt: complaint.createdAt
+      }), currentDocument: { exists: false } };
     }
     function complaintRefDto(complaint) {
       if (!complaint || typeof complaint.orderId !== "string" || typeof complaint.source !== "string" || typeof complaint.complaintStatus !== "string") return null;
@@ -2004,12 +2115,84 @@
         source: complaint.source,
         target: typeof complaint.target === "string" ? complaint.target : "",
         type: typeof complaint.type === "string" ? complaint.type : "",
+        ...(complaint.type === 'participant_safety' ? { reasonCode: typeof complaint.reasonCode === 'string' ? complaint.reasonCode : '' } : {}),
         complaintStatus: complaint.complaintStatus,
         note: typeof complaint.note === "string" ? complaint.note : "",
         adminNote: typeof complaint.adminNote === "string" ? complaint.adminNote : "",
         createdAt: typeof complaint.createdAt === "string" ? complaint.createdAt : "",
         updatedAt: typeof complaint.updatedAt === "string" ? complaint.updatedAt : ""
       };
+    }
+    function complaintSafetySummary(complaints, nowMs = Date.now()) {
+      const items = Array.isArray(complaints) ? complaints : [];
+      const substantiatedByTarget = new Map();
+      for (const item of items) {
+        if (item.type !== 'participant_safety' || item.reviewFinding !== 'substantiated' || !phase4aSafeSegment(item.targetAccountUid)) continue;
+        if (!substantiatedByTarget.has(item.targetAccountUid)) substantiatedByTarget.set(item.targetAccountUid, new Set());
+        substantiatedByTarget.get(item.targetAccountUid).add(item.orderId);
+      }
+      return {
+        total: items.length,
+        pending: items.filter((item) => item.complaintStatus === 'pending').length,
+        substantiated: items.filter((item) => item.type === 'participant_safety' && item.reviewFinding === 'substantiated').length,
+        unsubstantiated: items.filter((item) => item.type === 'participant_safety' && item.reviewFinding === 'unsubstantiated').length,
+        distinctOrders: new Set(items.map((item) => item.orderId).filter(Boolean)).size,
+        last7Days: items.filter((item) => Number.isFinite(Date.parse(item.createdAt)) && Date.parse(item.createdAt) >= nowMs - 7 * 864e5 && Date.parse(item.createdAt) <= nowMs).length,
+        last30Days: items.filter((item) => Number.isFinite(Date.parse(item.createdAt)) && Date.parse(item.createdAt) >= nowMs - 30 * 864e5 && Date.parse(item.createdAt) <= nowMs).length,
+        repeatedSubstantiatedAccountsForManualReview: [...substantiatedByTarget.values()].filter((orders) => orders.size >= 2).length,
+        seriousPendingForManualReview: items.filter((item) => item.type === 'participant_safety' && item.reviewFinding === 'pending' && ['abuse_or_threats', 'suspected_fraud'].includes(item.reasonCode)).length
+      };
+    }
+    function participantSafetyTarget(role, target, reason) {
+      if (!['customer', 'provider', 'driver'].includes(role) || !['customer', 'provider', 'driver'].includes(target) || role === target) return false;
+      if (reason === 'customer_received_unpaid') return role === 'provider' && target === 'customer';
+      if (reason === 'customer_no_show') return ['provider', 'driver'].includes(role) && target === 'customer';
+      if (reason === 'assigned_driver_problem') return ['customer', 'provider'].includes(role) && target === 'driver';
+      return ['abuse_or_threats', 'suspected_fraud', 'other'].includes(reason);
+    }
+    function orderAssignedDriverUid(order) {
+      return phase4aSafeSegment(order?.driverUid) && ['driver_assigned', 'picked_up', 'arrived', 'delivered_pending_confirmation', 'delivered'].includes(order.deliveryStatus) ? order.driverUid : null;
+    }
+    async function participantAccountAvailable(uid, role, accessToken) {
+      if (!phase4aSafeSegment(uid)) return null;
+      const [user, deletion, marker] = await Promise.all([
+        getFirestoreDoc('users', uid, accessToken),
+        getFirestoreDoc('account_deletion_requests', uid, accessToken),
+        getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken)
+      ]);
+      if (!user || user.role !== role || user.accountStatus === 'suspended' || user.accountStatus === 'disabled' || marker || deletion) return null;
+      return user;
+    }
+    async function handleOrderParticipantSummary(request, orderId, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      if (auth.user.role !== 'provider' || !phase4aSafeSegment(orderId)) return phase4aError('forbidden', 'Participant summary unavailable', 403);
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+      const order = await getFirestoreDoc('orders', orderId, accessToken);
+      if (!order || order.providerUid !== auth.uid) return phase4aError('not_found', 'Participant summary unavailable', 404);
+      const customer = await participantAccountAvailable(order.customerUid, 'customer', accessToken);
+      if (!customer) return phase4aError('participant_unavailable', 'Participant unavailable', 409);
+      const result = {
+        success: true, orderId,
+        customer: { displayName: String(customer.displayName || '').trim().slice(0, 120), avatarUrl: null },
+        driver: null
+      };
+      // A driver is disclosed only after an authoritative order assignment.
+      const assignedDriverUid = orderAssignedDriverUid(order);
+      if (assignedDriverUid) {
+        const driver = await participantAccountAvailable(assignedDriverUid, 'driver', accessToken);
+        if (driver) {
+          const publicDriver = await getFirestoreDoc('public_profiles', assignedDriverUid, accessToken);
+          result.driver = {
+            displayName: String(driver.displayName || '').trim().slice(0, 120),
+            // A public photo is not proof of avatar-specific approval.
+            avatarUrl: null,
+            ratingAverage: publicDriver?.role === 'driver' && Number.isFinite(publicDriver.ratingAverage) ? Math.max(0, Math.min(5, publicDriver.ratingAverage)) : 0,
+            ratingCount: publicDriver?.role === 'driver' && Number.isInteger(publicDriver.ratingCount) ? Math.max(0, publicDriver.ratingCount) : 0
+          };
+        }
+      }
+      return jsonResponse(result);
     }
     async function handleMyComplaints(request, accessToken) {
       const auth = await phase4aAuth(request, accessToken);
@@ -2026,10 +2209,69 @@
       const unique = new Map(refs.map((ref) => [ref.id || ref.orderId + "_" + ref.source + "_" + ref.type, ref]));
       return jsonResponse({ success: true, complaints: [...unique.values()] });
     }
+    async function handleReceivedSafetyReports(request, orderId, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      const role = auth.user.role;
+      if (!['customer', 'provider', 'driver'].includes(role)) return phase4aError('forbidden', 'Safety reports unavailable', 403);
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+      const order = await getFirestoreDoc('orders', orderId, accessToken);
+      if (!order || order[role + 'Uid'] !== auth.uid) return phase4aError('not_found', 'Safety reports unavailable', 404);
+      // At most two point reads, derived from the authoritative order. Never
+      // query the complaint collection or accept a reporter UID from the client.
+      const reporters = ['customer', 'provider', 'driver']
+        .filter((source) => source !== role && phase4aSafeSegment(order[source + 'Uid']) && order[source + 'Uid'] !== auth.uid);
+      const complaints = [];
+      for (const source of reporters) {
+        const reporterUid = order[source + 'Uid'];
+        const id = 'safety_' + orderId + '_' + reporterUid + '_' + role;
+        if (!phase4aSafeSegment(id)) continue;
+        const report = await getFirestoreDoc('delivery_complaints', id, accessToken);
+        if (!report || report.type !== 'participant_safety' || report.orderId !== orderId || report.source !== source || report.reporterUid !== reporterUid || report.target !== role || report.targetAccountUid !== auth.uid) continue;
+        complaints.push({
+          id, orderId, source,
+          reasonCode: typeof report.reasonCode === 'string' ? report.reasonCode : '',
+          note: typeof report.note === 'string' ? report.note : '',
+          complaintStatus: typeof report.complaintStatus === 'string' ? report.complaintStatus : '',
+          createdAt: typeof report.createdAt === 'string' ? report.createdAt : '',
+          hasResponded: typeof report.targetResponse === 'string' && !!report.targetResponse
+        });
+      }
+      return jsonResponse({ success: true, orderId, complaints });
+    }
     async function handleComplaintCreate(request, accessToken) {
       const auth = await phase4aAuth(request, accessToken);
       if (auth.response) return auth.response;
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid complaint"); }
+      if (body?.type === 'participant_safety') {
+        if (!phase4aKeysOnly(body, ['orderId', 'type', 'reasonCode', 'target', 'note']) || !phase4aSafeSegment(body.orderId) || !participantSafetyTarget(auth.user.role, body.target, body.reasonCode) || typeof body.note !== 'string' || Array.from(body.note.trim()).length < 10 || Array.from(body.note).length > 500) return phase4aError('invalid_request', 'Invalid safety report');
+        const orderSnapshot = await getFirestoreSnapshot('orders', body.orderId, accessToken);
+        const order = orderSnapshot?.data;
+        const role = auth.user.role;
+        if (!order || order[role + 'Uid'] !== auth.uid) return phase4aError('forbidden', 'Report unavailable', 403);
+        if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+        const targetUid = order[body.target + 'Uid'];
+        if (!phase4aSafeSegment(targetUid) || targetUid === auth.uid || body.target === 'driver' && orderAssignedDriverUid(order) !== targetUid) return phase4aError('forbidden', 'Report target unavailable', 403);
+        const id = 'safety_' + body.orderId + '_' + auth.uid + '_' + body.target;
+        if (!phase4aSafeSegment(id)) return phase4aError('invalid_request', 'Invalid safety report');
+        const report = {
+          orderId: body.orderId, reporterUid: auth.uid, targetAccountUid: targetUid,
+          source: role, target: body.target, type: 'participant_safety', reasonCode: body.reasonCode,
+          note: body.note.trim(), complaintStatus: 'pending', reviewFinding: 'pending',
+          createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+        };
+        const existing = await getFirestoreDoc('delivery_complaints', id, accessToken);
+        if (existing) return existing.reporterUid === auth.uid && existing.orderId === body.orderId && existing.targetAccountUid === targetUid && existing.reasonCode === report.reasonCode && existing.note === report.note ? jsonResponse({ success: true, idempotent: true, complaint: complaintRefDto(existing) }) : phase4aError('idempotency_conflict', 'Safety report already exists', 409);
+        const created = await phase4aCommit([
+          { update: phase4aDoc('delivery_complaints', id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } },
+          await complaintEmailAlertWrite(id, report),
+          { verify: 'projects/tabbakheen-99883/databases/(default)/documents/orders/' + body.orderId, currentDocument: { updateTime: orderSnapshot.updateTime } },
+          { verify: 'projects/tabbakheen-99883/databases/(default)/documents/' + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + '/' + auth.uid, currentDocument: { exists: false } },
+          auth.deletionFence
+        ], accessToken);
+        if (!created) return phase4aError('state_conflict', 'Report changed; retry', 409);
+        return jsonResponse({ success: true, complaint: complaintRefDto({ ...report, _id: id }) });
+      }
       if (!phase4aKeysOnly(body, ["orderId", "type", "note", "target"]) || !phase4aSafeSegment(body?.orderId) || !["customer_rejected_receipt", "delivery_not_confirmed", "customer_complaint", "provider_complaint"].includes(body?.type) || typeof body?.note !== "string" || Array.from(body.note).length > 500 || (body.target !== undefined && !["customer", "provider", "driver"].includes(body.target))) return phase4aError("invalid_request", "Invalid complaint");
       const order = await getFirestoreDoc("orders", body.orderId, accessToken);
       const role = auth.user.role;
@@ -2040,8 +2282,32 @@
       const report = { orderId: body.orderId, customerUid: order.customerUid || "", providerUid: order.providerUid || "", driverUid: order.driverUid || "", status: order.status || "", deliveryStatus: order.deliveryStatus || "", source: role, target: body.target || "", type: body.type, note: body.note.trim(), complaintStatus: "pending", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
       const existing = await getFirestoreDoc("delivery_complaints", id, accessToken);
       if (existing) return existing.source === role && existing.orderId === body.orderId ? jsonResponse({ success: true, idempotent: true, complaint: complaintRefDto(existing) }) : phase4aError("idempotency_conflict", "Complaint already exists", 409);
-      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, auth.deletionFence], accessToken);
+      const created = await phase4aCommit([{ update: phase4aDoc("delivery_complaints", id, report), updateMask: { fieldPaths: Object.keys(report) }, currentDocument: { exists: false } }, await complaintEmailAlertWrite(id, report), auth.deletionFence], accessToken);
       return created ? jsonResponse({ success: true, complaint: complaintRefDto({ ...report, _id: id }) }) : phase4aError("state_conflict", "Complaint changed; retry", 409);
+    }
+    async function handleSafetyReportResponse(request, complaintId, accessToken) {
+      const auth = await phase4aAuth(request, accessToken);
+      if (auth.response) return auth.response;
+      if (!phase4aSafeSegment(complaintId)) return phase4aError('invalid_request', 'Invalid safety report');
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError('account_deletion_blocked', 'Account deletion is in progress', 403);
+      let body; try { body = await request.json(); } catch { return phase4aError('invalid_request', 'Invalid response'); }
+      if (!phase4aKeysOnly(body, ['response']) || typeof body.response !== 'string' || Array.from(body.response.trim()).length < 10 || Array.from(body.response).length > 1000) return phase4aError('invalid_request', 'Invalid response');
+      const snapshot = await getFirestoreSnapshot('delivery_complaints', complaintId, accessToken);
+      const report = snapshot?.data;
+      if (!report || report.type !== 'participant_safety' || report.target !== auth.user.role || report.targetAccountUid !== auth.uid) return phase4aError('not_found', 'Safety report unavailable', 404);
+      const orderSnapshot = await getFirestoreSnapshot('orders', report.orderId, accessToken);
+      const order = orderSnapshot?.data;
+      if (!order || order[report.target + 'Uid'] !== auth.uid || order[report.source + 'Uid'] !== report.reporterUid) return phase4aError('not_found', 'Safety report unavailable', 404);
+      const response = body.response.trim();
+      if (report.targetResponse) return report.targetResponse === response ? jsonResponse({ success: true, idempotent: true }) : phase4aError('response_exists', 'Response already recorded', 409);
+      const fields = { targetResponse: response, targetRespondedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      const committed = await phase4aCommit([
+        { update: phase4aDoc('delivery_complaints', complaintId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snapshot.updateTime } },
+        { verify: 'projects/tabbakheen-99883/databases/(default)/documents/orders/' + report.orderId, currentDocument: { updateTime: orderSnapshot.updateTime } },
+        { verify: 'projects/tabbakheen-99883/databases/(default)/documents/' + ACCOUNT_DELETION_IRREVERSIBLE_MARKERS + '/' + auth.uid, currentDocument: { exists: false } },
+        auth.deletionFence
+      ], accessToken);
+      return committed ? jsonResponse({ success: true }) : phase4aError('state_conflict', 'Report changed; retry', 409);
     }
     async function createFirestoreDocument(collectionPath, docId, fields, accessToken) {
       const url = docId ? `${FIRESTORE_BASE}/${collectionPath}/${docId}` : `${FIRESTORE_BASE}/${collectionPath}`;
@@ -3190,7 +3456,10 @@
         let preferenceFields = null;
         if (saveAsDefault) {
           const preference = read.get(preferenceName);
-          preferenceFields = { ...dropoff, label: typeof preference?.data?.label === "string" ? preference.data.label.slice(0, 80) : "", schemaVersion: 1 };
+          const saved = preference?.data;
+          const sameAddress = saved && ["lat", "lng", "addressLine", "city", "district"].every((field) => saved[field] === dropoff[field]);
+          preferenceFields = { ...dropoff, label: typeof saved?.label === "string" ? saved.label.slice(0, 80) : "",
+            ...(sameAddress && typeof saved.shortAddress === "string" && /^[A-Z]{4}[0-9]{4}$/.test(saved.shortAddress) ? { shortAddress: saved.shortAddress } : {}), schemaVersion: 1 };
           writes.push({ update: phase4aDoc(CUSTOMER_DELIVERY_PREFERENCES_COLLECTION, auth.uid, preferenceFields),
             updateTransforms: [{ fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" }],
             currentDocument: preference ? { updateTime: preference.updateTime } : { exists: false } });
@@ -3294,7 +3563,7 @@
       if (!addressLine || !city || !district) return null;
       return { success: true, addressLine, city, district, lat: value.lat, lng: value.lng, deliveryNotes: typeof value.deliveryNotes === "string" ? value.deliveryNotes.slice(0, 500) : "" };
     }
-    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, paymentMethod, accessToken, pricingSnapshot) {
+    async function commitDeliveryFinalizationV2(orderId, orderSnapshot, quoteId, quoteSnapshot, privateSnapshot, paymentMethod, accessToken, pricingSnapshot, fundingEnabled = false) {
       const uid = orderSnapshot.data.customerUid, providerUid = orderSnapshot.data.providerUid;
       if (!phase4aSafeSegment(uid) || !phase4aSafeSegment(providerUid)) return { ok: false, conflict: true };
       const name = (collection, id) => "projects/tabbakheen-99883/databases/(default)/documents/" + collection + "/" + id;
@@ -3324,11 +3593,19 @@
         if (!confirmed.ok || confirmed.pricingVersion !== quote.pricingVersion || confirmed.deliveryDistanceKm !== quote.deliveryDistanceKm || confirmed.deliveryFee !== quote.deliveryFee) return { abort: "STALE_DELIVERY_QUOTE" };
         const subtotal = order.priceSnapshot;
         if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return { abort: "ORDER_PRICE_INVALID" };
+        const fundingIntent = order.cashFundingIntentVersion === CASH_FUNDING_V1;
+        if (fundingIntent && (!fundingEnabled || order.paymentMethod !== "CASH" || paymentMethod !== "cod")) return { abort: "CASH_FUNDING_INELIGIBLE" };
+        if (fundingIntent) {
+          const advance = sarCents(subtotal), fee = sarCents(quote.deliveryFee);
+          if (advance === null || advance <= 0 || fee === null || !Number.isSafeInteger(advance + fee)) return { abort: "ORDER_PRICE_INVALID" };
+        }
         const stateVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
         const fields = { deliveryMethod: "driver", dropoffCity: quote.city, dropoffDistrict: quote.district, dropoffConfirmedAt: now,
-          deliveryDistanceKm: quote.deliveryDistanceKm, deliveryFee: quote.deliveryFee, totalAmount: subtotal + quote.deliveryFee,
+          deliveryDistanceKm: quote.deliveryDistanceKm, deliveryFee: quote.deliveryFee,
+          totalAmount: fundingIntent ? (sarCents(subtotal) + sarCents(quote.deliveryFee)) / 100 : subtotal + quote.deliveryFee,
           deliveryQuoteId: quoteId, deliveryPricingVersion: quote.pricingVersion, deliveryPaymentMethod: paymentMethod,
           platformDeliveryCommission: 0, driverGrossDeliveryEarnings: quote.deliveryFee, driverUid: null,
+          ...(fundingIntent ? { cashFundingVersion: CASH_FUNDING_V1 } : {}),
           deliveryStatus: "ready_for_driver", status: "searching_driver", deliveryStateVersion: stateVersion, updatedAt: now };
         const privateFields = { orderId, customerUid: uid, providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng,
           addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "",
@@ -3363,7 +3640,7 @@
         return { event, jobId: expected.jobId, fields: expected.fields, order: order.data, stateVersion: expected.stateVersion };
       }, 2, {}, 12);
       if (["committed", "reconciled"].includes(result.kind)) return { ok: true, ...result.value };
-      return { ok: false, conflict: result.kind !== "uncertain", uncertain: result.kind === "uncertain" };
+      return { ok: false, conflict: result.kind !== "uncertain", uncertain: result.kind === "uncertain", code: result.kind === "aborted" ? result.value : null };
     }
     function parseAppleSubscriptionStatusPayload(payload) {
       if (!payload || typeof payload !== "object") return null;
@@ -4008,6 +4285,399 @@
       return jsonResponse({ success: true });
     }
     const PRIVATE_DESTINATION_ORDER_CONTRACT = "explicit_v2";
+    const CASH_FUNDING_V1 = 1;
+    // Rev this code whenever the financial-risk notice changes after release;
+    // it is part of the driver's amount-specific consent terms.
+    const CASH_FUNDING_RISK_CODE = "DRIVER_ADVANCES_OWN_CASH_V1";
+    const CASH_FUNDING_RISK_NOTICE = Object.freeze({ code: CASH_FUNDING_RISK_CODE,
+      ar: "ستدفع قيمة الطعام من مالك للمزوّد. قد يتأخر أو يتعذّر تحصيل المبلغ من العميل، ولا يوجد تعويض تلقائي. لك حرية رفض الطلب دون التزام؛ اقبله فقط إذا وافقت على تحمّل هذه المخاطرة.",
+      en: "You pay the provider for the food with your own money. Customer cash collection may be delayed or fail, and there is no automatic reimbursement. You may decline without obligation; accept only if you choose this risk." });
+    function cashFundingV1Enabled(env) { return env?.CASH_FUNDING_V1_ENABLED === "true"; }
+    function sarCents(value) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER / 100) return null;
+      const cents = Math.round(value * 100);
+      return Number.isSafeInteger(cents) && cents / 100 === value ? cents : null;
+    }
+    function cashFundingAmounts(order) {
+      if (!order || order.cashFundingVersion !== CASH_FUNDING_V1 || order.cashFundingIntentVersion !== CASH_FUNDING_V1 || order.destinationContract !== PRIVATE_DESTINATION_ORDER_CONTRACT ||
+          order.paymentMethod !== "CASH" || order.deliveryPaymentMethod !== "cod" || !isDriverDeliveryMethod(order.deliveryMethod)) return null;
+      const food = sarCents(order.priceSnapshot), fee = sarCents(order.deliveryFee);
+      if (food === null || food <= 0 || fee === null || !Number.isSafeInteger(food + fee) ||
+          sarCents(order.totalAmount) !== food + fee || sarCents(order.driverGrossDeliveryEarnings) !== fee || order.platformDeliveryCommission !== 0) return null;
+      return { foodAdvanceSar: food / 100, deliveryFeeSar: fee / 100, customerCashTotalSar: (food + fee) / 100, currency: "SAR" };
+    }
+    function cashFundingTermsVersion(order, amounts) {
+      return JSON.stringify([CASH_FUNDING_V1, CASH_FUNDING_RISK_CODE, order._id || order.id,
+        order.status, order.deliveryStatus, order.deliveryStateVersion, order.updatedAt, order.deliveryQuoteId,
+        order.deliveryPricingVersion, sarCents(amounts.foodAdvanceSar), sarCents(amounts.deliveryFeeSar),
+        sarCents(amounts.customerCashTotalSar)]);
+    }
+    function cashFundingConsentMatches(order, orderId, amounts) {
+      const consent = order?.cashFundingDriverConsent;
+      if (!consent || typeof consent.termsVersion !== "string") return false;
+      let terms; try { terms = JSON.parse(consent.termsVersion); } catch { return false; }
+      return Array.isArray(terms) && terms.length === 12 && terms[0] === CASH_FUNDING_V1 &&
+        terms[1] === CASH_FUNDING_RISK_CODE && terms[2] === orderId &&
+        terms[7] === order.deliveryQuoteId && terms[8] === order.deliveryPricingVersion &&
+        terms[9] === sarCents(amounts.foodAdvanceSar) && terms[10] === sarCents(amounts.deliveryFeeSar) &&
+        terms[11] === sarCents(amounts.customerCashTotalSar) &&
+        consent.foodAdvanceSar === amounts.foodAdvanceSar && consent.deliveryFeeSar === amounts.deliveryFeeSar &&
+        consent.customerCashTotalSar === amounts.customerCashTotalSar;
+    }
+    function cashFundingPublicState(order, amounts) {
+      return { contractVersion: CASH_FUNDING_V1, orderId: order._id || order.id,
+        ...amounts, platformDeliveryCommissionSar: 0, financialRiskNotice: CASH_FUNDING_RISK_NOTICE,
+        providerReceiptAcknowledged: !!order.cashFundingProviderReceipt,
+        driverCollectionReported: !!order.cashFundingCollectionReport,
+        customerCollectionAcknowledged: !!order.cashFundingCustomerAcknowledgment,
+        termsVersion: typeof order.cashFundingDriverConsent?.termsVersion === "string" ? order.cashFundingDriverConsent.termsVersion : null,
+        onHold: !!order.cashFundingHold, deliveryStateVersion: order.deliveryStateVersion,
+        driverReleasedNoAdvance: !!order.cashFundingDriverRelease,
+        providerAttestedNoReceipt: !!order.cashFundingProviderNoReceipt };
+    }
+    async function cashFundingV1Read(request, orderId, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken)) return phase4aError("account_deletion_blocked", "Account deletion is in progress", 403);
+      const order = await getFirestoreDoc("orders", orderId, accessToken);
+      const role = auth.user.role;
+      const participant = order && ["customer", "provider", "driver"].includes(role) && order[role + "Uid"] === auth.uid;
+      if (!order) return phase4aError("not_found", "Order unavailable", 404);
+      if (order.cashFundingVersion !== CASH_FUNDING_V1) return phase4aError("not_found", "Cash funding unavailable", 404);
+      if (participant && order.cashFundingSelfPickupConversion && order.deliveryMethod === "self_pickup")
+        return jsonResponse({ success: true, contractVersion: CASH_FUNDING_V1, orderId,
+          recoveryState: "self_pickup", foodAmountSar: order.cashFundingSelfPickupConversion.foodAmountSar,
+          currency: "SAR", providerSelfPickupReceiptAcknowledged: !!order.cashFundingSelfPickupReceipt,
+          paymentStatus: order.cashFundingSelfPickupReceipt ? "PAID_CONFIRMED" : "PENDING" });
+      const amounts = cashFundingAmounts(order);
+      if (!amounts) return phase4aError("cash_funding_invalid", "Cash funding snapshot is invalid", 409);
+      if (participant) return jsonResponse({ success: true, ...cashFundingPublicState(order, amounts) });
+      if (role !== "driver" || !cashFundingV1Enabled(env) || order.cashFundingHold) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const runtime = await getFirestoreDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid, accessToken);
+      if (auth.user.isAvailable !== true || !evaluateSubscriptionEntitlement(auth.user).eligible ||
+          !driverRuntimeLocationStatus(runtime).fresh || !driverOrderMatchV2(order, auth.uid, runtime, driverDistancePreferences(auth.user))) return phase4aError("not_found", "Cash funding unavailable", 404);
+      return jsonResponse({ success: true, ...cashFundingPublicState(order, amounts),
+        termsVersion: cashFundingTermsVersion(order, amounts) });
+    }
+    async function deliveryClassificationV1(request, orderId, env, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (auth.user.role !== "driver") return phase4aError("forbidden", "Driver account required", 403);
+      if (await getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, auth.uid, accessToken))
+        return phase4aError("account_deletion_blocked", "Account deletion is in progress", 403);
+      const [order, runtime] = await Promise.all([
+        getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid, accessToken)
+      ]);
+      if (!order || auth.user.isAvailable !== true || !evaluateSubscriptionEntitlement(auth.user).eligible ||
+          !driverRuntimeLocationStatus(runtime).fresh || !driverOrderMatchV2(order, auth.uid, runtime, driverDistancePreferences(auth.user)) ||
+          order.cashFundingHold || order.cashFundingDriverRelease) return phase4aError("not_found", "Delivery unavailable", 404);
+      if (!phase4aSafeSegment(order.customerUid) || !phase4aSafeSegment(order.providerUid)) return phase4aError("not_found", "Delivery unavailable", 404);
+      const members = [order.customerUid, order.providerUid];
+      const guards = await Promise.all(members.flatMap((uid) => [
+        getFirestoreDoc("account_deletion_requests", uid, accessToken),
+        getFirestoreDoc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid, accessToken)
+      ]));
+      if (guards.some(Boolean)) return phase4aError("not_found", "Delivery unavailable", 404);
+      if ((order.cashFundingIntentVersion === CASH_FUNDING_V1 && order.cashFundingVersion !== CASH_FUNDING_V1) ||
+          (order.cashFundingVersion === CASH_FUNDING_V1 && !cashFundingAmounts(order)))
+        return phase4aError("cash_funding_invalid", "Funding snapshot is invalid", 409);
+      const kind = order.cashFundingVersion === CASH_FUNDING_V1 ? "funded_cash_v1" :
+        order.paymentMethod === "CASH" && order.deliveryPaymentMethod === "cod" ? "ordinary_cod" : "other";
+      return jsonResponse({ success: true, contractVersion: 1, orderId, kind,
+        acceptanceEnabled: kind !== "funded_cash_v1" || cashFundingV1Enabled(env) });
+    }
+    async function cashFundingV1Accept(request, orderId, env, accessToken) {
+      if (!cashFundingV1Enabled(env)) return phase4aError("cash_funding_disabled", "Cash funding is unavailable", 503);
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      if (auth.user.role !== "driver") return phase4aError("forbidden", "Driver account required", 403);
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid consent"); }
+      if (!phase4aKeysOnly(body, ["termsVersion", "consent"]) || body.consent !== true || typeof body.termsVersion !== "string" || body.termsVersion.length > 1024) return phase4aError("invalid_request", "Explicit terms consent is required");
+      const initial = await getFirestoreSnapshot("orders", orderId, accessToken);
+      const order = initial?.data, amounts = cashFundingAmounts(order);
+      if (!amounts || !phase4aSafeSegment(order.customerUid) || !phase4aSafeSegment(order.providerUid)) return phase4aError("not_found", "Cash funding unavailable", 404);
+      if (order.driverUid === auth.uid && !order.cashFundingDriverRelease && order.cashFundingDriverConsent?.termsVersion === body.termsVersion && order.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: order.deliveryStatus });
+      const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
+      const eventId = notificationEventId(orderId, "driver_assigned", nextVersion);
+      const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
+      const orderName = doc("orders", orderId), userName = doc("users", auth.uid);
+      const locationName = doc(DRIVER_RUNTIME_LOCATION_COLLECTION, auth.uid), eventName = doc("order_transition_events", eventId);
+      const consentId = orderId + "_driver_consent_" + nextVersion;
+      const consentName = doc("order_cash_funding_events", consentId);
+      const members = [order.customerUid, order.providerUid, auth.uid];
+      const deletionNames = members.flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
+      const now = new Date().toISOString();
+      const result = await firestoreReadWriteTransaction([orderName, userName, locationName, eventName, consentName, ...deletionNames], accessToken, (read) => {
+        const current = read.get(orderName), driver = read.get(userName)?.data;
+        const location = read.get(locationName)?.data;
+        if (!current || current.updateTime !== initial.updateTime || read.get(eventName) || read.get(consentName)) return { abort: "stale_terms" };
+        if (deletionNames.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
+        const active = current.data, exact = cashFundingAmounts(active);
+        if (!exact || active.cashFundingHold || cashFundingTermsVersion(active, exact) !== body.termsVersion ||
+            active.driverUid || active.deliveryStatus !== "ready_for_driver" || active.status !== "searching_driver" ||
+            !driver || driver.role !== "driver" || driver.isAvailable !== true || !evaluateSubscriptionEntitlement(driver).eligible ||
+            !driverRuntimeLocationStatus(location).fresh || !driverOrderMatchV2(active, auth.uid, location, driverDistancePreferences(driver))) return { abort: "stale_terms" };
+        const consent = { driverUid: auth.uid, termsVersion: body.termsVersion, ...exact, acceptedAt: now };
+        const fields = { driverUid: auth.uid, deliveryStatus: "driver_assigned", driverAssignedAt: now,
+          deliveryStateVersion: nextVersion, cashFundingDriverConsent: consent, updatedAt: now };
+        const event = { orderId, transition: "driver_assigned", stateVersion: nextVersion, status: "pending", createdAt: now };
+        return { writes: [
+          { update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: current.updateTime } },
+          { update: phase4aDoc("order_transition_events", eventId, event), currentDocument: { exists: false } },
+          { update: phase4aDoc("order_cash_funding_events", consentId, { orderId, type: "driver_consent", actorUid: auth.uid, ...exact, termsVersion: body.termsVersion, createdAt: now }), currentDocument: { exists: false } },
+          ...trackingJobWrite(orderId, eventId, now)
+        ], value: true, expected: true };
+      }, async () => {
+        const [latest, event, consent] = await Promise.all([getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_transition_events", eventId, accessToken), getFirestoreDoc("order_cash_funding_events", consentId, accessToken)]);
+        return !!latest && latest.driverUid === auth.uid && latest.deliveryStatus === "driver_assigned" && latest.cashFundingDriverConsent?.termsVersion === body.termsVersion && event?.orderId === orderId && event.transition === "driver_assigned" && consent?.actorUid === auth.uid && consent.termsVersion === body.termsVersion;
+      }, 2, {}, 11);
+      if (["committed", "reconciled"].includes(result.kind)) {
+        // The atomic outbox event is durable; Cron owns bounded dispatch.
+        return jsonResponse({ success: true, orderId, deliveryStatus: "driver_assigned", ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
+      }
+      if (result.kind === "uncertain") return phase4aError("state_uncertain", "Acceptance outcome uncertain; refresh before retrying", 503);
+      const latest = await getFirestoreDoc("orders", orderId, accessToken);
+      if (latest?.driverUid === auth.uid && !latest.cashFundingDriverRelease && latest.cashFundingDriverConsent?.termsVersion === body.termsVersion && latest.deliveryStatus === "driver_assigned") return jsonResponse({ success: true, idempotent: true, orderId, deliveryStatus: latest.deliveryStatus });
+      return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" : "stale_terms", "Cash-funding terms or assignment changed", 409);
+    }
+    async function cashFundingV1Record(request, orderId, action, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid cash-funding event"); }
+      const issue = action === "issue";
+      if (issue ? (!phase4aKeysOnly(body, ["kind"]) || !["provider_refusal", "customer_no_show", "dispute"].includes(body.kind))
+        : (!phase4aKeysOnly(body, ["termsVersion", "amountSar", "currency", action === "collection-report" ? "reportedCollected" : "acknowledged"]) ||
+            typeof body.termsVersion !== "string" || body.termsVersion.length > 300 || body.currency !== "SAR" ||
+            sarCents(body.amountSar) === null || body[action === "collection-report" ? "reportedCollected" : "acknowledged"] !== true)) return phase4aError("invalid_request", "Invalid cash-funding event");
+      const field = { "provider-receipt": "cashFundingProviderReceipt", "collection-report": "cashFundingCollectionReport", "customer-ack": "cashFundingCustomerAcknowledgment", issue: "cashFundingHold" }[action];
+      if (!field) return phase4aError("invalid_request", "Invalid cash-funding event");
+      const orderSnapshot = await getFirestoreSnapshot("orders", orderId, accessToken), order = orderSnapshot?.data;
+      const amounts = cashFundingAmounts(order);
+      if (!amounts) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const role = auth.user.role;
+      if (order[role + "Uid"] !== auth.uid || action === "provider-receipt" && role !== "provider" ||
+          action === "collection-report" && role !== "driver" || action === "customer-ack" && role !== "customer" ||
+          issue && !["customer", "provider", "driver"].includes(role)) return phase4aError("not_found", "Cash funding unavailable", 404);
+      const amount = action === "provider-receipt" ? amounts.foodAdvanceSar : amounts.customerCashTotalSar;
+      if (!issue && (sarCents(body.amountSar) !== sarCents(amount) || body.termsVersion !== order.cashFundingDriverConsent?.termsVersion)) return phase4aError("stale_terms", "Cash-funding amount or terms changed", 409);
+      if (issue && (body.kind === "provider_refusal" && role !== "provider" || body.kind === "customer_no_show" && role !== "driver")) return phase4aError("forbidden", "Issue is unavailable", 403);
+      const existing = order[field];
+      const same = (value) => value?.actorUid === auth.uid && (issue ? value.kind === body.kind :
+        value.termsVersion === body.termsVersion && sarCents(value.amountSar) === sarCents(amount));
+      const eventId = orderId + "_" + (issue ? "issue_" + auth.uid + "_" + body.kind : action);
+      const casePossible = issue || action === "provider-receipt";
+      const caseReason = issue ? body.kind : "conflicting_payment_evidence";
+      const complaintId = casePossible ? "cash_" + (await sha256Hex("cash-funding-issue:" + eventId)).slice(0, 48) : null;
+      const complaintRecorded = async (required) => {
+        if (!required) return true;
+        const alertId = "a_" + (await sha256Hex("complaint-email:" + complaintId)).slice(0, 48);
+        const [complaint, alert] = await Promise.all([
+          getFirestoreDoc("delivery_complaints", complaintId, accessToken),
+          getFirestoreDoc("complaint_email_alerts", alertId, accessToken)
+        ]);
+        return complaint?.orderId === orderId && complaint.reporterUid === auth.uid &&
+          complaint.type === "cash_funding_issue" && complaint.reasonCode === caseReason &&
+          alert?.complaintId === complaintId;
+      };
+      if (existing) return same(existing) && await complaintRecorded(issue || action === "provider-receipt" && order.cashFundingHold?.kind === "conflicting_payment_evidence") ? jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action }) : phase4aError("event_exists", "Cash-funding event already recorded", 409);
+      const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
+      const orderName = doc("orders", orderId), eventName = doc("order_cash_funding_events", eventId), userName = doc("users", auth.uid);
+      const complaintName = casePossible ? doc("delivery_complaints", complaintId) : null;
+      const members = [order.customerUid, order.providerUid, order.driverUid];
+      if (members.some((uid) => !phase4aSafeSegment(uid))) return phase4aError("state_conflict", "Order participants unavailable", 409);
+      const fences = members.flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
+      const now = new Date().toISOString();
+      const alertWrite = casePossible ? await complaintEmailAlertWrite(complaintId, { orderId, type: "cash_funding_issue", createdAt: now }) : null;
+      const result = await firestoreReadWriteTransaction([orderName, eventName, userName, ...fences, ...(casePossible ? [complaintName] : [])], accessToken, (read) => {
+        const current = read.get(orderName), actor = read.get(userName)?.data;
+        if (!current || current.updateTime !== orderSnapshot.updateTime || read.get(eventName) || casePossible && read.get(complaintName) || !actor || actor.role !== role ||
+            ["suspended", "disabled"].includes(actor.accountStatus)) return { abort: "state_conflict" };
+        if (fences.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
+        const latest = current.data, exact = cashFundingAmounts(latest);
+        if (!exact || latest[role + "Uid"] !== auth.uid || latest[field] || !latest.cashFundingDriverConsent ||
+            latest.cashFundingDriverConsent.driverUid !== latest.driverUid ||
+            latest.cashFundingDriverConsent.foodAdvanceSar !== exact.foodAdvanceSar ||
+            latest.cashFundingDriverConsent.deliveryFeeSar !== exact.deliveryFeeSar ||
+            latest.cashFundingDriverConsent.customerCashTotalSar !== exact.customerCashTotalSar) return { abort: "state_conflict" };
+        if (!issue && (body.termsVersion !== latest.cashFundingDriverConsent.termsVersion ||
+            sarCents(body.amountSar) !== sarCents(action === "provider-receipt" ? exact.foodAdvanceSar : exact.customerCashTotalSar))) return { abort: "stale_terms" };
+        if (action === "provider-receipt" && (latest.deliveryStatus !== "driver_assigned" || latest.cashFundingHold) ||
+            action === "collection-report" && (!latest.cashFundingProviderReceipt || latest.cashFundingHold || !["arrived", "delivered_pending_confirmation", "delivered"].includes(latest.deliveryStatus)) ||
+            action === "customer-ack" && (!latest.cashFundingCollectionReport || latest.cashFundingHold || !["delivered_pending_confirmation", "delivered"].includes(latest.deliveryStatus)) ||
+            issue && (body.kind === "provider_refusal" && (!!latest.cashFundingProviderReceipt || latest.deliveryStatus !== "driver_assigned") ||
+              body.kind === "customer_no_show" && (!latest.cashFundingProviderReceipt || !["arrived", "delivered_pending_confirmation"].includes(latest.deliveryStatus)))) return { abort: "transition_not_allowed" };
+        const recorded = issue ? { kind: body.kind, actorUid: auth.uid, actorRole: role, createdAt: now } :
+          { actorUid: auth.uid, actorRole: role, termsVersion: body.termsVersion,
+            amountSar: action === "provider-receipt" ? exact.foodAdvanceSar : exact.customerCashTotalSar,
+            currency: "SAR", createdAt: now, evidenceState: action === "customer-ack" ? "customer_acknowledged" : action === "collection-report" ? "driver_reported" : "provider_acknowledged" };
+        const fields = { [field]: recorded, updatedAt: now };
+        if (action === "provider-receipt" && (latest.cashFundingDriverRelease || latest.cashFundingProviderNoReceipt))
+          fields.cashFundingHold = { kind: "conflicting_payment_evidence", actorUid: auth.uid, actorRole: role, createdAt: now };
+        const caseRequired = issue || !!fields.cashFundingHold;
+        return { writes: [
+          { update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: current.updateTime } },
+          { update: phase4aDoc("order_cash_funding_events", eventId, { orderId, type: action, ...recorded }), currentDocument: { exists: false } },
+          ...(caseRequired ? [{ update: phase4aDoc("delivery_complaints", complaintId, {
+            orderId, reporterUid: auth.uid, source: role, target: "admin", type: "cash_funding_issue",
+            reasonCode: caseReason, note: "", complaintStatus: "pending", createdAt: now, updatedAt: now
+          }), currentDocument: { exists: false } }, alertWrite] : [])
+        ], value: true, expected: { recorded, caseRequired } };
+      }, async (expected) => {
+        const [latest, event, complaint, alert] = await Promise.all([getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_cash_funding_events", eventId, accessToken), expected.caseRequired ? getFirestoreDoc("delivery_complaints", complaintId, accessToken) : null, expected.caseRequired ? getFirestoreDoc("complaint_email_alerts", alertWrite.update.name.split("/").at(-1), accessToken) : null]);
+        return !!latest && !!event && (!expected.caseRequired || complaint?.reporterUid === auth.uid && complaint?.reasonCode === caseReason && alert?.complaintId === complaintId) && same(latest[field]) && event.actorUid === auth.uid && event.createdAt === expected.recorded.createdAt;
+      }, 2, {}, casePossible ? 10 : 9);
+      if (["committed", "reconciled"].includes(result.kind)) return jsonResponse({ success: true, orderId, state: issue ? "manual_review" : action, ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
+      if (result.kind === "uncertain") return phase4aError("state_uncertain", "Event outcome uncertain; refresh before retrying", 503);
+      const latest = await getFirestoreDoc("orders", orderId, accessToken);
+      if (same(latest?.[field]) && await complaintRecorded(issue || action === "provider-receipt" && latest?.cashFundingHold?.kind === "conflicting_payment_evidence")) return jsonResponse({ success: true, idempotent: true, orderId, state: issue ? "manual_review" : action });
+      return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" : result.value || "state_conflict", "Cash-funding state changed", 409);
+    }
+    async function cashFundingV1Recovery(request, orderId, action, accessToken) {
+      const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
+      let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid recovery request"); }
+      const release = action === "release-no-advance", noReceipt = action === "provider-no-receipt";
+      const convert = action === "convert-self-pickup", receipt = action === "self-pickup-receipt";
+      if (!release && !noReceipt && !convert && !receipt) return phase4aError("invalid_request", "Invalid recovery action");
+      if (release || noReceipt) {
+        if (!phase4aKeysOnly(body, ["termsVersion", release ? "noAdvanceAttested" : "noCashReceived"]) ||
+            typeof body.termsVersion !== "string" || body.termsVersion.length > 300 || body[release ? "noAdvanceAttested" : "noCashReceived"] !== true)
+          return phase4aError("invalid_request", "Explicit attestation required");
+      } else if (convert) {
+        if (!phase4aKeysOnly(body, ["expectedDeliveryStateVersion", "confirmSelfPickup"]) ||
+            !Number.isSafeInteger(body.expectedDeliveryStateVersion) || body.confirmSelfPickup !== true)
+          return phase4aError("invalid_request", "Explicit self-pickup request required");
+      } else if (!phase4aKeysOnly(body, ["amountSar", "currency", "acknowledged"]) ||
+          body.currency !== "SAR" || body.acknowledged !== true || sarCents(body.amountSar) === null)
+        return phase4aError("invalid_request", "Explicit provider receipt required");
+      const role = release ? "driver" : noReceipt || receipt ? "provider" : "customer";
+      const initial = await getFirestoreSnapshot("orders", orderId, accessToken), order = initial?.data;
+      if (!order || auth.user.role !== role || (release && order.driverUid !== auth.uid) ||
+          (!release && order[role + "Uid"] !== auth.uid)) return phase4aError("not_found", "Recovery unavailable", 404);
+      if (order.cashFundingVersion !== CASH_FUNDING_V1 || order.cashFundingIntentVersion !== CASH_FUNDING_V1)
+        return phase4aError("not_found", "Cash-funding recovery unavailable", 404);
+      const field = release ? "cashFundingDriverRelease" : noReceipt ? "cashFundingProviderNoReceipt" :
+        convert ? "cashFundingSelfPickupConversion" : "cashFundingSelfPickupReceipt";
+      const same = (value) => value?.actorUid === auth.uid &&
+        (release || noReceipt ? value.termsVersion === body.termsVersion :
+          convert ? value.expectedDeliveryStateVersion === body.expectedDeliveryStateVersion :
+            sarCents(value.amountSar) === sarCents(body.amountSar));
+      const auditId = orderId + "_" + action;
+      const auditConsistent = async (value) => {
+        if (!same(value) || typeof value.createdAt !== "string") return false;
+        const audit = await getFirestoreDoc("order_cash_funding_events", auditId, accessToken);
+        if (!audit || audit.actorUid !== auth.uid || audit.createdAt !== value.createdAt || audit.type !== action) return false;
+        if (convert) {
+          const outbox = await getFirestoreDoc("order_transition_events",
+            notificationEventId(orderId, "self_pickup_selected", body.expectedDeliveryStateVersion + 1), accessToken);
+          if (!outbox || outbox.transition !== "self_pickup_selected" || outbox.orderId !== orderId) return false;
+        }
+        return true;
+      };
+      if (order[field]) return await auditConsistent(order[field]) ?
+        jsonResponse({ success: true, idempotent: true, orderId, state: action }) :
+        phase4aError("event_exists", "Recovery action or audit conflicts", 409);
+      if (convert && order.cashFundingVersion === CASH_FUNDING_V1 &&
+          Number(order.deliveryStateVersion) !== body.expectedDeliveryStateVersion)
+        return phase4aError("stale_terms", "Order changed; refresh before conversion", 409);
+      const doc = (collection, id) => phase4aDoc(collection, id, {}).name;
+      const orderName = doc("orders", orderId), eventId = auditId;
+      const auditName = doc("order_cash_funding_events", eventId), userName = doc("users", auth.uid);
+      const providerReceiptName = doc("order_cash_funding_events", orderId + "_provider-receipt");
+      const releaseName = doc("order_cash_funding_events", orderId + "_release-no-advance");
+      const transitionId = convert ? notificationEventId(orderId, "self_pickup_selected", (Number(order.deliveryStateVersion) || 0) + 1) : null;
+      const transitionName = transitionId ? doc("order_transition_events", transitionId) : null;
+      const members = [order.customerUid, order.providerUid, ...(!receipt && order.driverUid ? [order.driverUid] : [])];
+      if (members.some((uid) => !phase4aSafeSegment(uid))) return phase4aError("state_conflict", "Order participants unavailable", 409);
+      const fences = [...new Set(members)].flatMap((uid) => [doc("account_deletion_requests", uid), doc(ACCOUNT_DELETION_IRREVERSIBLE_MARKERS, uid)]);
+      const names = [...new Set([orderName, auditName, userName, providerReceiptName,
+        ...(convert ? [releaseName, transitionName] : noReceipt ? [releaseName] : []), ...fences])];
+      const now = new Date().toISOString();
+      const result = await firestoreReadWriteTransaction(names, accessToken, (read) => {
+        const current = read.get(orderName), actor = read.get(userName)?.data;
+        if (!current || current.updateTime !== initial.updateTime || read.get(auditName) ||
+            !actor || actor.role !== role || ["suspended", "disabled"].includes(actor.accountStatus)) return { abort: "state_conflict" };
+        if (fences.some((name) => read.get(name))) return { abort: "account_deletion_blocked" };
+        const latest = current.data, exact = cashFundingAmounts(latest);
+        if (latest[field] || latest.cashFundingHold || latest.paymentStatus !== "PENDING" ||
+            latest.cashFundingProviderReceipt || latest.cashFundingCollectionReport || latest.cashFundingCustomerAcknowledgment ||
+            read.get(providerReceiptName)) return { abort: "manual_review_required" };
+        if (release || noReceipt || convert) {
+          if (!exact || latest.status !== "searching_driver" ||
+              !["ready_for_driver", "driver_assigned"].includes(latest.deliveryStatus) ||
+              latest.pickedUpAt || latest.completedAt) return { abort: "transition_not_allowed" };
+        }
+        if (release || noReceipt) {
+          if (latest.driverUid !== order.driverUid || !latest.driverUid || latest.deliveryStatus !== "driver_assigned" ||
+              !cashFundingConsentMatches(latest, orderId, exact) || latest.cashFundingDriverConsent.driverUid !== latest.driverUid ||
+              latest.cashFundingDriverConsent.termsVersion !== body.termsVersion ||
+              latest.cashFundingDriverConsent.foodAdvanceSar !== exact.foodAdvanceSar ||
+              latest.cashFundingDriverConsent.deliveryFeeSar !== exact.deliveryFeeSar ||
+              latest.cashFundingDriverConsent.customerCashTotalSar !== exact.customerCashTotalSar ||
+              (release && latest.driverUid !== auth.uid) || (noReceipt &&
+                (latest.providerUid !== auth.uid || latest.cashFundingDriverRelease?.actorUid !== latest.driverUid ||
+                  latest.cashFundingDriverRelease?.termsVersion !== body.termsVersion || !read.get(releaseName))))
+            return { abort: "stale_terms" };
+        }
+        if (convert) {
+          if (latest.customerUid !== auth.uid || Number(latest.deliveryStateVersion) !== body.expectedDeliveryStateVersion ||
+              latest.driverUid && (latest.deliveryStatus !== "driver_assigned" ||
+                latest.cashFundingDriverRelease?.actorUid !== latest.driverUid ||
+                !cashFundingConsentMatches(latest, orderId, exact) ||
+                latest.cashFundingDriverRelease?.termsVersion !== latest.cashFundingDriverConsent.termsVersion ||
+                latest.cashFundingProviderNoReceipt?.termsVersion !== latest.cashFundingDriverConsent.termsVersion ||
+                latest.cashFundingProviderNoReceipt?.actorUid !== latest.providerUid ||
+                !read.get(releaseName)) ||
+              !latest.driverUid && (latest.deliveryStatus !== "ready_for_driver" ||
+                latest.cashFundingDriverConsent || latest.cashFundingDriverRelease || latest.cashFundingProviderNoReceipt) ||
+              read.get(transitionName)) return { abort: "state_conflict" };
+        }
+        if (receipt) {
+          if (latest.providerUid !== auth.uid || latest.cashFundingVersion !== CASH_FUNDING_V1 ||
+              !latest.cashFundingSelfPickupConversion || latest.deliveryMethod !== "self_pickup" ||
+              !["self_pickup_selected", "delivered"].includes(latest.deliveryStatus) ||
+              sarCents(latest.cashFundingSelfPickupConversion.foodAmountSar) !== sarCents(body.amountSar) ||
+              sarCents(latest.totalAmount) !== sarCents(body.amountSar)) return { abort: "stale_terms" };
+        }
+        const recorded = { actorUid: auth.uid, actorRole: role, createdAt: now,
+          ...(release || noReceipt ? { termsVersion: body.termsVersion, foodAmountSar: exact.foodAdvanceSar } :
+            convert ? { expectedDeliveryStateVersion: body.expectedDeliveryStateVersion, foodAmountSar: exact.foodAdvanceSar,
+              driverWasAssigned: !!latest.driverUid } : { amountSar: body.amountSar, currency: "SAR" }) };
+        const fields = { [field]: recorded, updatedAt: now };
+        const writes = [];
+        if (convert) {
+          const stateVersion = (Number(latest.deliveryStateVersion) || 0) + 1;
+          Object.assign(fields, { deliveryMethod: "self_pickup", deliveryStatus: "self_pickup_selected",
+            status: "ready_for_pickup", driverUid: null, deliveryQuoteId: null, deliveryPricingVersion: null,
+            deliveryFee: 0, deliveryDistanceKm: 0, driverGrossDeliveryEarnings: 0,
+            totalAmount: exact.foodAdvanceSar, deliveryPaymentMethod: null, dropoffCity: null,
+            dropoffDistrict: null, dropoffConfirmedAt: null, driverStatus: null,
+            driverAssignedAt: null, driverSearchCancelledAt: now, deliveryStateVersion: stateVersion });
+          writes.push({ update: phase4aDoc("order_transition_events", transitionId,
+            { orderId, transition: "self_pickup_selected", stateVersion, status: "pending", createdAt: now }),
+            currentDocument: { exists: false } });
+          writes.push({ delete: doc(ORDER_DELIVERY_PRIVATE_COLLECTION, orderId) });
+          writes.push(...trackingJobWrite(orderId, transitionId, now));
+        }
+        if (receipt) fields.paymentStatus = "PAID_CONFIRMED";
+        writes.unshift({ update: phase4aDoc("orders", orderId, fields), updateMask: { fieldPaths: Object.keys(fields) },
+          currentDocument: { updateTime: current.updateTime } });
+        if (convert) writes[0].updateMask.fieldPaths.push(...ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS);
+        writes.push({ update: phase4aDoc("order_cash_funding_events", eventId,
+          { orderId, type: action, ...recorded }), currentDocument: { exists: false } });
+        return { writes, value: true, expected: recorded };
+      }, async (expected) => {
+        const [latest, event] = await Promise.all([
+          getFirestoreDoc("orders", orderId, accessToken), getFirestoreDoc("order_cash_funding_events", eventId, accessToken)
+        ]);
+        return !!latest && !!event && same(latest[field]) && event.actorUid === auth.uid && event.createdAt === expected.createdAt &&
+          (!convert || latest.deliveryMethod === "self_pickup" && latest.driverUid === null &&
+            sarCents(latest.totalAmount) === sarCents(expected.foodAmountSar)) &&
+          (!receipt || latest.paymentStatus === "PAID_CONFIRMED");
+      }, 2, {}, 12);
+      if (["committed", "reconciled"].includes(result.kind)) return jsonResponse({ success: true, orderId, state: action,
+        ...(result.kind === "reconciled" ? { idempotent: true } : {}) });
+      if (result.kind === "uncertain") return phase4aError("state_uncertain", "Recovery outcome uncertain; refresh before retrying", 503);
+      const latest = await getFirestoreDoc("orders", orderId, accessToken);
+      if (await auditConsistent(latest?.[field])) return jsonResponse({ success: true, idempotent: true, orderId, state: action });
+      return phase4aError(result.value === "account_deletion_blocked" ? "account_deletion_blocked" :
+        result.value || "state_conflict", "Recovery blocked; refresh or request manual review", 409);
+    }
     // A missing binding is deliberately OFF. Existing V2 orders continue
     // through the V2 delivery paths when new creation is disabled.
     function v2OrderCreationEnabled(env) {
@@ -4022,15 +4692,18 @@
       const auth = await phase4aAuth(request, accessToken); if (auth.response) return auth.response;
       if (auth.user.role !== "customer") return phase4aError("forbidden", "Customer account required", 403);
       let body; try { body = await request.json(); } catch { return phase4aError("invalid_request", "Invalid request"); }
-      if (!phase4aKeysOnly(body, ["requestId", "providerUid", "offerId", "quantity", "paymentMethod", "note"]) || !phase4aSafeSegment(body.requestId) || !phase4aSafeSegment(body.offerId) || !phase4aSafeSegment(body.providerUid)) return phase4aError("invalid_request", "Invalid order request");
+      if (!phase4aKeysOnly(body, ["requestId", "providerUid", "offerId", "quantity", "paymentMethod", "note", ...(privateDestinationCreation ? ["cashFundingVersion"] : [])]) || !phase4aSafeSegment(body.requestId) || !phase4aSafeSegment(body.offerId) || !phase4aSafeSegment(body.providerUid)) return phase4aError("invalid_request", "Invalid order request");
       const quantity = body.quantity, paymentMethod = String(body.paymentMethod || "").trim().toLowerCase();
       if (typeof quantity !== "number" || !Number.isInteger(quantity) || quantity !== 1) return phase4aError("invalid_quantity", "Quantity must be one");
       if (!["cash", "cod", "bank_transfer", "stc", "stc_pay"].includes(paymentMethod)) return phase4aError("invalid_payment_method", "Unsupported payment method");
       const canonicalPaymentMethod = { cash: "CASH", cod: "CASH", bank_transfer: "BANK_TRANSFER", stc: "STC_PAY", stc_pay: "STC_PAY" }[paymentMethod];
+      const fundingIntent = body.cashFundingVersion === CASH_FUNDING_V1;
+      if (body.cashFundingVersion !== undefined && (!fundingIntent || !privateDestinationCreation || canonicalPaymentMethod !== "CASH")) return phase4aError("cash_funding_ineligible", "Cash funding is unavailable for this order", 409);
+      if (fundingIntent && !cashFundingV1Enabled(env)) return phase4aError("cash_funding_disabled", "Cash funding is unavailable", 503);
       const input = { offerId: body.offerId, quantity, paymentMethod: canonicalPaymentMethod, note: typeof body.note === "string" ? body.note.trim().slice(0, 1000) : "" };
       // Keep the legacy hash byte-for-byte compatible with existing request IDs.
       // A request ID cannot replay across the two creation contracts.
-      const intentHash = JSON.stringify(privateDestinationCreation ? { ...input, destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : input);
+      const intentHash = JSON.stringify(privateDestinationCreation ? { ...input, destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT, ...(fundingIntent ? { cashFundingVersion: CASH_FUNDING_V1 } : {}) } : input);
       const idemPath = "order_creation_requests", idemId = auth.uid + "_" + body.requestId.trim();
       const providerUid = body.providerUid, now = new Date().toISOString(), orderId = crypto.randomUUID();
       const orderNumber = "TB-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + orderId.slice(0, 8).toUpperCase();
@@ -4054,7 +4727,7 @@
         return parseFirestoreDoc(document);
       };
       const matchesCreationContract = (order) => privateDestinationCreation
-        ? isPrivateDestinationOrder(order) && !ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS.some((field) => Object.prototype.hasOwnProperty.call(order, field))
+        ? isPrivateDestinationOrder(order) && (order.cashFundingIntentVersion === CASH_FUNDING_V1) === fundingIntent && !ORDER_PREASSIGNMENT_PRIVATE_FIELD_PATHS.some((field) => Object.prototype.hasOwnProperty.call(order, field))
         : order?.destinationContract == null;
       const replay = async (existingOrderId) => {
         if (!phase4aSafeSegment(existingOrderId)) return null;
@@ -4101,6 +4774,7 @@
         if ((canonicalPaymentMethod === "STC_PAY" && methods.stcPay?.enabled !== true) || (canonicalPaymentMethod === "BANK_TRANSFER" && methods.bankTransfer?.enabled !== true)) return { abort: phase4aError("payment_rejected", "Selected payment method is unavailable", 409) };
         const normalizedAvailability = offer.availabilityType == null ? "immediate" : offer.availabilityType;
         if (typeof offer.price !== "number" || !Number.isFinite(offer.price) || offer.price <= 0 || offer.price > 1e6 || typeof offer.title !== "string" || !offer.title.trim() || offer.title.trim().length > 120 || !["immediate", "preorder"].includes(normalizedAvailability) || (normalizedAvailability === "preorder" && (!Number.isInteger(offer.preparationTimeMinutes) || offer.preparationTimeMinutes < 15 || offer.preparationTimeMinutes > 1440))) return { abort: phase4aError("invalid_offer", "Offer is malformed") };
+        if (fundingIntent && (sarCents(offer.price) === null || sarCents(offer.price) <= 0)) return { abort: phase4aError("cash_funding_invalid_amount", "Food amount must use valid SAR cents", 409) };
         const versions = [customerSnap.updateTime, providerSnap.updateTime, offerSnap.updateTime];
         if (firstVersions && versions.some((version, index) => version !== firstVersions[index])) return { abort: phase4aError("state_conflict", "Order inputs changed; retry", 409) };
         firstVersions = versions;
@@ -4115,7 +4789,7 @@
           deliveryPaymentMethod: null, deliveryStatus: null, driverStatus: "",
           providerLat: provider?.location?.lat ?? provider?.lat ?? provider?.latitude ?? null,
           providerLng: provider?.location?.lng ?? provider?.lng ?? provider?.longitude ?? null,
-          ...(privateDestinationCreation ? { destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT } : {
+          ...(privateDestinationCreation ? { destinationContract: PRIVATE_DESTINATION_ORDER_CONTRACT, ...(fundingIntent ? { cashFundingIntentVersion: CASH_FUNDING_V1 } : {}) } : {
             customerLat: customer.location?.lat ?? customer.lat ?? customer.latitude ?? null,
             customerLng: customer.location?.lng ?? customer.lng ?? customer.longitude ?? null,
             dropoffAddress: typeof customer.address === "string" ? customer.address : ""
@@ -4132,7 +4806,7 @@
           { update: phase4aDoc("order_numbers", orderNumber, { orderId, createdAt: now }), updateMask: { fieldPaths: ["orderId", "createdAt"] }, currentDocument: { exists: false } },
           ...trackingJobWrite(orderId, eventId, now)
         ], value: { success: true, orderId, order }, expected: { orderId } };
-      }, reconcile);
+      }, reconcile, 2, {}, 8);
       if (result.kind === "aborted") {
         if (result.value?.replayOrderId) {
           const priorOrder = await replay(result.value.replayOrderId);
@@ -4198,37 +4872,62 @@
     }
     __name(hashPassword, "hashPassword");
     __name2(hashPassword, "hashPassword");
-    async function sendEmail(to, subject, html, env, attachments) {
+    async function sendEmail(to, subject, html, env, attachments, options) {
       const apiKey = env.EMAIL_API_KEY;
       if (!apiKey) {
         console.log("[Email] EMAIL_API_KEY not configured; email skipped");
-        return { sent: false, reason: "EMAIL_API_KEY not configured" };
+        return { sent: false, reason: "EMAIL_API_KEY not configured", code: "missing_credentials" };
       }
-      const from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
+      const from = options?.from || env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
       try {
         const payload = { from, to: [to], subject, html };
         if (attachments && attachments.length > 0) {
           payload.attachments = attachments;
         }
-        const res = await fetch("https://api.resend.com/emails", {
+        const headers = { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" };
+        if (options?.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
+        const request = {
           method: "POST",
-          headers: {
-            "Authorization": "Bearer " + apiKey,
-            "Content-Type": "application/json"
-          },
+          headers,
           body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (res.ok) {
+        };
+        let res, data;
+        if (options?.deadlineMs) {
+          // Alert retries need a finite transport deadline and bounded response.
+          // The existing transactional-user email path remains unchanged.
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), options.deadlineMs);
+          try {
+            res = await fetch("https://api.resend.com/emails", { ...request, signal: controller.signal });
+            const reader = res.body?.getReader();
+            let size = 0, text = "";
+            if (reader) {
+              const decoder = new TextDecoder("utf-8", { fatal: true });
+              while (true) {
+                const chunk = await reader.read();
+                if (chunk.done) break;
+                size += chunk.value.byteLength;
+                if (size > 16384) { await reader.cancel(); throw new Error("Email response too large"); }
+                text += decoder.decode(chunk.value, { stream: true });
+              }
+              text += decoder.decode();
+            }
+            data = text ? JSON.parse(text) : {};
+          } finally { clearTimeout(timer); }
+        } else {
+          res = await fetch("https://api.resend.com/emails", request);
+          data = await res.json();
+        }
+        if (res.ok && (!options?.idempotencyKey || typeof data.id === "string" && data.id.length > 0)) {
           console.log("[Email] Sent");
           return { sent: true, id: data.id };
         } else {
           console.error("[Email] Failed");
-          return { sent: false, reason: data.message || "Failed" };
+          return { sent: false, reason: data.message || "Failed", code: res.ok ? "uncertain" : data.name || data.error || "provider_rejected", httpStatus: res.ok ? null : res.status };
         }
       } catch (e) {
         console.error("[Email] Error");
-        return { sent: false, reason: e.message };
+        return { sent: false, reason: e.message, code: "uncertain" };
       }
     }
     __name(sendEmail, "sendEmail");
@@ -5338,32 +6037,78 @@
     }
     __name(handleEvent, "handleEvent");
     __name2(handleEvent, "handleEvent");
+    function adminOwnerLoginMode(env) {
+      const configured = env.ADMIN_OWNER_LOGIN_MODE;
+      return configured === undefined || configured === null || configured === "" || configured === "legacy" ? "legacy" :
+        configured === "owner_only" || configured === "dual" ? configured : "invalid";
+    }
+    function adminOwnerLoginConfigured(env) {
+      return !!(phase4aSafeSegment(env.OWNER_FIREBASE_UID) && env.FIREBASE_WEB_API_KEY &&
+        env.ADMIN_TOKEN_SECRET && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY);
+    }
+    function adminAuthResponse(data, status = 200) {
+      return new Response(JSON.stringify(data), { status, headers: {
+        "Content-Type": "application/json", "Cache-Control": "no-store, max-age=0", "Referrer-Policy": "no-referrer"
+      } });
+    }
+    async function adminSignSession(payload, secret) {
+      const encoded = btoa(JSON.stringify(payload));
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
+        { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(encoded));
+      return encoded + "." + btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
     async function createAdminToken(env) {
       const exp = Date.now() + 24 * 60 * 60 * 1e3;
-      const payload = btoa(JSON.stringify({ exp, r: Math.random().toString(36).slice(2), a: "admin" }));
-      const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
-      const key = await crypto.subtle.importKey(
-        "raw",
-        new TextEncoder().encode(secret),
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-      );
-      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-      const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-      return payload + "." + sigB64;
+      return adminSignSession({ exp, r: crypto.randomUUID(), a: "admin" }, env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD);
     }
     __name(createAdminToken, "createAdminToken");
     __name2(createAdminToken, "createAdminToken");
+    async function createOwnerAdminToken(uid, env, accessToken) {
+      if (!adminOwnerLoginConfigured(env) || uid !== env.OWNER_FIREBASE_UID) return null;
+      const now = Date.now();
+      const sid = crypto.randomUUID();
+      const exp = now + 8 * 60 * 60 * 1e3;
+      const created = await phase4aCommit([{ update: phase4aDoc("admin_owner_sessions", sid,
+        { ownerUid: uid, createdAt: new Date(now).toISOString(), expiresAt: new Date(exp).toISOString(), revoked: false }),
+        currentDocument: { exists: false } }], accessToken);
+      if (!created) return null;
+      return adminSignSession({ a: "firebase_owner", v: 1, uid, sid, iat: now, exp }, env.ADMIN_TOKEN_SECRET + ":firebase-owner-v1");
+    }
+    async function reserveAdminLoginAttempt(request, env, accessToken) {
+      // Durable CAS limits attempts across isolates; all identifiers are keyed hashes.
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const key = await sha256Hex(env.ADMIN_TOKEN_SECRET + ":admin-login:" + ip);
+      const ids = ["global", "ip-" + key];
+      const snapshots = await Promise.all(ids.map((id) => getFirestoreSnapshot("admin_login_limits", id, accessToken)));
+      const now = Date.now();
+      const writes = ids.map((id, index) => {
+        const snapshot = snapshots[index];
+        const start = Date.parse(snapshot?.data?.windowStart || "");
+        const active = Number.isFinite(start) && start <= now && now - start < 15 * 60 * 1e3;
+        const count = active ? snapshot.data.count : 0;
+        if (!Number.isInteger(count) || count < 0 || count >= (index ? 6 : 30)) return null;
+        const fields = { count: count + 1, windowStart: active ? snapshot.data.windowStart : new Date(now).toISOString() };
+        return { update: phase4aDoc("admin_login_limits", id, fields),
+          currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
+      });
+      return writes.every(Boolean) && await phase4aCommit(writes, accessToken);
+    }
     async function verifyAdminToken(token, env) {
       try {
-        if (!token) return false;
+        if (!token || token.length > 4096) return false;
         const parts = token.split(".");
         if (parts.length !== 2) return false;
         const [payload, sigB64] = parts;
         const data = JSON.parse(atob(payload));
-        if (Date.now() > data.exp) return false;
-        const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
+        const mode = adminOwnerLoginMode(env);
+        if (mode === "invalid") return false;
+        const owner = data.a === "firebase_owner" && data.v === 1;
+        if (owner ? mode === "legacy" || !adminOwnerLoginConfigured(env) || data.uid !== env.OWNER_FIREBASE_UID ||
+            !phase4aSafeSegment(data.sid) || !Number.isSafeInteger(data.iat) || !Number.isSafeInteger(data.exp) ||
+            data.iat > Date.now() + 30000 || data.exp - data.iat > 8 * 60 * 60 * 1e3 || Date.now() >= data.exp
+          : mode === "owner_only" || data.a !== "admin" || !Number.isSafeInteger(data.exp) || Date.now() >= data.exp) return false;
+        const secret = owner ? env.ADMIN_TOKEN_SECRET + ":firebase-owner-v1" : env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
         const key = await crypto.subtle.importKey(
           "raw",
           new TextEncoder().encode(secret),
@@ -5374,9 +6119,13 @@
         const normalizedSig = sigB64.replace(/-/g, "+").replace(/_/g, "/");
         const padded = normalizedSig + "=".repeat((4 - normalizedSig.length % 4) % 4);
         const sig = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
-        return await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload));
+        if (!await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload))) return false;
+        if (!owner) return true;
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const session = await getFirestoreDoc("admin_owner_sessions", data.sid, accessToken);
+        return session?.ownerUid === data.uid && session?.revoked === false &&
+          Date.parse(session.expiresAt) === data.exp;
       } catch (e) {
-        console.error("[Admin] Token verify error:", e);
         return false;
       }
     }
@@ -5386,7 +6135,7 @@
       try {
         const payload = token && token.split(".")[0];
         const data = payload ? JSON.parse(atob(payload)) : null;
-        return data && typeof data.a === "string" && data.a ? data.a : "admin";
+        return data?.a === "firebase_owner" ? "owner:" + data.uid : "admin";
       } catch (e) {
         return "admin";
       }
@@ -5539,6 +6288,38 @@
     }
     __name(verifyFirebaseIdToken, "verifyFirebaseIdToken");
     __name2(verifyFirebaseIdToken, "verifyFirebaseIdToken");
+    async function verifyOwnerVersionGateToken(idToken, env) {
+      // The shared Admin token does not establish owner identity.
+      if (!phase4aSafeSegment(env.OWNER_FIREBASE_UID) || !idToken || idToken.length > 8192) return null;
+      let claims;
+      try { claims = await verifyFirebaseIdToken(idToken, true); } catch { return null; }
+      const now = Math.floor(Date.now() / 1e3);
+      if (claims.sub !== env.OWNER_FIREBASE_UID ||
+          !Number.isInteger(claims.exp) || claims.exp <= now ||
+          !Number.isInteger(claims.iat) || claims.iat > now + 30 ||
+          !Number.isInteger(claims.auth_time) || claims.auth_time > now ||
+          now - claims.auth_time > 300) return null;
+      return { uid: claims.sub };
+    }
+    async function reauthenticateOwnerVersionGate(credentials, env) {
+      if (!phase4aSafeSegment(env.OWNER_FIREBASE_UID) || !env.FIREBASE_WEB_API_KEY ||
+          !credentials || typeof credentials !== "object" || Array.isArray(credentials) ||
+          Object.keys(credentials).sort().join(",") !== "email,password" ||
+          typeof credentials.email !== "string" || credentials.email.length > 320 || !credentials.email.includes("@") ||
+          typeof credentials.password !== "string" || !credentials.password || credentials.password.length > 1024) return null;
+      const controller = new AbortController();
+      const deadline = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + encodeURIComponent(env.FIREBASE_WEB_API_KEY), {
+          method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+          body: JSON.stringify({ email: credentials.email, password: credentials.password, returnSecureToken: true })
+        });
+        if (!response.ok) { await response.body?.cancel(); return null; }
+        const result = await response.json();
+        return verifyOwnerVersionGateToken(result?.idToken, env);
+      } catch { return null; }
+      finally { clearTimeout(deadline); }
+    }
     function isCrActive(data) {
       const status = data && typeof data === "object" ? data.status : null;
       if (!status || typeof status !== "object") {
@@ -5742,6 +6523,7 @@
     function htmlSecurityHeaders(contentSecurityPolicy) {
       return {
         "Content-Type": "text/html;charset=UTF-8",
+        "Cache-Control": "no-store, max-age=0",
         "Content-Security-Policy": contentSecurityPolicy,
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -6204,7 +6986,7 @@ ${notes ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>' + (isAr
     }
     __name(generateInvoiceEmailHTML, "generateInvoiceEmailHTML");
     __name2(generateInvoiceEmailHTML, "generateInvoiceEmailHTML");
-    function getAdminHTML() {
+    function getAdminHTML(loginMode = "legacy") {
       return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -6313,6 +7095,12 @@ tr:hover td{background:#f8fafc}
 .user-info-row{display:flex;gap:8px;align-items:center;margin-bottom:4px}
 .user-info-row .name{font-weight:600;color:var(--text)}
 .user-info-row .email{color:var(--text2);font-size:12px}
+.complaint-order-cell{max-width:190px;min-width:0;overflow-wrap:anywhere}
+.complaint-order-ref{unicode-bidi:isolate;display:inline-block;max-width:100%;overflow-wrap:anywhere;text-align:start}
+.complaint-short-label{display:block;font-size:11px;color:var(--text2)}
+.complaint-order-full{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.complaint-order-full code{min-width:0;max-width:100%;overflow-wrap:anywhere;user-select:all}
+.modal h3 .complaint-order-ref{font-size:13px;color:var(--text2);vertical-align:middle}
 .toast{position:fixed;top:20px;z-index:999;padding:12px 20px;border-radius:8px;color:#fff;font-size:14px;font-weight:500;opacity:0;transform:translateY(-10px);transition:all .3s}
 html[dir="rtl"] .toast{left:20px}html[dir="ltr"] .toast{right:20px}
 .toast.show{opacity:1;transform:translateY(0)}
@@ -6411,7 +7199,7 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
 </style>
 </head>
 <body>
-<a class="skip-link" href="#page-content">تجاوز القائمة إلى المحتوى</a>
+<a class="skip-link" id="admin-skip-link" href="#page-content">تجاوز القائمة إلى المحتوى</a>
 
 <div id="login-view">
   <div class="login-card">
@@ -6420,12 +7208,17 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
        <p id="login-subtitle">\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646</p>
     </div>
     <form id="login-form" onsubmit="doLogin(event);return false;">
-      <div id="login-error" class="err-msg"></div>
+      <div id="login-error" class="err-msg" role="alert"></div>
+      <div class="form-group" id="login-email-group" style="display:none">
+        <label id="login-email-label" for="login-email">البريد الإلكتروني للمالك</label>
+        <input type="email" id="login-email" autocomplete="username" inputmode="email" dir="ltr" maxlength="320">
+      </div>
       <div class="form-group">
-        <label id="login-pw-label">\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644</label>
-        <input type="password" id="login-password" autocomplete="current-password">
+        <label id="login-pw-label" for="login-password">\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644</label>
+        <input type="password" id="login-password" autocomplete="current-password" maxlength="1024">
       </div>
       <button type="submit" class="btn btn-primary btn-block" id="login-btn">\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644</button>
+      <button type="button" id="login-switch" class="btn btn-block" style="display:none;margin-top:8px" onclick="switchAdminLogin()"></button>
       <div id="login-status" class="login-status" role="status" aria-live="polite"></div>
     </form>
   </div>
@@ -6434,7 +7227,7 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
 <div id="main-view">
   <div class="layout">
     <div class="mobile-header" id="mobile-header">
-      <button class="hamburger" onclick="toggleSidebar()" aria-label="Menu">\u2630</button>
+      <button class="hamburger" id="admin-menu-button" onclick="toggleSidebar()" aria-label="Menu">\u2630</button>
       <span class="page-name" id="mobile-page-name"></span>
       <span class="logo-sm">Tabbakheen</span>
     </div>
@@ -6507,6 +7300,18 @@ function esc(s){return escapeHtml(s);}
 var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",verification:"\u0627\u0644\u062A\u0648\u062B\u064A\u0642",crVerifications:"\u062A\u0648\u062B\u064A\u0642 \u0627\u0644\u0633\u062C\u0644 \u0627\u0644\u062A\u062C\u0627\u0631\u064A",freelanceRequests:"\u0637\u0644\u0628\u0627\u062A \u0634\u0647\u0627\u062F\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u062D\u0631",certNumber:"\u0631\u0642\u0645 \u0627\u0644\u0634\u0647\u0627\u062F\u0629",submittedAt:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u062A\u0642\u062F\u064A\u0645",reviewStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",approve:"\u0627\u0639\u062A\u0645\u0627\u062F",reject:"\u0631\u0641\u0636",pendingReview:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",verifiedStatus:"\u0645\u0648\u062B\u0651\u0642",unverifiedStatus:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",notVerified:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",viewDocument:"\u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0648\u062B\u064A\u0642\u0629",viewImage:"\u0639\u0631\u0636 \u0627\u0644\u0635\u0648\u0631\u0629",rejectReason:"\u0633\u0628\u0628 \u0627\u0644\u0631\u0641\u0636 (\u062F\u0627\u062E\u0644\u064A)",verificationApproved:"\u062A\u0645 \u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062A\u0648\u062B\u064A\u0642",verificationRejected:"\u062A\u0645 \u0631\u0641\u0636 \u0627\u0644\u062A\u0648\u062B\u064A\u0642",notifyCrVerification:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0648\u062B\u064A\u0642 \u0633\u062C\u0644 \u062A\u062C\u0627\u0631\u064A \u062C\u062F\u064A\u062F",notifyFreelanceRequest:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u0637\u0644\u0628 \u0634\u0647\u0627\u062F\u0629 \u0639\u0645\u0644 \u062D\u0631 \u062C\u062F\u064A\u062F",noVerificationData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u0648\u062B\u064A\u0642",source:"\u0627\u0644\u0645\u0635\u062F\u0631",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",notifications:"\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastTitle:"\u0639\u0646\u0648\u0627\u0646 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastMessage:"\u0646\u0635 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastAudience:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u0633\u062A\u0647\u062F\u0641",audienceCustomers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",audienceProviders:"\u0645\u0642\u062F\u0645\u0648 \u0627\u0644\u062E\u062F\u0645\u0629",audienceDrivers:"\u0645\u0646\u0627\u062F\u064A\u0628 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",audienceAll:"\u0627\u0644\u0643\u0644",broadcastSend:"\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastHistory:"\u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastConfirm:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastConfirmMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u062C\u0645\u064A\u0639 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0645\u062D\u062F\u062F\u064A\u0646.",broadcastResult:"\u0646\u062A\u064A\u062C\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastMatched:"\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0645\u0637\u0627\u0628\u0642\u0648\u0646",broadcastTokens:"\u0631\u0645\u0648\u0632 \u0635\u0627\u0644\u062D\u0629",broadcastSentCount:"\u062A\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastFailed:"\u0641\u0634\u0644 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",noBroadcastHistory:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0633\u062C\u0644 \u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastAudienceLabel:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631",deleteNotif:"\u062D\u0630\u0641",resendNotif:"\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResend:"\u062A\u0639\u062F\u064A\u0644 \u0648\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResendSend:"\u0625\u0631\u0633\u0627\u0644 \u0646\u0633\u062E\u0629 \u0645\u0639\u062F\u0644\u0629",confirmDelete:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u062D\u0630\u0641",confirmDeleteMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u062D\u0630\u0641 \u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0641\u0642\u0637 \u062F\u0648\u0646 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0631\u0633\u0644\u0629.",confirmResend:"\u062A\u0623\u0643\u064A\u062F \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",confirmResendMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u062D\u062F\u062F.",notifDeleted:"\u062A\u0645 \u062D\u0630\u0641 \u0627\u0644\u0633\u062C\u0644",deleteFailed:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0630\u0641",resendSuccess:"\u062A\u0645\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",resendFailed:"\u0641\u0634\u0644\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",providerSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0632\u0648\u062F \u0627\u0644\u062E\u062F\u0645\u0629",driverSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0633\u0627\u0626\u0642",subActive:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0641\u0639\u0651\u0644",subPrice:"\u0633\u0639\u0631 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 (SAR)",subPeriod:"\u0641\u062A\u0631\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",periodWeekly:"\u0623\u0633\u0628\u0648\u0639\u064A",periodMonthly:"\u0634\u0647\u0631\u064A",periodQuarterly:"\u0631\u0628\u0639 \u0633\u0646\u0648\u064A",periodYearly:"\u0633\u0646\u0648\u064A",freeTrialEnabledLabel:"\u0627\u0644\u062A\u062C\u0631\u0628\u0629 \u0627\u0644\u0645\u062C\u0627\u0646\u064A\u0629 \u0645\u0641\u0639\u0651\u0644\u0629",freeTrialTextArLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0639\u0631\u0628\u064A)",freeTrialTextEnLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0625\u0646\u062C\u0644\u064A\u0632\u064A)"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",verification:"Verification",crVerifications:"CR Verification",freelanceRequests:"Freelance Certificate Requests",certNumber:"Certificate #",submittedAt:"Submitted At",reviewStatus:"Review Status",approve:"Approve",reject:"Reject",pendingReview:"Pending Review",verifiedStatus:"Verified",unverifiedStatus:"Unverified",notVerified:"Not Verified",viewDocument:"Verify Document",viewImage:"View Image",rejectReason:"Reject reason (internal)",verificationApproved:"Verification approved",verificationRejected:"Verification rejected",notifyCrVerification:"Notify on new CR verification",notifyFreelanceRequest:"Notify on new freelance request",noVerificationData:"No verification data",source:"Source",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices",notifications:"Notifications",broadcastTitle:"Notification Title",broadcastMessage:"Message",broadcastAudience:"Target Audience",audienceCustomers:"Customers",audienceProviders:"Providers",audienceDrivers:"Drivers",audienceAll:"All",broadcastSend:"Send Notification",broadcastHistory:"Notification History",broadcastConfirm:"Confirm Send",broadcastConfirmMsg:"Are you sure? This notification will be sent to all targeted users.",broadcastResult:"Send Result",broadcastMatched:"Users Matched",broadcastTokens:"Valid Tokens",broadcastSentCount:"Sent",broadcastFailed:"Failed",noBroadcastHistory:"No notification history",broadcastAudienceLabel:"Audience",deleteNotif:"Delete",resendNotif:"Resend",editResend:"Edit & Resend",editResendSend:"Send Edited Copy",confirmDelete:"Confirm Delete",confirmDeleteMsg:"Are you sure? Only the history record will be deleted. Sent notifications are not recalled.",confirmResend:"Confirm Resend",confirmResendMsg:"Are you sure? This notification will be resent to the targeted audience.",notifDeleted:"Record deleted",deleteFailed:"Delete failed",resendSuccess:"Resend successful",resendFailed:"Resend failed",providerSubSettings:"Provider Subscription Settings",driverSubSettings:"Driver Subscription Settings",subActive:"Subscription Active",subPrice:"Subscription Price (SAR)",subPeriod:"Subscription Period",periodWeekly:"Weekly",periodMonthly:"Monthly",periodQuarterly:"Quarterly",periodYearly:"Yearly",freeTrialEnabledLabel:"Free Trial Enabled",freeTrialTextArLabel:"Free Trial Text (Arabic)",freeTrialTextEnLabel:"Free Trial Text (English)"}};
 var lang=localStorage.getItem("tbk_admin_lang")||"ar";
 function t(k){return(T[lang]&&T[lang][k])||T.en[k]||k;}
+var adminUiText={
+  ar:{signingIn:"جارٍ تسجيل الدخول...",loginRetry:"تعذّر تسجيل الدخول، حاول مرة أخرى",serverUnavailable:"تعذّر الاتصال بالخادم",liveNow:"الآن",liveTenSeconds:"منذ 10 ثوانٍ",autoRefresh:"تحديث تلقائي",lastRefresh:"آخر تحديث",newComplaints:"بلاغات جديدة",newVerifications:"طلبات توثيق جديدة",
+    releaseCurrent:"على 1.0.6 أو أحدث",releaseRequired:"يحتاج تحديث",releaseRequiredPlural:"يحتاجون تحديث",releaseUnknown:"لم يُبلّغ عن إصدار",releaseTest:"1.0.7 · جديد / تجريبي",releasePublic:"1.0.6 · الإصدار العام",releaseOlder:"إصدار أقدم",releaseOther:"إصدار آخر مُبلّغ عنه",releaseTotal:"إجمالي المستخدمين",releaseAdoption:"نسبة التحديث",releaseTestMetric:"1.0.7 · جديد / TestFlight / Internal Testing",releasePublicMetric:"1.0.6 · الإصدار العام الحالي",releaseOlderMetric:"أقل من 1.0.6",releaseOtherMetric:"إصدارات أخرى مُبلّغ عنها",releaseShare:"% من إجمالي الحسابات",releaseUsers:"مستخدم",releaseNoData:"لا توجد بيانات إصدارات بعد",releaseNoDataHint:"ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.",releaseVersionAll:"الإصدار: الكل",releaseCategoryAll:"فئة الإصدار: الكل",releaseStatusAll:"حالة الإصدار: الكل",releaseUpdated:"محدّث",releaseUnknownShort:"غير معروف",releaseTestShort:"1.0.7 · تجريبي",releasePublicShort:"1.0.6 · عام",releaseOlderShort:"أقدم من 1.0.6",releaseOtherShort:"إصدار آخر",releaseNotReported:"لم يُبلّغ",releaseAppVersion:"إصدار التطبيق",releaseStatus:"حالة الإصدار",releaseLastVersion:"آخر إصدار أبلغ عنه الحساب",releaseCategory:"فئة الإصدار",releaseTracking:"متابعة الإصدارات",releaseTitle:"إصدارات التطبيق",releaseIntro:"آخر إصدار أبلغ عنه كل حساب، وليس إصدار كل جهاز. الإصدار العام الحالي:",releaseTestDisclaimer:"1.0.7 إصدار تجريبي ولا يغيّر أهلية تذكير مستخدمي 1.0.6.",releaseDistribution:"توزيع الإصدارات",releaseDistributionHint:"عدد ونسبة الحسابات حسب آخر إصدار مُبلّغ عنه؛ غير المعروف لا يعني إصدارًا قديمًا.",releaseAccounts:"إصدارات الحسابات",releaseAccountsHint:"تصفية حسب الإصدار الدقيق والدور والحساب؛ البيانات تخص الحساب لا التثبيت الفعلي.",releaseRoleFilter:"تصفية الدور",releaseCategoryFilter:"تصفية فئة الإصدار",releaseVersionFilter:"تصفية الإصدار الدقيق",releaseAccountFilter:"تصفية الحساب بالاسم أو المعرّف",releaseAccountSearch:"ابحث باسم الحساب أو معرّفه",usersKicker:"إدارة المستخدمين",usersIntro:"إدارة الحسابات ومعرفة إصدار التطبيق المسجل لكل مستخدم.",bulkReminder:"إرسال تنبيه جماعي",singleReminder:"طلب تحديث",
+    gateTitle:"التحديث الإجباري للتطبيق",gateIntro:"إعداد منفصل عن تذكيرات الإصدارات. السياسة معطّلة افتراضيًا، ولا تُفعّل قبل توفر الإصدار العام المتوافق في المتجرين وموافقة المالك المستقلة.",gatePolicy:"سياسة التحديث الإجباري",gateLoading:"جارٍ تحميل السياسة…",gateLoadError:"تعذّر تحميل السياسة. أعد فتح الصفحة قبل التعديل.",gateInvalid:"الإعداد المخزن غير صالح؛ ستبقى سياسة المحمول معطّلة حتى يصححها المالك.",gateEnabled:"الحالة المحفوظة: مفعّل",gateDisabled:"الحالة المحفوظة: معطّل",gateReady:"بوابة موافقة النشر متاحة",gateNotReady:"بوابة موافقة النشر غير مفعّلة؛ لا يمكن تشغيل الحظر",gateToggle:"تفعيل التحديث الإجباري",gateIosVersion:"الحد الأدنى لإصدار iOS",gateAndroidVersion:"الحد الأدنى لإصدار Android",gateVersionHint:"إصدار عام ثابت، مثل 1.0.6",gateIosBuild:"الحد الأدنى لرقم بناء iOS",gateAndroidBuild:"الحد الأدنى لرقم بناء Android",gateBuildHint:"رقم البناء الأصلي المنشور",gateIosUrl:"رابط App Store الرسمي",gateAndroidUrl:"رابط Google Play الرسمي",gateStoreHint:"يجب أن يشير إلى تطبيق طباخين فقط",gateOwnerEmail:"بريد Firebase للمالك",gateOwnerHint:"يستخدم للتحقق عند الحفظ فقط",gateOwnerPassword:"كلمة مرور Firebase للمالك",gatePasswordHint:"لا تُحفظ في إعدادات التطبيق.",gateStoreConfirm:"تحققت من توفر الإصدار المطلوب في App Store وGoogle Play",gateSave:"حفظ السياسة",gateReadOnly:"للعرض فقط حتى تُضبط هوية مالك Firebase وإعدادات إعادة المصادقة.",gateOwnerRequired:"يلزم التحقق من هوية مالك Firebase",gateStoreRequired:"أكّد توفر الإصدار في المتجرين قبل التفعيل",gateConfirm:"هل تريد حفظ سياسة التحديث؟ لا تفعّل الحظر دون موافقة نشر مستقلة.",gateSaving:"جارٍ الحفظ…",gateSaved:"حُفظت سياسة التحديث",gateSaveError:"تعذّر حفظ السياسة؛ راجع الحقول وحالة موافقة النشر",gateConnectionError:"تعذّر الاتصال؛ أعد تحميل السياسة قبل المحاولة",
+    reminderConfirm:"تأكيد إرسال طلب تحديث",reminderMessage:"سيتم إرسال إشعار داخل التطبيق، وإشعار فوري، وبريد إلكتروني عند توفره إلى",reminderUser:"المستخدم",reminderSent:"تم إرسال طلب التحديث",reminderFailed:"تعذر إرسال طلب التحديث",remindersConfirm:"تأكيد إرسال تنبيهات التحديث",remindersMessage:"مستخدم يحتاج إلى تحديث التطبيق، مع تطبيق مهلة 72 ساعة لمنع التكرار.",remindersFailed:"تعذر إرسال التنبيهات",remindersStopped:"توقف الإرسال الآمن؛ أعد المحاولة لإكمال الباقي",remindersResult:"نتيجة تنبيهات التحديث",remindersTargeted:"المستهدفون",remindersSent:"تم الإرسال",remindersCooldown:"ضمن مهلة الانتظار",remindersUnsent:"تعذر الإرسال",done:"تم",send:"إرسال",campaigns:"الحملات",pushHealth:"فحص حالة الإشعارات",pushChecking:"جارٍ الفحص…",pushCheckFailed:"تعذر فحص حالة الإشعارات",pushUsers:"المستخدمون",pushCustomers:"عملاء",pushProviders:"مقدمو خدمة",pushDrivers:"سائقون",pushPrivateDevices:"الأجهزة الخاصة",pushEnabled:"مفعلة",pushValidTokens:"رموز صالحة",pushNoToken:"بدون رمز",pushLegacyTokens:"الرموز القديمة الصالحة",pushLastBroadcast:"آخر بث",pushProcessed:"تمت معالجة",pushOf:"من",pushCandidates:"مرشحون",pushValid:"صالحون",pushSent:"أرسل",pushFailed:"فشل"},
+  en:{signingIn:"Signing in...",loginRetry:"Could not sign in. Please try again.",serverUnavailable:"Could not connect to the server",liveNow:"Now",liveTenSeconds:"10 seconds ago",autoRefresh:"Auto-refresh",lastRefresh:"Last updated",newComplaints:"New complaints",newVerifications:"New verification requests",
+    releaseCurrent:"On 1.0.6 or newer",releaseRequired:"Update required",releaseRequiredPlural:"Update required",releaseUnknown:"No version reported",releaseTest:"1.0.7 · New / test",releasePublic:"1.0.6 · Public release",releaseOlder:"Older version",releaseOther:"Another reported version",releaseTotal:"Total users",releaseAdoption:"Update adoption",releaseTestMetric:"1.0.7 · New / TestFlight / Internal Testing",releasePublicMetric:"1.0.6 · Current public release",releaseOlderMetric:"Below 1.0.6",releaseOtherMetric:"Other reported versions",releaseShare:"% of accounts",releaseUsers:"users",releaseNoData:"No version data yet",releaseNoDataHint:"Versions appear when users open the app.",releaseVersionAll:"Version: all",releaseCategoryAll:"Release category: all",releaseStatusAll:"Release status: all",releaseUpdated:"Up to date",releaseUnknownShort:"Unknown",releaseTestShort:"1.0.7 · Test",releasePublicShort:"1.0.6 · Public",releaseOlderShort:"Older than 1.0.6",releaseOtherShort:"Other version",releaseNotReported:"Not reported",releaseAppVersion:"App version",releaseStatus:"Release status",releaseLastVersion:"Last reported app version",releaseCategory:"Release category",releaseTracking:"Release tracking",releaseTitle:"App releases",releaseIntro:"Last app version reported by each account, not each device. Current public release:",releaseTestDisclaimer:"1.0.7 is a test release and does not change reminder eligibility for 1.0.6 users.",releaseDistribution:"Version distribution",releaseDistributionHint:"Account counts and percentages by last reported version; unknown does not mean outdated.",releaseAccounts:"Account versions",releaseAccountsHint:"Filter by exact version, role and account; these are accounts, not individual installations.",releaseRoleFilter:"Filter by role",releaseCategoryFilter:"Filter by release category",releaseVersionFilter:"Filter by exact version",releaseAccountFilter:"Filter accounts by name or ID",releaseAccountSearch:"Search account name or ID",usersKicker:"User management",usersIntro:"Manage accounts and see each user's last reported app version.",bulkReminder:"Send bulk reminder",singleReminder:"Request update",
+    gateTitle:"Mandatory app update",gateIntro:"Separate from release reminders. Disabled by default; enable only after a compatible public version is available in both stores and the owner separately approves it.",gatePolicy:"Mandatory update policy",gateLoading:"Loading policy…",gateLoadError:"Could not load the policy. Reopen this page before editing.",gateInvalid:"Stored settings are invalid. The mobile policy stays disabled until the owner corrects them.",gateEnabled:"Saved state: enabled",gateDisabled:"Saved state: disabled",gateReady:"Release approval gate available",gateNotReady:"Release approval gate disabled; blocking cannot be enabled",gateToggle:"Enable mandatory update",gateIosVersion:"Minimum iOS version",gateAndroidVersion:"Minimum Android version",gateVersionHint:"Published public version, e.g. 1.0.6",gateIosBuild:"Minimum iOS build",gateAndroidBuild:"Minimum Android build",gateBuildHint:"Published native build number",gateIosUrl:"Official App Store URL",gateAndroidUrl:"Official Google Play URL",gateStoreHint:"Must link to Tabbakheen only",gateOwnerEmail:"Owner Firebase email",gateOwnerHint:"Used only to verify changes",gateOwnerPassword:"Owner Firebase password",gatePasswordHint:"Not stored in app settings.",gateStoreConfirm:"I verified the required release is available on App Store and Google Play",gateSave:"Save policy",gateReadOnly:"Read-only until Firebase owner identity and reauthentication settings are configured.",gateOwnerRequired:"Firebase owner verification is required",gateStoreRequired:"Confirm store availability before enabling",gateConfirm:"Save this policy? Do not enable blocking without separate release approval.",gateSaving:"Saving…",gateSaved:"Update policy saved",gateSaveError:"Could not save the policy; check the fields and release approval state",gateConnectionError:"Connection failed; reload the policy before retrying",
+    reminderConfirm:"Confirm update request",reminderMessage:"An in-app notification, push and email where available will be sent to",reminderUser:"the user",reminderSent:"Update request sent",reminderFailed:"Could not send update request",remindersConfirm:"Confirm update reminders",remindersMessage:"users need an app update; a 72-hour cooldown prevents duplicates.",remindersFailed:"Could not send reminders",remindersStopped:"Safe sending stopped; retry to finish the remainder",remindersResult:"Update reminder results",remindersTargeted:"Targeted",remindersSent:"Sent",remindersCooldown:"Within cooldown",remindersUnsent:"Failed",done:"Done",send:"Send",campaigns:"Campaigns",pushHealth:"Check notification health",pushChecking:"Checking…",pushCheckFailed:"Could not check notification health",pushUsers:"Users",pushCustomers:"customers",pushProviders:"providers",pushDrivers:"drivers",pushPrivateDevices:"Private devices",pushEnabled:"enabled",pushValidTokens:"valid tokens",pushNoToken:"without token",pushLegacyTokens:"Valid legacy tokens",pushLastBroadcast:"Last broadcast",pushProcessed:"Processed",pushOf:"of",pushCandidates:"candidates",pushValid:"valid",pushSent:"sent",pushFailed:"failed"}
+};
+function ui(k){return(adminUiText[lang]&&adminUiText[lang][k])||adminUiText.en[k]||k;}
+function adminError(data,fallback){return lang==="ar"?fallback:(data&&typeof data.error==="string"&&data.error?data.error:fallback);}
 function formatAdminDate(value,includeTime){
   if(!value)return "-";
   var date=new Date(value);
@@ -6516,8 +7321,24 @@ function formatAdminDate(value,includeTime){
   if(includeTime){options.hour="2-digit";options.minute="2-digit";}
   return new Intl.DateTimeFormat(locale,options).format(date);
 }
-function setLang(l){lang=l;localStorage.setItem("tbk_admin_lang",l);var d=l==="ar"?"rtl":"ltr";document.documentElement.dir=d;document.documentElement.lang=l;updateStaticLabels();renderPage();}
+async function setLang(l){
+  if(l!=="ar"&&l!=="en")return;
+  var form={};
+  document.querySelectorAll("#page-content input[id],#page-content select[id],#page-content textarea[id]").forEach(function(el){
+    if(el.type==="password"||el.type==="file")return;
+    form[el.id]=el.type==="checkbox"?{checked:el.checked}:{value:el.value};
+  });
+  lang=l;localStorage.setItem("tbk_admin_lang",l);
+  document.documentElement.dir=l==="ar"?"rtl":"ltr";document.documentElement.lang=l;
+  updateStaticLabels();refreshAdminLoginForm();updateMobilePageName();
+  await renderPage();
+  Object.keys(form).forEach(function(id){var el=document.getElementById(id);if(!el)return;if("checked" in form[id])el.checked=form[id].checked;else el.value=form[id].value;});
+  if(currentPage==="users"||currentPage==="releases")filterUsers();
+}
 function updateStaticLabels(){
+  document.getElementById("admin-skip-link").textContent=lang==="ar"?"تجاوز القائمة إلى المحتوى":"Skip navigation to content";
+  document.getElementById("login-email-label").textContent=lang==="ar"?"البريد الإلكتروني للمالك":"Owner email";
+  document.getElementById("admin-menu-button").setAttribute("aria-label",lang==="ar"?"القائمة":"Menu");
   document.getElementById("login-subtitle").textContent=t("adminDashboard");
   document.getElementById("login-pw-label").textContent=t("adminPassword");
   document.getElementById("login-password").placeholder=t("enterPassword");
@@ -6535,6 +7356,8 @@ function updateStaticLabels(){
   var nnEl=document.getElementById("nav-notifications");if(nnEl)nnEl.textContent=t("notifications");
 }
 
+var ADMIN_LOGIN_MODE="${loginMode}";
+var adminLoginKind=ADMIN_LOGIN_MODE==="legacy"?"legacy":"owner";
 var TOKEN=sessionStorage.getItem("tbk_admin_token");
 var currentPage="dashboard";
 var allUsers=[];
@@ -6546,8 +7369,8 @@ function releaseDataSignature(data){
 function releaseLiveIndicator(){
   var el=document.getElementById("release-live-indicator");
   if(!el)return;
-  var text=releasePolling.lastUpdatedAt&&Date.now()-releasePolling.lastUpdatedAt>=10000?"منذ 10 ثوانٍ":"الآن";
-  el.innerHTML='<span class="release-live-dot" aria-hidden="true">●</span><span>تحديث تلقائي</span><span class="release-live-separator">·</span><span>آخر تحديث: '+text+'</span>';
+  var text=releasePolling.lastUpdatedAt&&Date.now()-releasePolling.lastUpdatedAt>=10000?ui("liveTenSeconds"):ui("liveNow");
+  el.innerHTML='<span class="release-live-dot" aria-hidden="true">●</span><span>'+ui("autoRefresh")+'</span><span class="release-live-separator">·</span><span>'+ui("lastRefresh")+': '+text+'</span>';
 }
 function stopReleasePolling(){
   releasePolling.epoch++;
@@ -6619,6 +7442,13 @@ var allInvoices=[];
 var appSettings={};
  var complaintLabels={ar:{nav:"\u0628\u0644\u0627\u063A\u0627\u062A",title:"\u0628\u0644\u0627\u063A\u0627\u062A \u0627\u0644\u0634\u0643\u0627\u0648\u0649",all:"\u0627\u0644\u0643\u0644",pending:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",resolved:"\u062A\u0645 \u0627\u0644\u062D\u0644",closed:"\u0645\u063A\u0644\u0642\u0629",customerComplaint:"\u0634\u0643\u0648\u0649 \u0639\u0645\u064A\u0644",providerComplaint:"\u0634\u0643\u0648\u0649 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",deliveryNotConfirmed:"\u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u063A\u064A\u0631 \u0645\u0624\u0643\u062F",customerRejectedReceipt:"\u0631\u0641\u0636 \u0627\u0633\u062A\u0644\u0627\u0645 \u0627\u0644\u0625\u064A\u0635\u0627\u0644",customer:"\u0627\u0644\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u0627\u0644\u062E\u062F\u0645\u0629",driver:"\u0627\u0644\u0633\u0627\u0626\u0642",order:"\u0627\u0644\u0637\u0644\u0628",orderNumber:"\u0631\u0642\u0645 \u0627\u0644\u0637\u0644\u0628",complaintType:"\u0646\u0648\u0639 \u0627\u0644\u0628\u0644\u0627\u063A",source:"\u0627\u0644\u0645\u0635\u062F\u0631",target:"\u0627\u0644\u0637\u0631\u0641 \u0627\u0644\u0645\u0639\u0646\u064A",note:"\u0646\u0635 \u0627\u0644\u0628\u0644\u0627\u063A",adminReply:"\u0631\u062F \u0627\u0644\u0625\u062F\u0627\u0631\u0629",created:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0625\u0646\u0634\u0627\u0621",updated:"\u0622\u062E\u0631 \u062A\u062D\u062F\u064A\u062B",status:"\u0627\u0644\u062D\u0627\u0644\u0629",details:"\u0627\u0644\u062A\u0641\u0627\u0635\u064A\u0644",save:"\u062D\u0641\u0638 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",saved:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0628\u0644\u0627\u063A",saveFailed:"\u0641\u0634\u0644 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0628\u0644\u0627\u063A",noComplaints:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u0644\u0627\u063A\u0627\u062A",search:"\u0628\u062D\u062B \u0628\u0631\u0642\u0645 \u0627\u0644\u0637\u0644\u0628 \u0623\u0648 \u0627\u0644\u0646\u0635 \u0623\u0648 \u0627\u0644\u0627\u0633\u0645",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",unknown:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",noUser:"\u062D\u0633\u0627\u0628 \u0645\u062D\u0630\u0648\u0641 \u0623\u0648 \u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631"},en:{nav:"Complaints",title:"Complaint Management",all:"All",pending:"Pending",resolved:"Resolved",closed:"Closed",customerComplaint:"Customer complaint",providerComplaint:"Provider complaint",deliveryNotConfirmed:"Delivery not confirmed",customerRejectedReceipt:"Receipt rejected",customer:"Customer",provider:"Provider",driver:"Driver",order:"Order",orderNumber:"Order number",complaintType:"Type",source:"Source",target:"Target",note:"Complaint",adminReply:"Admin reply",created:"Created",updated:"Updated",status:"Status",details:"Details",save:"Save update",saved:"Complaint updated",saveFailed:"Failed to update complaint",noComplaints:"No complaints found",search:"Search by order, text, or name",loading:"Loading...",unknown:"Unavailable",noUser:"Deleted or unavailable account"}};
  function ct(k){return(complaintLabels[lang]&&complaintLabels[lang][k])||complaintLabels.en[k]||k;}
+ var complaintUiText={
+   ar:{shortRef:"مرجع مختصر",fullOrderId:"معرّف الطلب الكامل",copyOrderId:"نسخ المعرّف",copiedOrderId:"نُسخ معرّف الطلب",copyFailed:"تعذّر النسخ؛ يمكنك تحديد المعرّف يدويًا",reportReason:"سبب البلاغ",reportedResponse:"رد الطرف المعني",privateFinding:"نتيجة المراجعة الخاصة بالإدارة",reviewRationale:"مبرر المراجعة",savePrivateReview:"حفظ المراجعة الخاصة",cashIssueReason:"نوع النزاع المالي",chatMessage:"الرسالة المُبلّغ عنها",noChatMessage:"لا توجد رسالة مرتبطة بهذا البلاغ",safetyReport:"بلاغ سلامة مشارك",chatReport:"بلاغ محادثة الطلب",cashIssue:"نزاع تمويل نقدي",safetySubstantiated:"بلاغ مثبت",safetyUnsubstantiated:"بلاغ غير مثبت",customer_received_unpaid:"العميل استلم الطلب دون دفع",customer_no_show:"العميل لم يحضر",assigned_driver_problem:"مشكلة مع السائق المعيّن",abuse_or_threats:"إساءة أو تهديد",suspected_fraud:"اشتباه في احتيال",other:"سبب آخر",provider_refusal:"رفض مقدم الخدمة",dispute:"نزاع مالي"},
+   en:{shortRef:"Short ref",fullOrderId:"Full order ID",copyOrderId:"Copy ID",copiedOrderId:"Order ID copied",copyFailed:"Could not copy; select the ID manually",reportReason:"Report reason",reportedResponse:"Reported participant response",privateFinding:"Private review finding",reviewRationale:"Review rationale",savePrivateReview:"Save private review",cashIssueReason:"Cash issue type",chatMessage:"Reported chat message",noChatMessage:"No message is attached to this report",safetyReport:"Participant safety report",chatReport:"Order chat report",cashIssue:"Cash funding issue",safetySubstantiated:"Substantiated",safetyUnsubstantiated:"Unsubstantiated",customer_received_unpaid:"Customer received order without paying",customer_no_show:"Customer did not show up",assigned_driver_problem:"Problem with assigned driver",abuse_or_threats:"Abuse or threats",suspected_fraud:"Suspected fraud",other:"Other reason",provider_refusal:"Provider refusal",dispute:"Financial dispute"}
+ };
+ function complaintUi(k){return(complaintUiText[lang]&&complaintUiText[lang][k])||complaintUiText.en[k]||ct("unknown");}
+ function complaintReasonLabel(code){return complaintUi(code);}
+ function complaintFindingLabel(code){return code==="pending"?ct("pending"):code==="substantiated"?complaintUi("safetySubstantiated"):code==="unsubstantiated"?complaintUi("safetyUnsubstantiated"):ct("unknown");}
 
 async function api(path,opts){
   opts=opts||{};
@@ -6630,8 +7460,17 @@ async function api(path,opts){
   return res.json();
 }
 
-function showLogin(){document.getElementById("login-view").style.display="flex";document.getElementById("main-view").style.display="none";}
-function showMain(){document.getElementById("login-view").style.display="none";document.getElementById("main-view").style.display="block";if(isMobile()){forceSidebarClosed();}else{closeSidebar();}setTimeout(function(){navigate("dashboard");},0);}
+function refreshAdminLoginForm(){
+  var owner=adminLoginKind==="owner";
+  document.getElementById("login-email-group").style.display=owner?"block":"none";
+  document.getElementById("login-pw-label").textContent=owner?(lang==="ar"?"كلمة مرور حساب Firebase":"Firebase account password"):t("adminPassword");
+  var switchEl=document.getElementById("login-switch");
+  switchEl.style.display=ADMIN_LOGIN_MODE==="dual"?"inline-flex":"none";
+  switchEl.textContent=owner?(lang==="ar"?"استخدام دخول الإدارة السابق مؤقتًا":"Use temporary legacy login"):(lang==="ar"?"الدخول بحساب المالك":"Sign in as owner");
+}
+function switchAdminLogin(){adminLoginKind=adminLoginKind==="owner"?"legacy":"owner";refreshAdminLoginForm();setLoginStatus("");}
+function showLogin(){document.getElementById("login-view").style.display="flex";document.getElementById("main-view").style.display="none";refreshAdminLoginForm();}
+function showMain(){document.getElementById("login-view").style.display="none";document.getElementById("main-view").style.display="block";if(isMobile()){forceSidebarClosed();}else{closeSidebar();}setTimeout(function(){navigate(location.hash==="#complaints"?"complaints":"dashboard");},0);}
 
 function setLoginStatus(message,type){
   var el=document.getElementById("login-status");
@@ -6642,43 +7481,53 @@ function setLoginStatus(message,type){
 async function doLogin(event){
   if(event&&event.preventDefault)event.preventDefault();
   var pwEl=document.getElementById("login-password");
+  var emailEl=document.getElementById("login-email");
   var btn=document.getElementById("login-btn");
   var errEl=document.getElementById("login-error");
   var pw=pwEl?pwEl.value:"";
   if(errEl){errEl.textContent="";errEl.style.display="none";}
-  if(!pw){
-    setLoginStatus(t("enterPassword"),"error");
-    if(pwEl)pwEl.focus();
+  if(!pw||(adminLoginKind==="owner"&&!emailEl.value.trim())){
+    setLoginStatus(lang==="ar"?"أدخل البريد الإلكتروني وكلمة المرور":"Enter your email and password","error");
+    if(adminLoginKind==="owner"&&!emailEl.value.trim())emailEl.focus();else if(pwEl)pwEl.focus();
     return false;
   }
-  if(btn){btn.disabled=true;btn.textContent="\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...";}
-  setLoginStatus("\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...","loading");
+  if(btn){btn.disabled=true;btn.textContent=ui("signingIn");}
+  setLoginStatus(ui("signingIn"),"loading");
   try{
-    var res=await fetch("/admin/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
+    var owner=adminLoginKind==="owner";
+    var res=await fetch(owner?"/admin/api/owner-login":"/admin/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(owner?{email:emailEl.value.trim(),password:pw}:{password:pw})});
     var data=null;
     try{data=await res.json();}catch(e){data=null;}
-    if(res.status===401){
-      setLoginStatus("\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629","error");
+    if(res.status===401||res.status===429){
+      setLoginStatus(res.status===429?(lang==="ar"?"محاولات كثيرة، حاول لاحقًا":"Too many attempts; try later"):(lang==="ar"?"تعذر التحقق من بيانات الدخول":"Unable to verify sign-in details"),"error");
       return false;
     }
     if(!res.ok||!data||!data.token){
-      setLoginStatus("\u062A\u0639\u0630\u0631 \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644\u060C \u062D\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062E\u0631\u0649","error");
+      setLoginStatus(ui("loginRetry"),"error");
       return false;
     }
     TOKEN=data.token;
+    pwEl.value="";
     sessionStorage.setItem("tbk_admin_token",TOKEN);
+    sessionStorage.setItem("tbk_admin_kind",owner?"owner":"legacy");
     setLoginStatus("","success");
     showMain();
     return true;
   }catch(e){
-    setLoginStatus("\u062A\u0639\u0630\u0631 \u0627\u0644\u0627\u062A\u0635\u0627\u0644 \u0628\u0627\u0644\u062E\u0627\u062F\u0645","error");
+    setLoginStatus(ui("serverUnavailable"),"error");
     return false;
   }finally{
     if(btn){btn.disabled=false;btn.textContent=t("signIn");}
   }
 }
 
-function doLogout(){TOKEN=null;sessionStorage.removeItem("tbk_admin_token");showLogin();}
+async function doLogout(){
+  var token=TOKEN;
+  var revoked=true;
+  if(token){try{var response=await fetch("/admin/api/logout",{method:"POST",headers:{"Authorization":"Bearer "+token}});revoked=response.ok;}catch(e){revoked=false;}}
+  TOKEN=null;sessionStorage.removeItem("tbk_admin_token");sessionStorage.removeItem("tbk_admin_kind");showLogin();
+  if(!revoked)setLoginStatus(lang==="ar"?"انتهت الجلسة هنا، لكن تعذر تأكيد إبطالها على الخادم. حاول مرة أخرى بعد الاتصال.":"Signed out here, but server revocation could not be confirmed.","error");
+}
 
 function isMobile(){return window.innerWidth<=768;}
 function toggleSidebar(){var sb=document.getElementById("sidebar");var bd=document.getElementById("sidebar-backdrop");if(!sb||!bd)return;if(sb.classList.contains("open")){closeSidebar();}else{if(isMobile()){sb.style.visibility="";sb.style.pointerEvents="";}sb.classList.add("open");bd.classList.add("show");document.body.style.overflow="hidden";}}
@@ -6706,17 +7555,17 @@ document.addEventListener("keydown",function(event){if(event.key==="Escape"&&doc
 function roleBadge(role){
   var m={customer:"blue",provider:"orange",driver:"purple"};
   var l={customer:t("customer"),provider:t("provider"),driver:t("driver")};
-  return '<span class="badge badge-'+(m[role]||"gray")+'">'+esc(l[role]||role)+'</span>';
+  return '<span class="badge badge-'+(m[role]||"gray")+'">'+esc(l[role]||t("na"))+'</span>';
 }
 function statusBadge(status){
   var m={active:"green",trial:"yellow",suspended:"yellow",disabled:"red"};
   var l={active:t("active"),trial:t("trial"),suspended:t("suspend"),disabled:t("disabled")};
-  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||status||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||t("na"))+'</span>';
 }
 function subBadge(status){
   var m={active:"green",trialing:"blue",expired:"red",canceled:"gray",past_due:"yellow"};
   var l={active:t("active"),trialing:t("trialing"),expired:t("expired"),canceled:t("canceledSub"),past_due:t("pastDue")};
-  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||status||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||t("na"))+'</span>';
 }
 
 function getSubDaysRemaining(u){
@@ -6739,12 +7588,12 @@ function subStatusLabel(u){
 function verifBadge(s){
   var m={verified:"green",pending_review:"yellow",unverified:"red",none:"gray"};
   var l={verified:t("verifiedStatus"),pending_review:t("pendingReview"),unverified:t("unverifiedStatus"),none:t("notVerified")};
-  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||s||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||t("na"))+'</span>';
 }
 function flReviewBadge(s){
   var m={approved:"green",pending:"yellow",pending_review:"yellow",rejected:"red"};
   var l={approved:t("verifiedStatus"),pending:t("pendingReview"),pending_review:t("pendingReview"),rejected:t("unverifiedStatus")};
-  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||s||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||t("na"))+'</span>';
 }
 function complaintStatusBadge(status){
   var m={pending:"yellow",resolved:"green",closed:"gray"};
@@ -6752,7 +7601,9 @@ function complaintStatusBadge(status){
 }
 function complaintStatusLabel(status){return ct(status==="pending"?"pending":status==="resolved"?"resolved":status==="closed"?"closed":"unknown");}
 function complaintTypeLabel(type){
-  if(type==="order_chat_report")return lang==="ar"?"بلاغ محادثة الطلب":"Order chat report";
+  if(type==="order_chat_report")return complaintUi("chatReport");
+  if(type==="participant_safety")return complaintUi("safetyReport");
+  if(type==="cash_funding_issue")return complaintUi("cashIssue");
   var m={customer_complaint:"customerComplaint",provider_complaint:"providerComplaint",delivery_not_confirmed:"deliveryNotConfirmed",customer_rejected_receipt:"customerRejectedReceipt"};
   return ct(m[type]||"unknown");
 }
@@ -6763,21 +7614,43 @@ function complaintDate(value){
 }
 function complaintPerson(item,role){
   var p=item&&item[role]||{};
-  return '<strong>'+esc(p.displayName||p.email||p.uid||ct("noUser"))+'</strong>'+(p.email&&p.displayName?'<div style="font-size:12px;color:var(--text2)">'+esc(p.email)+'</div>':"");
+  return '<strong>'+(p.displayName?esc(p.displayName):p.email||p.uid?'<bdi dir="ltr">'+esc(p.email||p.uid)+'</bdi>':ct("noUser"))+'</strong>'+(p.email&&p.displayName?'<div style="font-size:12px;color:var(--text2)"><bdi dir="ltr">'+esc(p.email)+'</bdi></div>':"");
 }
 var complaintFilter={status:"all",search:""};
 var allComplaints=[];
+var complaintOrderRefs=new Map();
+function compactComplaintOrderId(id,size){return id.length<=size*2+1?id:id.slice(0,size)+"…"+id.slice(-size);}
+function buildComplaintOrderRefs(items){
+  var ids=[...new Set(items.map(function(item){return item.orderId||"";}).filter(Boolean))];
+  var sizes=new Map(ids.map(function(id){return [id,6];})),refs=new Map();
+  for(var attempt=0;attempt<128;attempt++){
+    var groups=new Map();
+    ids.forEach(function(id){var ref=compactComplaintOrderId(id,sizes.get(id));refs.set(id,ref);if(!groups.has(ref))groups.set(ref,[]);groups.get(ref).push(id);});
+    var collisions=[...groups.values()].filter(function(group){return group.length>1;});
+    if(!collisions.length)break;
+    collisions.forEach(function(group){group.forEach(function(id){sizes.set(id,sizes.get(id)+1);});});
+  }
+  return refs;
+}
+function complaintOrderDisplay(x){return x.displayOrderNumber||(x.orderNumber!==x.orderId?x.orderNumber:"")||complaintOrderRefs.get(x.orderId)||x.orderId||"-";}
+function complaintHasOrderNumber(x){return !!(x.displayOrderNumber||(x.orderNumber!==x.orderId&&x.orderNumber));}
 async function renderComplaints(c){
   var data=await api("/complaints");
   if(!data)return;
   allComplaints=data.complaints||[];
+  complaintOrderRefs=buildComplaintOrderRefs(allComplaints);
   var counts={all:allComplaints.length,pending:0,resolved:0,closed:0};
   allComplaints.forEach(function(x){if(counts[x.complaintStatus]!==undefined)counts[x.complaintStatus]++;});
   var cards=["all","pending","resolved","closed"].map(function(s){
     return '<button class="stat-card '+(complaintFilter.status===s?"selected":"")+'" data-status="'+s+'" onclick="setComplaintStatusFilter(this.dataset.status)" style="text-align:inherit;cursor:pointer"><div class="stat-label">'+ct(s)+'</div><div class="stat-value">'+counts[s]+'</div></button>';
   }).join("");
+  var safety=data.safetySummary||{};
+  var safetyLabels=lang==="ar"?[complaintUi("safetySubstantiated"),complaintUi("safetyUnsubstantiated"),"طلبات مختلفة","آخر 7 أيام","آخر 30 يومًا","حسابات للمراجعة اليدوية","بلاغات خطيرة قيد المراجعة"]:[complaintUi("safetySubstantiated"),complaintUi("safetyUnsubstantiated"),"Distinct orders","Last 7 days","Last 30 days","Accounts for manual review","Serious reports for manual review"];
+  var safetyValues=[safety.substantiated,safety.unsubstantiated,safety.distinctOrders,safety.last7Days,safety.last30Days,safety.repeatedSubstantiatedAccountsForManualReview,safety.seriousPendingForManualReview];
+  var safetyCards=safetyLabels.map(function(label,i){return '<div class="stat-card"><div class="stat-label">'+esc(label)+'</div><div class="stat-value">'+esc(String(Number(safetyValues[i])||0))+'</div></div>';}).join("");
   c.innerHTML='<h1 class="page-title">'+ct("title")+'</h1>'+
     '<div class="stats-grid complaint-stats">'+cards+'</div>'+
+    '<div class="stats-grid complaint-stats">'+safetyCards+'</div>'+
     '<div class="settings-section">'+
     '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">'+
     '<input id="complaint-search" type="search" value="'+esc(complaintFilter.search)+'" placeholder="'+ct("search")+'" style="flex:1;min-width:220px;padding:9px;border:1px solid var(--border);border-radius:6px" oninput="filterComplaints(this.value)">'+
@@ -6802,12 +7675,12 @@ function paintComplaintRows(){
   var items=allComplaints.filter(function(x){
     if(complaintFilter.status!=="all"&&x.complaintStatus!==complaintFilter.status)return false;
     if(!q)return true;
-    var text=[x.orderNumber,x.note,x.type,x.source,x.target,x.customer&&x.customer.displayName,x.provider&&x.provider.displayName,x.driver&&x.driver.displayName].join(" ").toLowerCase();
+    var text=[x.orderNumber,x.displayOrderNumber,x.orderId,complaintOrderRefs.get(x.orderId),x.note,x.type,x.reasonCode,x.source,x.target,x.customer&&x.customer.displayName,x.provider&&x.provider.displayName,x.driver&&x.driver.displayName].join(" ").toLowerCase();
     return text.indexOf(q)>=0;
   });
   body.innerHTML=items.map(function(x){
     var id=esc(x.id||"");
-    return '<tr><td><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong><div style="font-size:11px;color:var(--text2)">'+esc(x.orderId||"")+'</div></td>'+
+    return '<tr><td class="complaint-order-cell">'+(complaintHasOrderNumber(x)?'<strong class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</strong>':'<span class="complaint-short-label">'+complaintUi("shortRef")+':</span> <strong class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</strong>')+'</td>'+
       '<td>'+esc(complaintTypeLabel(x.type))+'</td>'+
       '<td>'+esc(complaintRoleLabel(x.source))+'</td>'+
       '<td>'+esc(complaintRoleLabel(x.target))+'</td>'+
@@ -6818,18 +7691,21 @@ function paintComplaintRows(){
   }).join("")||'<tr><td colspan="8" class="empty">'+ct("noComplaints")+'</td></tr>';
 }
 function complaintRoleLabel(role){
+  if(role==="admin")return lang==="ar"?"الإدارة":"Admin";
   var m={customer:"customer",provider:"provider",driver:"driver"};
   return ct(m[role]||"unknown");
 }
 async function viewComplaint(id){
   openModal('<div class="loading">'+ct("loading")+'</div>');
   var data=await api("/complaints/"+encodeURIComponent(id));
-  if(!data||!data.complaint){closeModal();toast((data&&data.error)||ct("saveFailed"),"error");return;}
+  if(!data||!data.complaint){closeModal();toast(adminError(data,ct("saveFailed")),"error");return;}
   var x=data.complaint;
-  var chatContext=x.type==="order_chat_report"?'<div class="form-group"><label>'+(lang==="ar"?"الرسالة المُبلّغ عنها":"Reported chat message")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+((x.reportedChatContext||[]).map(function(m){return '<div><strong>'+esc(complaintRoleLabel(m.senderRole))+'</strong><div>'+esc(m.text||"")+'</div><small>'+complaintDate(m.createdAt)+'</small></div>';}).join("")||(lang==="ar"?"لا توجد رسالة مرتبطة بهذا البلاغ":"No message is attached to this report"))+'</div></div>':"";
-  openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span style="font-size:13px;color:var(--text2)">#'+esc(x.orderNumber||x.orderId||x.id)+'</span></h3>'+
+  var chatContext=x.type==="order_chat_report"?'<div class="form-group"><label>'+complaintUi("chatMessage")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+((x.reportedChatContext||[]).map(function(m){return '<div><strong>'+esc(complaintRoleLabel(m.senderRole))+'</strong><div>'+esc(m.text||"")+'</div><small>'+complaintDate(m.createdAt)+'</small></div>';}).join("")||complaintUi("noChatMessage"))+'</div></div>':"";
+  var safetyReview=x.type==="participant_safety"?'<div class="form-group"><label>'+complaintUi("reportReason")+'</label><strong>'+esc(complaintReasonLabel(x.reasonCode))+'</strong></div><div class="form-group"><label>'+complaintUi("reportedResponse")+'</label><div style="white-space:pre-wrap">'+esc(x.targetResponse||"-")+'</div></div><div class="form-group"><label for="safety-finding">'+complaintUi("privateFinding")+'</label><select id="safety-finding" style="width:100%">'+["pending","substantiated","unsubstantiated"].map(function(s){return '<option value="'+s+'" '+(x.reviewFinding===s?"selected":"")+'>'+esc(complaintFindingLabel(s))+'</option>';}).join("")+'</select></div><div class="form-group"><label for="safety-review-note">'+complaintUi("reviewRationale")+'</label><textarea id="safety-review-note" rows="3" maxlength="2000" style="width:100%">'+esc(x.reviewNote||"")+'</textarea></div><button class="btn btn-secondary" data-id="'+esc(x.id)+'" onclick="saveSafetyReview(this.dataset.id)">'+complaintUi("savePrivateReview")+'</button>':"";
+  var cashIssue=x.type==="cash_funding_issue"?'<div class="form-group"><label>'+complaintUi("cashIssueReason")+'</label><strong>'+esc(complaintReasonLabel(x.reasonCode))+'</strong></div>':"";
+  openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</span></h3>'+
     '<div class="detail-grid">'+
-    '<div><label>'+ct("orderNumber")+'</label><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong></div>'+
+    '<div><label>'+(complaintHasOrderNumber(x)?ct("orderNumber"):complaintUi("shortRef"))+'</label><strong class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</strong></div>'+
     '<div><label>'+ct("complaintType")+'</label><strong>'+esc(complaintTypeLabel(x.type))+'</strong></div>'+
     '<div><label>'+ct("source")+'</label><strong>'+esc(complaintRoleLabel(x.source))+'</strong></div>'+
     '<div><label>'+ct("target")+'</label><strong>'+esc(complaintRoleLabel(x.target))+'</strong></div>'+
@@ -6838,17 +7714,25 @@ async function viewComplaint(id){
     '<div><label>'+ct("driver")+'</label>'+complaintPerson(x,"driver")+'</div>'+
     '<div><label>'+ct("created")+'</label><strong>'+complaintDate(x.createdAt)+'</strong></div>'+
     '</div>'+
-    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+
+    (x.orderId?'<div class="form-group"><label>'+complaintUi("fullOrderId")+'</label><div class="complaint-order-full"><code dir="ltr">'+esc(x.orderId)+'</code><button class="btn btn-secondary btn-sm" data-order-id="'+esc(x.orderId)+'" onclick="copyComplaintOrderId(this.dataset.orderId)">'+complaintUi("copyOrderId")+'</button></div></div>':"")+
+    '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+cashIssue+safetyReview+
     '<div class="form-group"><label for="complaint-status">'+ct("status")+'</label><select id="complaint-status" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px">'+["pending","resolved","closed"].map(function(s){return'<option value="'+s+'" '+(x.complaintStatus===s?"selected":"")+'>'+ct(s)+'</option>';}).join("")+'</select></div>'+
     '<div class="form-group"><label for="complaint-admin-note">'+ct("adminReply")+'</label><textarea id="complaint-admin-note" rows="4" maxlength="4000" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;resize:vertical">'+esc(x.adminNote||"")+'</textarea></div>'+
     '<div style="font-size:12px;color:var(--text2);margin-bottom:12px">'+ct("updated")+': '+complaintDate(x.updatedAt)+'</div>'+
     '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-orange" data-id="'+esc(x.id)+'" onclick="saveComplaint(this.dataset.id)">'+ct("save")+'</button></div>');
 }
+async function copyComplaintOrderId(id){try{await navigator.clipboard.writeText(id);toast(complaintUi("copiedOrderId"));}catch(e){toast(complaintUi("copyFailed"),"error");}}
+async function saveSafetyReview(id){
+  var finding=document.getElementById("safety-finding");
+  var note=document.getElementById("safety-review-note");
+  var data=await api("/complaints/"+encodeURIComponent(id)+"/review",{method:"POST",body:JSON.stringify({finding:finding?finding.value:"pending",reviewNote:note?note.value:""})});
+  if(data&&data.success){toast(ct("saved"));viewComplaint(id);}else toast(adminError(data,ct("saveFailed")),"error");
+}
 async function saveComplaint(id){
   var statusEl=document.getElementById("complaint-status");
   var noteEl=document.getElementById("complaint-admin-note");
   var data=await api("/complaints/"+encodeURIComponent(id)+"/update",{method:"POST",body:JSON.stringify({complaintStatus:statusEl?statusEl.value:"pending",adminNote:noteEl?noteEl.value:""})});
-  if(data&&data.success){closeModal();toast(ct("saved"));renderPage();}else{toast((data&&data.error)||ct("saveFailed"),"error");}
+  if(data&&data.success){closeModal();toast(ct("saved"));renderPage();}else{toast(adminError(data,ct("saveFailed")),"error");}
 }
 async function renderVerification(c){
   var data=await api("/verification");
@@ -6885,7 +7769,7 @@ async function renderVerification(c){
 }
 async function approveFreelance(uid){
   var data=await api("/verification/freelance/"+uid+"/approve",{method:"POST",body:JSON.stringify({})});
-  if(data&&data.success){toast(t("verificationApproved"));renderPage();}else{toast((data&&data.error)||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("verificationApproved"));renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 function rejectFreelance(uid){
   openModal('<h3>'+t("reject")+'</h3><div class="form-group"><label>'+t("rejectReason")+'</label><textarea id="rej-note" rows="3" style="width:100%"></textarea></div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="confirmRejectFreelance(this.dataset.userId)">'+t("reject")+'</button></div>');
@@ -6894,7 +7778,7 @@ async function confirmRejectFreelance(uid){
   var el=document.getElementById("rej-note");
   var note=el?el.value:"";
   var data=await api("/verification/freelance/"+uid+"/reject",{method:"POST",body:JSON.stringify({note:note})});
-  if(data&&data.success){toast(t("verificationRejected"));closeModal();renderPage();}else{toast((data&&data.error)||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("verificationRejected"));closeModal();renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 async function renderPage(){
   if(isMobile()){forceSidebarClosed();}else{closeSidebar();}
@@ -6912,7 +7796,7 @@ async function renderPage(){
     else if(currentPage==="notifications")await renderNotifications(c);
     c.focus({preventScroll:true});
     startAdminLivePolling();
-  }catch(e){c.innerHTML='<div class="inline-error"><strong>'+(lang==="ar"?"تعذر تحميل الصفحة":"Page failed to load")+'</strong><div>'+esc(e.message)+'</div><button class="btn btn-sm btn-secondary" style="margin-top:10px" onclick="renderPage()">'+(lang==="ar"?"إعادة المحاولة":"Retry")+'</button></div>';}
+  }catch(e){c.innerHTML='<div class="inline-error"><strong>'+(lang==="ar"?"تعذر تحميل الصفحة":"Page failed to load")+'</strong><div>'+esc(lang==="ar"?t("connectionError"):e.message)+'</div><button class="btn btn-sm btn-secondary" style="margin-top:10px" onclick="renderPage()">'+(lang==="ar"?"إعادة المحاولة":"Retry")+'</button></div>';}
 }
 
 async function renderDashboard(c){
@@ -6936,7 +7820,7 @@ async function renderDashboard(c){
     '<div id="live-stat-verifiedAccounts" class="stat-card blue"><div class="label">'+(lang==="ar"?"الحسابات الموثقة":"Verified accounts")+'</div><div class="value">'+(s.verifiedAccounts||0)+'</div></div>'+
     '</div>'+
     '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"حالة إصدارات التطبيق":"App release health")+'</h2><p>'+(lang==="ar"?"ملخص المستخدمين حسب إصدار التطبيق المسجل لكل مستخدم.":"Users classified by their recorded app version.")+'</p></div><button class="btn btn-sm btn-secondary" onclick="navigate(\\'releases\\')">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button></div>'+
-    '<div class="release-grid"><div><div class="metric-label">على 1.0.6 أو أحدث</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">يحتاجون تحديث</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">غير معروف</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
+    '<div class="release-grid"><div><div class="metric-label">'+ui("releaseCurrent")+'</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">'+ui("releaseRequiredPlural")+'</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">'+ui("releaseUnknownShort")+'</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
     '<div id="drill-down"></div>';
 }
 
@@ -6996,40 +7880,90 @@ async function renderUsers(c){
   allUsers=data.users||[];
   setReleaseIntelligence(data);
   var versions=knownReleaseVersions();
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">إدارة المستخدمين</div><h1 class="page-title">'+t("users")+' <span id="users-count" class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">إدارة الحسابات ومعرفة إصدار التطبيق المسجل لكل مستخدم.</p></div></div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">'+ui("usersKicker")+'</div><h1 class="page-title">'+t("users")+' <span id="users-count" class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">'+ui("usersIntro")+'</p></div></div>'+
     '<div class="filters">'+
     '<select id="f-role" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
     '<select id="f-status" onchange="filterUsers()"><option value="">'+t("allStatus")+'</option><option value="active">'+t("active")+'</option><option value="trial">'+t("trial")+'</option><option value="suspended">'+t("suspend")+'</option><option value="disabled">'+t("disabled")+'</option></select>'+
-    '<select id="f-release" onchange="filterUsers()"><option value="">حالة الإصدار: الكل</option><option value="CURRENT">محدّث</option><option value="UPDATE_REQUIRED">يحتاج تحديث</option><option value="UNKNOWN">غير معروف</option></select>'+
-    '<select id="f-version" onchange="filterUsers()"><option value="">الإصدار: الكل</option>'+versions.map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("")+'</select>'+
+    '<select id="f-release" onchange="filterUsers()"><option value="">'+ui("releaseStatusAll")+'</option><option value="CURRENT">'+ui("releaseUpdated")+'</option><option value="UPDATE_REQUIRED">'+ui("releaseRequired")+'</option><option value="UNKNOWN">'+ui("releaseUnknownShort")+'</option></select>'+
+    '<select id="f-version" onchange="filterUsers()"><option value="">'+ui("releaseVersionAll")+'</option>'+versions.map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("")+'</select>'+
     '<input type="text" id="f-search" placeholder="'+t("searchPlaceholder")+'" oninput="filterUsers()">'+
     '</div>'+
-    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>إصدار التطبيق</th><th>حالة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div>';
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>'+ui("releaseAppVersion")+'</th><th>'+ui("releaseStatus")+'</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div>';
   filterUsers();
   startReleasePolling();
 }
 
 function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},displayCounts:data.displayCounts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",testVersion:data.testVersion||"1.0.7",adoptionPercent:data.adoptionPercent||0};}
-function releaseStatusText(value){var labels={CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاج تحديث",TEST_RELEASE:"1.0.7 · جديد / تجريبي",PUBLIC_RELEASE:"1.0.6 · الإصدار العام",OLDER:"إصدار أقدم",OTHER_REPORTED:"إصدار آخر مُبلّغ عنه",UNKNOWN:"لم يُبلّغ عن إصدار"};return labels[value]||labels.UNKNOWN;}
+function releaseStatusText(value){var keys={CURRENT:"releaseCurrent",UPDATE_REQUIRED:"releaseRequired",TEST_RELEASE:"releaseTest",PUBLIC_RELEASE:"releasePublic",OLDER:"releaseOlder",OTHER_REPORTED:"releaseOther",UNKNOWN:"releaseUnknown"};return ui(keys[value]||"releaseUnknown");}
 function releaseStatusBadge(value){var cls=value==="CURRENT"||value==="PUBLIC_RELEASE"?"status-current":value==="TEST_RELEASE"?"status-supported":value==="UPDATE_REQUIRED"||value==="OLDER"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
-function releaseMetric(key,value,note){var labels={TOTAL:"إجمالي المستخدمين",CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاجون تحديث",TEST_RELEASE:"1.0.7 · جديد / TestFlight / Internal Testing",PUBLIC_RELEASE:"1.0.6 · الإصدار العام الحالي",OLDER:"أقل من 1.0.6",OTHER_REPORTED:"إصدارات أخرى مُبلّغ عنها",UNKNOWN:"لم يُبلّغ عن إصدار",ADOPTION:"نسبة التحديث"};var cls=key==="CURRENT"||key==="PUBLIC_RELEASE"?"current":key==="TEST_RELEASE"?"supported":key==="UPDATE_REQUIRED"||key==="OLDER"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
+function releaseMetric(key,value,note){var labels={TOTAL:"releaseTotal",CURRENT:"releaseCurrent",UPDATE_REQUIRED:"releaseRequiredPlural",TEST_RELEASE:"releaseTestMetric",PUBLIC_RELEASE:"releasePublicMetric",OLDER:"releaseOlderMetric",OTHER_REPORTED:"releaseOtherMetric",UNKNOWN:"releaseUnknown",ADOPTION:"releaseAdoption"};var cls=key==="CURRENT"||key==="PUBLIC_RELEASE"?"current":key==="TEST_RELEASE"?"supported":key==="UPDATE_REQUIRED"||key==="OLDER"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+ui(labels[key])+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
 function knownReleaseVersions(){var values={"1.0.7":true,"1.0.6":true};allUsers.forEach(function(u){var version=u.releaseIntelligence&&u.releaseIntelligence.appVersion;if(version)values[version]=true;});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
-function refreshReleaseVersionFilter(){var select=document.getElementById("f-version");if(!select)return;var selected=select.value;select.innerHTML='<option value="">الإصدار: الكل</option>'+knownReleaseVersions().map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");select.value=selected;}
-function releaseCategoryMetric(key){var count=(releaseIntelligence.displayCounts||{})[key]||0,total=releaseIntelligence.totalUsers||0,pct=total?Math.round(count*1000/total)/10:0;return releaseMetric(key,count,pct+"% من إجمالي الحسابات");}
+function refreshReleaseVersionFilter(){var select=document.getElementById("f-version");if(!select)return;var selected=select.value;select.innerHTML='<option value="">'+ui("releaseVersionAll")+'</option>'+knownReleaseVersions().map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");select.value=selected;}
+function releaseCategoryMetric(key){var count=(releaseIntelligence.displayCounts||{})[key]||0,total=releaseIntelligence.totalUsers||0,pct=total?Math.round(count*1000/total)/10:0;return releaseMetric(key,count,pct+ui("releaseShare"));}
 
 async function renderReleaseIntelligence(c){
   var data=await api("/users");if(!data)return;allUsers=data.users||[];setReleaseIntelligence(data);
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">آخر إصدار أبلغ عنه كل حساب، وليس إصدار كل جهاز. الإصدار العام الحالي: <span id="release-current-version">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span> · 1.0.7 إصدار تجريبي ولا يغيّر أهلية تذكير مستخدمي 1.0.6.</p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">'+ui("releaseTracking")+'</div><h1 class="page-title">'+ui("releaseTitle")+'</h1><p class="page-subtitle">'+ui("releaseIntro")+' <span id="release-current-version" dir="ltr">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span> · '+ui("releaseTestDisclaimer")+'</p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
     '<div class="release-grid"><div id="release-metric-total">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+'</div><div id="release-metric-test">'+releaseCategoryMetric("TEST_RELEASE")+'</div><div id="release-metric-public">'+releaseCategoryMetric("PUBLIC_RELEASE")+'</div><div id="release-metric-older">'+releaseCategoryMetric("OLDER")+'</div><div id="release-metric-unknown">'+releaseCategoryMetric("UNKNOWN")+'</div><div id="release-metric-other">'+releaseCategoryMetric("OTHER_REPORTED")+'</div></div>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد ونسبة الحسابات حسب آخر إصدار مُبلّغ عنه؛ غير المعروف لا يعني إصدارًا قديمًا.</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>إصدارات الحسابات</h2><p>تصفية حسب الإصدار الدقيق والدور والحساب؛ البيانات تخص الحساب لا التثبيت الفعلي.</p></div></div><div class="filters">'+
-    '<select id="f-role" aria-label="تصفية الدور" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
-    '<select id="f-release" aria-label="تصفية فئة الإصدار" onchange="filterUsers()"><option value="">فئة الإصدار: الكل</option><option value="TEST_RELEASE">1.0.7 · تجريبي</option><option value="PUBLIC_RELEASE">1.0.6 · عام</option><option value="OLDER">أقدم من 1.0.6</option><option value="UNKNOWN">لم يُبلّغ</option><option value="OTHER_REPORTED">إصدار آخر</option></select>'+
-    '<select id="f-version" aria-label="تصفية الإصدار الدقيق" onchange="filterUsers()"></select><input type="text" id="f-search" aria-label="تصفية الحساب بالاسم أو المعرّف" placeholder="ابحث باسم الحساب أو معرّفه" oninput="filterUsers()"></div>'+
-    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>آخر إصدار أبلغ عنه الحساب</th><th>فئة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>';
+    '<section class="surface-panel"><div class="surface-head"><div><h2>'+ui("releaseDistribution")+'</h2><p>'+ui("releaseDistributionHint")+'</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>'+ui("releaseAccounts")+'</h2><p>'+ui("releaseAccountsHint")+'</p></div></div><div class="filters">'+
+    '<select id="f-role" aria-label="'+ui("releaseRoleFilter")+'" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
+    '<select id="f-release" aria-label="'+ui("releaseCategoryFilter")+'" onchange="filterUsers()"><option value="">'+ui("releaseCategoryAll")+'</option><option value="TEST_RELEASE">'+ui("releaseTestShort")+'</option><option value="PUBLIC_RELEASE">'+ui("releasePublicShort")+'</option><option value="OLDER">'+ui("releaseOlderShort")+'</option><option value="UNKNOWN">'+ui("releaseNotReported")+'</option><option value="OTHER_REPORTED">'+ui("releaseOtherShort")+'</option></select>'+
+    '<select id="f-version" aria-label="'+ui("releaseVersionFilter")+'" onchange="filterUsers()"></select><input type="text" id="f-search" aria-label="'+ui("releaseAccountFilter")+'" placeholder="'+ui("releaseAccountSearch")+'" oninput="filterUsers()"></div>'+
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>'+ui("releaseLastVersion")+'</th><th>'+ui("releaseCategory")+'</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>'+
+    '<section class="surface-panel" id="version-gate-panel" aria-label="'+ui("gatePolicy")+'"><div class="surface-head"><div><h2>'+ui("gateTitle")+'</h2><p>'+ui("gateIntro")+'</p></div></div><div id="version-gate-content" role="status">'+ui("gateLoading")+'</div></section>';
   refreshReleaseVersionFilter();
   paintReleaseIntelligence();
   startReleasePolling();
+  await loadClientVersionGatePanel();
+}
+var clientVersionGateRevision=null;
+function clientVersionGateForm(){
+  function value(id){var el=document.getElementById(id);return el?el.value.trim():"";}
+  return {enabled:!!(document.getElementById("vg-enabled")||{}).checked,
+    ios:{minimumVersion:value("vg-ios-version"),minimumBuild:value("vg-ios-build"),storeUrl:value("vg-ios-url")},
+    android:{minimumVersion:value("vg-android-version"),minimumBuild:value("vg-android-build"),storeUrl:value("vg-android-url")}};
+}
+async function loadClientVersionGatePanel(){
+  var target=document.getElementById("version-gate-content");if(!target)return;
+  var result;try{result=await api("/client-version-gate");}catch(e){}
+  if(!target.isConnected)return;
+  if(!result||(!result.success&&result.code!=="CLIENT_VERSION_GATE_INVALID")){
+    target.innerHTML='<p role="alert">'+ui("gateLoadError")+'</p>';return;
+  }
+  clientVersionGateRevision=result.revision||null;
+  var policy=result.clientVersionGate||{enabled:false,ios:{minimumVersion:"",minimumBuild:"",storeUrl:""},android:{minimumVersion:"",minimumBuild:"",storeUrl:""}};
+  var editable=result.ownerAuthorizationAvailable===true;
+  function field(id,label,value,hint){return '<div class="form-group"><label for="'+id+'">'+label+'</label><input id="'+id+'" type="'+(id==='vg-owner-email'?'email':'text')+'"'+(id==='vg-owner-email'?' autocomplete="username"':'')+' value="'+esc(value||"")+'"'+(editable?'':' readonly')+' aria-describedby="'+id+'-hint"><small id="'+id+'-hint">'+hint+'</small></div>';}
+  target.innerHTML=(result.code==="CLIENT_VERSION_GATE_INVALID"?'<p role="alert">'+ui("gateInvalid")+'</p>':'')+
+    '<p role="status">'+(policy.enabled?ui("gateEnabled"):ui("gateDisabled"))+' · '+(result.activationReady?ui("gateReady"):ui("gateNotReady"))+'</p>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="vg-enabled"'+(policy.enabled?' checked':'')+(editable?'':' disabled')+'> '+ui("gateToggle")+'</label></div>'+
+    '<div class="grid-2">'+
+    field('vg-ios-version',ui("gateIosVersion"),policy.ios.minimumVersion,ui("gateVersionHint"))+
+    field('vg-ios-build',ui("gateIosBuild"),policy.ios.minimumBuild,ui("gateBuildHint"))+
+    field('vg-ios-url',ui("gateIosUrl"),policy.ios.storeUrl,ui("gateStoreHint"))+
+    field('vg-android-version',ui("gateAndroidVersion"),policy.android.minimumVersion,ui("gateVersionHint"))+
+    field('vg-android-build',ui("gateAndroidBuild"),policy.android.minimumBuild,ui("gateBuildHint"))+
+    field('vg-android-url',ui("gateAndroidUrl"),policy.android.storeUrl,ui("gateStoreHint"))+'</div>'+
+    (editable?'<div class="grid-2">'+field('vg-owner-email',ui("gateOwnerEmail"),'',ui("gateOwnerHint"))+
+      '<div class="form-group"><label for="vg-owner-password">'+ui("gateOwnerPassword")+'</label><input id="vg-owner-password" type="password" autocomplete="current-password" aria-describedby="vg-password-hint"><small id="vg-password-hint">'+ui("gatePasswordHint")+'</small></div></div>'+
+      '<label class="toggle"><input type="checkbox" id="vg-store-confirm"> '+ui("gateStoreConfirm")+'</label><div class="page-actions"><button class="btn btn-primary" id="vg-save" onclick="saveClientVersionGate()">'+ui("gateSave")+'</button></div>':
+      '<p role="status">'+ui("gateReadOnly")+'</p>');
+}
+async function saveClientVersionGate(){
+  var policy=clientVersionGateForm(),emailEl=document.getElementById('vg-owner-email'),passwordEl=document.getElementById('vg-owner-password');
+  var email=emailEl?emailEl.value.trim():'',password=passwordEl?passwordEl.value:'';
+  if(passwordEl)passwordEl.value='';
+  if(!email||!password){toast(ui("gateOwnerRequired"),'error');return;}
+  if(policy.enabled&&!(document.getElementById('vg-store-confirm')||{}).checked){toast(ui("gateStoreRequired"),'error');return;}
+  if(!confirm(ui("gateConfirm")))return;
+  var button=document.getElementById('vg-save');if(button){button.disabled=true;button.textContent=ui("gateSaving");}
+  try{
+    var result=await api('/client-version-gate',{method:'POST',body:JSON.stringify({confirm:true,baseUpdateTime:clientVersionGateRevision,clientVersionGate:policy,ownerCredentials:{email:email,password:password}})});
+    if(result&&result.success){toast(ui("gateSaved"));await loadClientVersionGatePanel();}
+    else toast(adminError(result,ui("gateSaveError")),'error');
+  }catch(e){toast(ui("gateConnectionError"),'error');}
+  finally{if(button&&button.isConnected){button.disabled=false;button.textContent=ui("gateSave");}}
 }
 function paintReleaseIntelligence(){
   var rc=releaseIntelligence.counts||{};
@@ -7042,7 +7976,7 @@ function paintReleaseIntelligence(){
   set("release-metric-unknown",releaseCategoryMetric("UNKNOWN"));
   set("release-metric-other",releaseCategoryMetric("OTHER_REPORTED"));
   var action=document.getElementById("release-reminder-action");
-  if(action)action.innerHTML=(rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">إرسال تنبيه جماعي</button>':"";
+  if(action)action.innerHTML=(rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">'+ui("bulkReminder")+'</button>':"";
   set("release-distribution",releaseDistributionHtml());
   refreshReleaseVersionFilter();
   filterUsers();
@@ -7077,9 +8011,9 @@ function paintAdminLiveSummary(data){
   if(currentPage==="verification")markAdminSectionSeen("verification");
   ["totalUsers","customers","providers","drivers","providersInTrial","driversInTrial","activeSubscriptions","verifiedAccounts"].forEach(function(key){var el=document.getElementById("live-stat-"+key);if(el){var value=el.querySelector(".value");if(value)value.textContent=String(s[key]||0);}});
   ["CURRENT","UPDATE_REQUIRED","UNKNOWN"].forEach(function(key){var el=document.getElementById("live-release-"+key);if(el)el.textContent=String(r[key]||0);});
-  setLiveBadge("nav-complaints",(attention.complaints||[]).length,"بلاغات جديدة");
-  setLiveBadge("nav-verification",(attention.verification||[]).length,"طلبات توثيق جديدة");
-  var indicator=document.getElementById("admin-live-indicator");if(indicator)indicator.textContent="● يتم التحديث تلقائيًا · آخر تحديث: الآن";
+  setLiveBadge("nav-complaints",(attention.complaints||[]).length,ui("newComplaints"));
+  setLiveBadge("nav-verification",(attention.verification||[]).length,ui("newVerifications"));
+  var indicator=document.getElementById("admin-live-indicator");if(indicator)indicator.textContent="● "+ui("autoRefresh")+" · "+ui("lastRefresh")+": "+ui("liveNow");
 }
 function scheduleAdminLivePolling(epoch){
   if(epoch!==adminLiveState.epoch||document.visibilityState!=="visible")return;
@@ -7100,7 +8034,7 @@ function startAdminLivePolling(){
   refreshAdminLive(true,adminLiveState.epoch);scheduleAdminLivePolling(adminLiveState.epoch);
 }
 
-function releaseDistributionHtml(){var distribution=Object.assign({"1.0.7":0,"1.0.6":0},releaseIntelligence.distribution||{}),grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(grand?rows:'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
+function releaseDistributionHtml(){var distribution=Object.assign({"1.0.7":0,"1.0.6":0},releaseIntelligence.distribution||{}),grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version==="غير معروف"?ui("releaseUnknownShort"):version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' '+ui("releaseUsers")+'</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(grand?rows:'<div class="empty-state"><strong>'+ui("releaseNoData")+'</strong><span>'+ui("releaseNoDataHint")+'</span></div>')+'</div>';}
 
 function filterUsers(){
   var role=document.getElementById("f-role")?document.getElementById("f-role").value:"";
@@ -7122,33 +8056,33 @@ function filterUsers(){
   tbody.innerHTML=filtered.map(function(u){
     var r=u.releaseIntelligence||{classification:"UNKNOWN",appVersion:null};
     return "<tr>"+
-      "<td><div class=\\"contact-stack\\"><strong>"+esc(u.displayName||t("noName"))+"</strong><span>"+esc(u.email||"")+"</span><span>"+esc(u.phone||"")+"</span></div></td>"+
+      "<td><div class=\\"contact-stack\\"><strong>"+esc(u.displayName||t("noName"))+"</strong><span><bdi dir=\\"ltr\\">"+esc(u.email||"")+"</bdi></span><span><bdi dir=\\"ltr\\">"+esc(u.phone||"")+"</bdi></span></div></td>"+
       "<td>"+roleBadge(u.role)+"</td>"+
       "<td>"+statusBadge(u.accountStatus)+"</td>"+
       "<td><strong>"+esc(r.appVersion||"—")+"</strong></td>"+
       "<td>"+releaseStatusBadge(currentPage==="releases"?r.displayCategory:r.classification)+"</td>"+
-      "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(r.classification==="UPDATE_REQUIRED"?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">طلب تحديث</button>":"")+"</div></td>"+
+      "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(r.classification==="UPDATE_REQUIRED"?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">"+ui("singleReminder")+"</button>":"")+"</div></td>"+
     "</tr>";
   }).join("");
 }
 
 function confirmReleaseReminder(uid){
   var u=allUsers.find(function(item){return item._id===uid;});if(!u)return;
-  openModal('<h3>تأكيد إرسال طلب تحديث</h3><p>سيتم إرسال إشعار داخل التطبيق، وإشعار فوري، وبريد إلكتروني عند توفره إلى '+esc(u.displayName||u.email||"المستخدم")+'.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="sendReleaseReminder(this.dataset.userId)">إرسال</button></div>');
+  openModal('<h3>'+ui("reminderConfirm")+'</h3><p>'+ui("reminderMessage")+' '+esc(u.displayName||u.email||ui("reminderUser"))+'.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button><button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="sendReleaseReminder(this.dataset.userId)">'+ui("send")+'</button></div>');
 }
 async function sendReleaseReminder(uid){
   var data=await api("/release-intelligence/remind",{method:"POST",body:JSON.stringify({uid:uid})});
-  if(data&&data.success){toast("تم إرسال طلب التحديث");closeModal();renderPage();}else toast(data&&data.error||"تعذر إرسال طلب التحديث","error");
+  if(data&&data.success){toast(ui("reminderSent"));closeModal();renderPage();}else toast(lang==="ar"?ui("reminderFailed"):(data&&data.error||ui("reminderFailed")),"error");
 }
 function confirmBulkReleaseReminder(){
   var targets=allUsers.filter(function(u){return u.releaseIntelligence&&u.releaseIntelligence.classification==="UPDATE_REQUIRED";});
-  openModal('<h3>تأكيد إرسال تنبيهات التحديث</h3><p>سيتم إرسال تنبيه إلى <b>'+targets.length+'</b> مستخدم يحتاج إلى تحديث التطبيق، مع تطبيق مهلة 72 ساعة لمنع التكرار.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" onclick="runBulkReleaseReminder()">إرسال</button></div>');
+  openModal('<h3>'+ui("remindersConfirm")+'</h3><p><b>'+targets.length+'</b> '+ui("remindersMessage")+'</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button><button class="btn btn-warning" onclick="runBulkReleaseReminder()">'+ui("send")+'</button></div>');
 }
 async function runBulkReleaseReminder(){
   var total=0,sent=0,failed=0,skippedCooldown=0,hasMore=true,calls=0;
-  while(hasMore&&calls<50){var data=await api("/release-intelligence/remind-required",{method:"POST",body:"{}"});if(!data||!data.success){toast(data&&data.error||"تعذر إرسال التنبيهات","error");return;}if(calls===0)skippedCooldown=data.skippedCooldown||0;total+=data.processed||0;sent+=data.sent||0;failed+=data.failed||0;hasMore=data.hasMore===true;calls++;}
-  if(hasMore){toast("توقف الإرسال الآمن؛ أعد المحاولة لإكمال الباقي","error");return;}
-  openModal('<h3>نتيجة تنبيهات التحديث</h3><div class="release-grid"><div class="release-metric"><div class="metric-label">المستهدفون</div><div class="metric-value">'+total+'</div></div><div class="release-metric current"><div class="metric-label">تم الإرسال</div><div class="metric-value">'+sent+'</div></div><div class="release-metric supported"><div class="metric-label">ضمن مهلة الانتظار</div><div class="metric-value">'+skippedCooldown+'</div></div><div class="release-metric required"><div class="metric-label">تعذر الإرسال</div><div class="metric-value">'+failed+'</div></div></div><div class="modal-actions"><button class="btn btn-primary" onclick="closeModal();renderPage()">تم</button></div>');
+  while(hasMore&&calls<50){var data=await api("/release-intelligence/remind-required",{method:"POST",body:"{}"});if(!data||!data.success){toast(lang==="ar"?ui("remindersFailed"):(data&&data.error||ui("remindersFailed")),"error");return;}if(calls===0)skippedCooldown=data.skippedCooldown||0;total+=data.processed||0;sent+=data.sent||0;failed+=data.failed||0;hasMore=data.hasMore===true;calls++;}
+  if(hasMore){toast(ui("remindersStopped"),"error");return;}
+  openModal('<h3>'+ui("remindersResult")+'</h3><div class="release-grid"><div class="release-metric"><div class="metric-label">'+ui("remindersTargeted")+'</div><div class="metric-value">'+total+'</div></div><div class="release-metric current"><div class="metric-label">'+ui("remindersSent")+'</div><div class="metric-value">'+sent+'</div></div><div class="release-metric supported"><div class="metric-label">'+ui("remindersCooldown")+'</div><div class="metric-value">'+skippedCooldown+'</div></div><div class="release-metric required"><div class="metric-label">'+ui("remindersUnsent")+'</div><div class="metric-value">'+failed+'</div></div></div><div class="modal-actions"><button class="btn btn-primary" onclick="closeModal();renderPage()">'+ui("done")+'</button></div>');
 }
 
 function editUser(uid){
@@ -7167,7 +8101,7 @@ function editUser(uid){
   };
   openModal(
     '<h3>'+t("editUser")+": "+esc(u.displayName||u.email||uid)+'</h3>'+
-    '<div style="margin-bottom:12px;font-size:13px;color:var(--text2)">UID: '+esc(uid)+"<br>"+t("role")+": "+esc(u.role||"N/A")+" | "+t("email")+": "+esc(u.email||"")+"</div>"+
+    '<div style="margin-bottom:12px;font-size:13px;color:var(--text2)">UID: <bdi dir="ltr">'+esc(uid)+'</bdi><br>'+t("role")+': '+esc(u.role?t(u.role):t("na"))+' | '+t("email")+': <bdi dir="ltr">'+esc(u.email||"")+'</bdi></div>'+
     daysInfo+
     '<div class="form-group"><label>'+t("accountStatus")+"</label>"+sel("eu-accountStatus",u.accountStatus,[{v:"active",l:t("active")},{v:"trial",l:t("trial")},{v:"suspended",l:t("suspend")},{v:"disabled",l:t("disabled")}])+"</div>"+
     '<div class="form-group"><label>'+t("subscriptionStatus")+"</label>"+sel("eu-subscriptionStatus",u.subscriptionStatus,[{v:"trialing",l:t("trialing")},{v:"active",l:t("active")},{v:"expired",l:t("expired")},{v:"canceled",l:t("canceledSub")},{v:"past_due",l:t("pastDue")}])+"</div>"+
@@ -7204,7 +8138,7 @@ async function quickAction(uid,action){
   if(action==="activate")fields={accountStatus:"active",subscriptionStatus:"active",activatedByAdmin:true,disabledReason:""};
   else if(action==="suspend")fields={accountStatus:"suspended"};
   var data=await api("/users/"+uid+"/update",{method:"POST",body:JSON.stringify(fields)});
-  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(data&&data.error||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 
 async function saveUser(uid){
@@ -7236,7 +8170,7 @@ async function saveUser(uid){
   }
   if(Object.keys(fields).length===0){toast(t("noChanges"),"error");return;}
   var data=await api("/users/"+uid+"/update",{method:"POST",body:JSON.stringify(fields)});
-  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(data&&data.error||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 
 async function generateInvoice(uid){
@@ -7254,8 +8188,8 @@ async function generateInvoice(uid){
     if(data&&data.success){
       toast(t("invoiceSaved"));
       showInvoiceActions(data.invoiceId,invoice);
-    }else{toast(data&&data.error||"Failed","error");}
-  }catch(e){toast(e.message,"error");}
+    }else{toast(adminError(data,t("failedUpdate")),"error");}
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 function showInvoiceActions(invoiceId,invoice){
@@ -7278,8 +8212,8 @@ async function viewInvoiceHTML(invoiceId){
     var data=await api("/invoices/"+invoiceId+"/token");
     if(data&&data.token){
       window.open("/admin/invoice/"+invoiceId+"?token="+encodeURIComponent(data.token)+"&lang="+lang,"_blank");
-    }else{toast("Failed to get access token","error");}
-  }catch(e){toast(e.message,"error");}
+    }else{toast(t("connectionError"),"error");}
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 async function downloadInvoicePdf(invoiceId){
@@ -7288,24 +8222,24 @@ async function downloadInvoicePdf(invoiceId){
     if(data&&data.token){
       var url="/admin/invoice/"+invoiceId+"/pdf?token="+encodeURIComponent(data.token)+"&lang="+lang;
       var a=document.createElement("a");a.href=url;a.download="invoice-"+invoiceId+".pdf";document.body.appendChild(a);a.click();document.body.removeChild(a);
-    }else{toast("Failed to get access token","error");}
-  }catch(e){toast(e.message,"error");}
+    }else{toast(t("connectionError"),"error");}
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 async function emailInvoice(invoiceId){
   try{
     var data=await api("/invoices/"+invoiceId+"/email",{method:"POST",body:JSON.stringify({lang:lang})});
     if(data&&data.success)toast(t("invoiceSent"));
-    else toast(data&&data.error||t("invoiceEmailFailed"),"error");
-  }catch(e){toast(e.message,"error");}
+    else toast(adminError(data,t("invoiceEmailFailed")),"error");
+  }catch(e){toast(lang==="ar"?t("invoiceEmailFailed"):e.message,"error");}
 }
 
 async function sendSubReminder(uid){
   try{
     var data=await api("/send-reminder",{method:"POST",body:JSON.stringify({uid:uid})});
     if(data&&data.success)toast(t("reminderSent"));
-    else toast(data&&data.error||"Failed","error");
-  }catch(e){toast(e.message,"error");}
+    else toast(lang==="ar"?t("failedUpdate"):(data&&data.error||t("failedUpdate")),"error");
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 async function renderInvoices(c){
@@ -7317,7 +8251,7 @@ async function renderInvoices(c){
   if(!allInvoices.length){c.innerHTML+='<div class="empty">'+t("noInvoices")+'</div>';return;}
   c.innerHTML+='<div class="table-wrap"><table><thead><tr><th>'+t("invoiceNumber")+'</th><th>'+t("name")+'</th><th>'+t("amount")+'</th><th>'+t("date")+'</th><th>'+t("status")+'</th><th>'+t("actions")+'</th></tr></thead><tbody>'+
   allInvoices.map(function(inv){
-    var dt=inv.createdAt?formatAdminDate(inv.createdAt,false):"N/A";
+    var dt=inv.createdAt?formatAdminDate(inv.createdAt,false):t("na");
     return "<tr>"+
       "<td><strong>"+esc(inv.invoiceNumber||inv._id)+"</strong></td>"+
       "<td>"+esc(inv.userName||"")+"</td>"+
@@ -7336,7 +8270,7 @@ async function renderInvoices(c){
 async function renderAdvertisements(c){
   var data=await api("/settings");if(!data)return;appSettings=data.settings||{};
   var bannerUrl=appSettings.bannerImageUrl||"",bannerEnabled=appSettings.bannerEnabled!==false;
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">Campaigns</div><h1 class="page-title">'+(lang==="ar"?"الإعلانات":"Advertisements")+'</h1><p class="page-subtitle">'+(lang==="ar"?"إدارة بانر الصفحة الرئيسية دون تغيير بقية إعدادات التطبيق.":"Manage the home banner without changing other app settings.")+'</p></div></div><section class="surface-panel"><div class="surface-head"><div><h2>'+t("homeBanner")+'</h2><p>'+(lang==="ar"?"معاينة وحالة الإعلان الحالي.":"Preview and status of the current campaign.")+'</p></div>'+('<span class="status-badge '+(bannerEnabled?"status-current":"status-unknown")+'">'+(bannerEnabled?(lang==="ar"?"مفعّل":"Enabled"):(lang==="ar"?"متوقف":"Disabled"))+'</span>')+'</div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">'+ui("campaigns")+'</div><h1 class="page-title">'+(lang==="ar"?"الإعلانات":"Advertisements")+'</h1><p class="page-subtitle">'+(lang==="ar"?"إدارة بانر الصفحة الرئيسية دون تغيير بقية إعدادات التطبيق.":"Manage the home banner without changing other app settings.")+'</p></div></div><section class="surface-panel"><div class="surface-head"><div><h2>'+t("homeBanner")+'</h2><p>'+(lang==="ar"?"معاينة وحالة الإعلان الحالي.":"Preview and status of the current campaign.")+'</p></div>'+('<span class="status-badge '+(bannerEnabled?"status-current":"status-unknown")+'">'+(bannerEnabled?(lang==="ar"?"مفعّل":"Enabled"):(lang==="ar"?"متوقف":"Disabled"))+'</span>')+'</div>'+
     (bannerUrl?'<img class="banner-preview" src="'+esc(bannerUrl)+'" alt="'+(lang==="ar"?"معاينة الإعلان":"Advertisement preview")+'">':'<div class="banner-preview empty-state">'+t("noBanner")+'</div>')+
     '<div class="upload-row"><input type="file" id="banner-file" accept="image/*" class="file-input"><button class="btn btn-sm btn-secondary" id="upload-btn" onclick="uploadBanner()">'+t("upload")+'</button></div>'+
     '<div class="form-group"><label for="s-bannerImageUrl">'+t("bannerUrl")+'</label><input id="s-bannerImageUrl" type="url" value="'+esc(bannerUrl)+'" placeholder="https://..."></div>'+
@@ -7345,7 +8279,7 @@ async function renderAdvertisements(c){
     '<button class="btn btn-primary" onclick="saveAdvertisementSettings()">'+t("saveSettings")+'</button></section>';
 }
 
-async function saveAdvertisementSettings(){var fields={bannerImageUrl:(document.getElementById("s-bannerImageUrl")||{}).value||"",bannerEnabled:!!(document.getElementById("s-bannerEnabled")||{}).checked,bannerWhatsapp:(document.getElementById("s-bannerWhatsapp")||{}).value||""};var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});if(data&&data.success)toast(t("settingsSaved"));else toast(data&&data.error||t("failedSave"),"error");}
+async function saveAdvertisementSettings(){var fields={bannerImageUrl:(document.getElementById("s-bannerImageUrl")||{}).value||"",bannerEnabled:!!(document.getElementById("s-bannerEnabled")||{}).checked,bannerWhatsapp:(document.getElementById("s-bannerWhatsapp")||{}).value||""};var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});if(data&&data.success)toast(t("settingsSaved"));else toast(adminError(data,t("failedSave")),"error");}
 
 async function renderSettings(c){
   var data=await api("/settings");
@@ -7415,13 +8349,16 @@ async function renderSettings(c){
         :"Provider and driver purchases, renewals, and cancellations are managed only by App Store and Google Play. Admin does not edit prices, subscription plans, or store trial configuration.")+
     '</div>'+
     '</div>'+
-    '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
+    ((typeof ADMIN_LOGIN_MODE!=="undefined"&&ADMIN_LOGIN_MODE==="owner_only")||
+      (typeof sessionStorage!=="undefined"&&sessionStorage.getItem("tbk_admin_kind")==="owner")
+      ?'<div class="settings-section">'+(lang==="ar"?"تُدار كلمة مرور المالك من Firebase Authentication، وليس من لوحة الإدارة.":"The owner password is managed by Firebase Authentication, not this panel.")+'</div>'
+      :'<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
     '<div id="pw-msg" class="success-msg"></div>'+
     '<div class="form-group"><label>'+t("currentPassword")+'</label><input type="password" id="s-curPw"></div>'+
     '<div class="form-group"><label>'+t("newPassword")+'</label><input type="password" id="s-newPw"></div>'+
     '<div class="form-group"><label>'+t("confirmNewPassword")+'</label><input type="password" id="s-confirmPw"></div>'+
     '<button class="btn btn-sm btn-warning" onclick="changePassword()">'+t("changePasswordBtn")+'</button>'+
-    '</div>'+
+    '</div>')+
     '<button class="btn btn-primary" onclick="saveSettings()">'+t("saveSettings")+'</button>';
   setTimeout(function(){updatePricingPreview();},50);
 }
@@ -7458,13 +8395,13 @@ async function uploadBanner(){
           if(currentPage==="advertisements")await saveAdvertisementSettings();else await saveSettings();
           renderPage();
         }else{
-          toast(t("uploadFailed")+": "+(data.error||"Unknown"),"error");
+          toast(adminError(data,t("uploadFailed")),"error");
         }
-      }catch(e){toast(t("uploadFailed")+": "+e.message,"error");}
+      }catch(e){toast(lang==="ar"?t("uploadFailed"):e.message,"error");}
       finally{btn.disabled=false;btn.textContent=t("upload");}
     };
     reader.readAsDataURL(file);
-  }catch(e){toast(t("uploadFailed")+": "+e.message,"error");btn.disabled=false;btn.textContent=t("upload");}
+  }catch(e){toast(lang==="ar"?t("uploadFailed"):t("uploadFailed")+": "+e.message,"error");btn.disabled=false;btn.textContent=t("upload");}
 }
 
 async function saveSettings(){
@@ -7505,7 +8442,7 @@ async function saveSettings(){
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
   var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});
   if(data&&data.success){toast(t("settingsSaved"));await renderSettings(document.getElementById("page-content"));}
-  else toast(data&&data.error||t("failedSave"),"error");
+  else toast(adminError(data,t("failedSave")),"error");
 }
 
 async function changePassword(){
@@ -7520,8 +8457,8 @@ async function changePassword(){
     if(data&&data.success){
       msgEl.textContent=t("passwordChanged");msgEl.className="success-msg";msgEl.style.display="block";
       document.getElementById("s-curPw").value="";document.getElementById("s-newPw").value="";document.getElementById("s-confirmPw").value="";
-    }else{msgEl.textContent=data&&data.error||t("passwordFailed");msgEl.className="err-msg";msgEl.style.display="block";}
-  }catch(e){msgEl.textContent=e.message;msgEl.className="err-msg";msgEl.style.display="block";}
+    }else{msgEl.textContent=adminError(data,t("passwordFailed"));msgEl.className="err-msg";msgEl.style.display="block";}
+  }catch(e){msgEl.textContent=lang==="ar"?t("connectionError"):e.message;msgEl.className="err-msg";msgEl.style.display="block";}
 }
 
 function updatePricingPreview(){
@@ -7607,7 +8544,7 @@ async function renderNotifications(c){
     '<select id="bc-audience" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px"><option value="">-- '+t("broadcastAudience")+' --</option>'+optHtml+'</select></div>'+
     '<div id="bc-result" style="display:none;padding:12px;border-radius:8px;margin-bottom:12px"></div>'+
     '<button id="bc-send-btn" class="btn btn-orange" onclick="confirmBroadcast()">'+t("broadcastSend")+'</button>'+
-    ' <button id="push-health-btn" class="btn btn-secondary" onclick="diagnosePushHealth()">فحص حالة الإشعارات</button>'+
+    ' <button id="push-health-btn" class="btn btn-secondary" onclick="diagnosePushHealth()">'+ui("pushHealth")+'</button>'+
     '<div id="push-health-result" style="display:none;padding:12px;border-radius:8px;margin-top:12px"></div>'+
     '</div>'+
     '<div class="settings-section">'+
@@ -7631,7 +8568,7 @@ async function renderNotifications(c){
 }
 function broadcastStatusLabel(value){
   var labels={pending:lang==="ar"?"قيد الانتظار":"Pending",processing:lang==="ar"?"قيد المعالجة":"Processing",completed:lang==="ar"?"مكتمل":"Completed",accepted:lang==="ar"?"قُبل من خدمة Push":"Accepted by Push service",failed:lang==="ar"?"فشل الإرسال":"Send failed",not_attempted:lang==="ar"?"لم تتم المحاولة":"Not attempted",not_applicable:"-",complete:lang==="ar"?"اكتمل إيصال Push":"Push receipt complete",stale:lang==="ar"?"رمز قديم/ملغى":"Stale token",pending_receipt:lang==="ar"?"بانتظار إيصال Push":"Waiting for Push receipt",missing:lang==="ar"?"لا يوجد Push token":"No Push token",invalid:lang==="ar"?"Push token غير صالح":"Invalid Push token",valid:lang==="ar"?"Push token صالح":"Valid Push token"};
-  return labels[value]||value||"-";
+  return labels[value]||t("na");
 }
 function openBroadcastDetails(id){
   if(!id)return;
@@ -7646,11 +8583,11 @@ async function loadBroadcastDetailsPage(){
   try{
     var token=_bcDetailsTokens[_bcDetailsPageIndex]||"";
     var data=await api("/broadcast-notifications/"+encodeURIComponent(_bcDetailsId)+"/details?pageSize=10"+(token?"&pageToken="+encodeURIComponent(token):""));
-    if(!data||!data.success)throw new Error(data&&data.error||t("connectionError"));
+    if(!data||!data.success)throw new Error(adminError(data,t("connectionError")));
     _bcDetailsNextToken=data.nextPageToken||null;
     renderBroadcastDetails(data);
   }catch(e){
-    if(body)body.innerHTML='<div class="empty" style="color:var(--error)">'+esc(e.message|| (lang==="ar"?"تعذر تحميل التفاصيل":"Unable to load details"))+'</div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("close")+'</button></div>';
+    if(body)body.innerHTML='<div class="empty" style="color:var(--error)">'+esc(lang==="ar"?t("connectionError"):(e.message||"Unable to load details"))+'</div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("close")+'</button></div>';
   }
 }
 function renderBroadcastDetails(data){
@@ -7686,19 +8623,19 @@ function nextBroadcastDetailsPage(){if(!_bcDetailsNextToken)return;_bcDetailsPag
 function previousBroadcastDetailsPage(){if(_bcDetailsPageIndex<1)return;_bcDetailsPageIndex--;loadBroadcastDetailsPage();}
 async function diagnosePushHealth(){
   var el=document.getElementById("push-health-result"),btn=document.getElementById("push-health-btn");
-  if(el){el.style.display="block";el.style.background="#eff6ff";el.style.color="var(--info)";el.textContent="جاري الفحص…";}
+  if(el){el.style.display="block";el.style.background="#eff6ff";el.style.color="var(--info)";el.textContent=ui("pushChecking");}
   if(btn)btn.disabled=true;
   try{
     var data=await api("/push-health");
-    if(!data||!data.success)throw new Error((data&&data.error)||"تعذر فحص حالة الإشعارات");
+    if(!data||!data.success)throw new Error(lang==="ar"?ui("pushCheckFailed"):(data&&data.error||ui("pushCheckFailed")));
     var u=data.users||{},p=data.privateDevices||{},l=data.legacyUsers||{},b=data.latestBroadcast||{};
     if(el){el.style.background="#f8fafc";el.style.color="var(--text)";el.innerHTML=
-      '<strong>حالة الإشعارات</strong><br>'+
-      'المستخدمون: '+esc(String(u.total||0))+' (عملاء '+esc(String(u.customers||0))+', مقدمو خدمة '+esc(String(u.providers||0))+', سائقون '+esc(String(u.drivers||0))+')<br>'+
-      'الأجهزة الخاصة: '+esc(String(p.documents||0))+'، مفعلة '+esc(String(p.pushEnabled||0))+'، رموز صالحة '+esc(String(p.validExpoToken||0))+'، بدون رمز '+esc(String(p.nullToken||0))+'<br>'+
-      'الرموز القديمة الصالحة: '+esc(String(l.validExpoToken||0))+'<br>'+
-      'آخر Broadcast: '+esc(String(b.status||"-"))+'، تمت معالجة '+esc(String(b.processedCount||0))+' من '+esc(String(b.totalUsersMatched||0))+'، مرشحون '+esc(String(b.totalCandidateTokens||0))+'، صالحون '+esc(String(b.validTokensCount||0))+'، أرسل '+esc(String(b.sentCount||0))+'، فشل '+esc(String(b.failedCount||0));}
-  }catch(e){if(el){el.style.background="#fef2f2";el.style.color="var(--error)";el.textContent=e.message||"تعذر الفحص";}}
+      '<strong>'+ui("pushHealth")+'</strong><br>'+
+      ui("pushUsers")+': '+esc(String(u.total||0))+' ('+ui("pushCustomers")+' '+esc(String(u.customers||0))+', '+ui("pushProviders")+' '+esc(String(u.providers||0))+', '+ui("pushDrivers")+' '+esc(String(u.drivers||0))+')<br>'+
+      ui("pushPrivateDevices")+': '+esc(String(p.documents||0))+', '+ui("pushEnabled")+' '+esc(String(p.pushEnabled||0))+', '+ui("pushValidTokens")+' '+esc(String(p.validExpoToken||0))+', '+ui("pushNoToken")+' '+esc(String(p.nullToken||0))+'<br>'+
+      ui("pushLegacyTokens")+': '+esc(String(l.validExpoToken||0))+'<br>'+
+      ui("pushLastBroadcast")+': '+esc(broadcastStatusLabel(b.status))+', '+ui("pushProcessed")+' '+esc(String(b.processedCount||0))+' '+ui("pushOf")+' '+esc(String(b.totalUsersMatched||0))+', '+ui("pushCandidates")+' '+esc(String(b.totalCandidateTokens||0))+', '+ui("pushValid")+' '+esc(String(b.validTokensCount||0))+', '+ui("pushSent")+' '+esc(String(b.sentCount||0))+', '+ui("pushFailed")+' '+esc(String(b.failedCount||0));}
+  }catch(e){if(el){el.style.background="#fef2f2";el.style.color="var(--error)";el.textContent=e.message||ui("pushCheckFailed");}}
   finally{if(btn)btn.disabled=false;}
 }
 function confirmBroadcast(){
@@ -7738,7 +8675,7 @@ async function doSendBroadcast(){
   var data=await api("/broadcast-notifications/send",{method:"POST",body:JSON.stringify(payload)});
   if(!data||!data.success||!data.broadcastId){
     _bcSending=false; _bcSourceId=null; if(sendBtn)sendBtn.disabled=false;
-    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=(data&&data.error)||t("connectionError");}
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=adminError(data,t("connectionError"));}
     return;
   }
   var broadcastId=data.broadcastId, progressCalls=0, latest=data;
@@ -7760,9 +8697,9 @@ async function doSendBroadcast(){
     if(resultEl){
       resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";
       var resumeButton="<br><button class='btn btn-secondary' style='margin-top:8px' onclick='resumeBroadcast("+String.fromCharCode(34)+esc(broadcastId)+String.fromCharCode(34)+")'>"+(lang==="ar"?"استكمال الإرسال":"Resume")+"</button>";
-      resultEl.innerHTML=esc(e.message||t("broadcastFailed"))+resumeButton;
+      resultEl.innerHTML=esc(lang==="ar"?t("broadcastFailed"):(e.message||t("broadcastFailed")))+resumeButton;
     }
-    toast(e.message||t("broadcastFailed"),"error");
+    toast(lang==="ar"?t("broadcastFailed"):(e.message||t("broadcastFailed")),"error");
   }finally{
     _bcSending=false; _bcSourceId=null; if(sendBtn){sendBtn.disabled=false;sendBtn.textContent=t("broadcastSend");}
   }
@@ -7781,7 +8718,7 @@ async function resumeBroadcast(broadcastId){
     if(latest.hasMore===true)throw new Error(lang==="ar"?"تعذر استكمال الإرسال":"Broadcast continuation limit reached");
     if(resultEl){resultEl.style.background="#f0fdf4";resultEl.style.color="var(--success)";resultEl.textContent=t("broadcastResult");}
     if(typeof loadBroadcastHistory==="function")loadBroadcastHistory();
-  }catch(e){if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=e.message||t("broadcastFailed");}toast(e.message||t("broadcastFailed"),"error");}
+  }catch(e){var error=lang==="ar"?t("broadcastFailed"):(e.message||t("broadcastFailed"));if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=error;}toast(error,"error");}
   finally{_bcSending=false;}
 }
 function formatFailureReasons(reasons){
@@ -7815,7 +8752,7 @@ async function doDeleteNotification(){
   _bcActionId=null;
   if(!data){toast(t("connectionError"),"error");return;}
   if(data.success){toast(t("notifDeleted"));setTimeout(function(){navigate("notifications");},400);}
-  else{toast(data.error||t("deleteFailed"),"error");}
+  else{toast(adminError(data,t("deleteFailed")),"error");}
 }
 function resendNotification(id){
   if(_bcSending)return;
@@ -7864,8 +8801,8 @@ async function doResendNotification(){
     toast(t("resendSuccess"));
     setTimeout(function(){navigate("notifications");},600);
   }else{
-    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=data.error||t("resendFailed");}
-    toast(data.error||t("resendFailed"),"error");
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=adminError(data,t("resendFailed"));}
+    toast(adminError(data,t("resendFailed")),"error");
   }
 }
 function editAndResend(id){
@@ -8018,7 +8955,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     __name(destroyFreelanceCertificate, "destroyFreelanceCertificate");
     __name2(destroyFreelanceCertificate, "destroyFreelanceCertificate");
     function orderIsActive(order) {
-      return ACCOUNT_DELETION_ACTIVE_ORDER_STATUSES.includes(order?.status) || ACCOUNT_DELETION_ACTIVE_DELIVERY_STATUSES.includes(order?.deliveryStatus);
+      return ACCOUNT_DELETION_ACTIVE_ORDER_STATUSES.includes(order?.status) || ACCOUNT_DELETION_ACTIVE_DELIVERY_STATUSES.includes(order?.deliveryStatus) ||
+        (order?.cashFundingSelfPickupConversion ? !order.cashFundingSelfPickupReceipt :
+        order?.cashFundingVersion === CASH_FUNDING_V1 && !!order.cashFundingDriverConsent &&
+          (!!order.cashFundingHold || !order.cashFundingProviderReceipt || !order.cashFundingCollectionReport || !order.cashFundingCustomerAcknowledgment));
     }
     __name(orderIsActive, "orderIsActive");
     __name2(orderIsActive, "orderIsActive");
@@ -8032,7 +8972,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         from: [{ collectionId: "orders" }],
         where: { fieldFilter: { field: { fieldPath: roleField }, op: "EQUAL", value: { stringValue: uid } } },
         orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
-        select: { fields: [{ fieldPath: "status" }, { fieldPath: "deliveryStatus" }] },
+        select: { fields: [{ fieldPath: "status" }, { fieldPath: "deliveryStatus" },
+          { fieldPath: "cashFundingVersion" }, { fieldPath: "cashFundingDriverConsent" },
+          { fieldPath: "cashFundingProviderReceipt" }, { fieldPath: "cashFundingCollectionReport" },
+          { fieldPath: "cashFundingCustomerAcknowledgment" }, { fieldPath: "cashFundingHold" },
+          { fieldPath: "cashFundingSelfPickupConversion" }, { fieldPath: "cashFundingSelfPickupReceipt" }] },
         limit: ACCOUNT_DELETION_PAGE_SIZE
       };
       if (cursor) query.startAt = { values: [{ referenceValue: cursor }], before: false };
@@ -9245,6 +10189,93 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
     }
     __name(handleScheduledOutbox, "handleScheduledOutbox");
     __name2(handleScheduledOutbox, "handleScheduledOutbox");
+    function complaintEmailContent(alert) {
+      const categoryLabels = {
+        customer_complaint: "بلاغ متعلق بالعميل",
+        provider_complaint: "بلاغ متعلق بمقدم الخدمة",
+        delivery_not_confirmed: "تعذر تأكيد التسليم",
+        customer_rejected_receipt: "اعتراض على استلام الطلب",
+        participant_safety: "بلاغ سلامة المشاركين",
+        order_chat_report: "بلاغ محادثة الطلب",
+        cash_funding_issue: "بلاغ تمويل التوصيل النقدي"
+      };
+      const compactReference = (value) => value.length <= 28 ? value : value.slice(0, 12) + "…" + value.slice(-6);
+      const complaintRef = escapeHtml(compactReference(alert.complaintId));
+      const orderRef = escapeHtml(compactReference(alert.orderId));
+      const category = escapeHtml(categoryLabels[alert.category]);
+      const submittedAt = escapeHtml(new Intl.DateTimeFormat("ar-SA-u-ca-gregory", {
+        timeZone: "Asia/Riyadh", year: "numeric", month: "long", day: "numeric",
+        hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+      }).format(new Date(alert.submittedAt)));
+      const adminUrl = "https://tabbakheen-api.tabbakheen.workers.dev/admin#complaints";
+      return {
+        subject: "طباخين | بلاغ جديد بانتظار المراجعة",
+        html: `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body dir="rtl" style="margin:0;padding:0;background:#fff7ed;color:#292524;font-family:Tahoma,Arial,sans-serif;text-align:right">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#fff7ed"><tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border:1px solid #fed7aa;border-radius:12px">
+<tr><td style="background:#ea580c;color:#ffffff;padding:22px 24px;font-size:22px;font-weight:bold">طباخين</td></tr>
+<tr><td style="padding:24px;font-size:15px;line-height:1.9">
+<h1 style="margin:0 0 12px;font-size:21px;line-height:1.5;color:#7c2d12">بلاغ جديد بانتظار المراجعة</h1>
+<p style="margin:0 0 18px">وصل بلاغ جديد إلى لوحة الإدارة. يُرجى فتح صفحة البلاغات للاطلاع عليه بعد تسجيل الدخول.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#fff7ed;border-radius:8px;font-size:14px;line-height:1.8">
+<tr><td style="padding:14px 16px">مرجع البلاغ: <b dir="ltr">${complaintRef}</b><br>مرجع الطلب: <b dir="ltr">${orderRef}</b><br>التصنيف: ${category}<br>وقت التقديم: ${submittedAt} (بتوقيت الرياض)</td></tr></table>
+<p style="margin:24px 0"><a href="${adminUrl}" style="display:inline-block;background:#ea580c;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:bold">فتح بلاغات الإدارة</a></p>
+<p style="margin:0;color:#78716c;font-size:12px">هذا التنبيه موجز ولا يحتوي على تفاصيل البلاغ الخاصة.</p>
+</td></tr></table></td></tr></table></body></html>`
+      };
+    }
+    async function handleScheduledComplaintEmailAlert(env, accessToken) {
+      // One durable complaint alert per invocation. The existing rotating Cron
+      // cursor prevents a missing recipient or leased alert from hiding others.
+      const item = await cronQueueNext("complaint_email_alerts", "pending", accessToken);
+      if (!item || !phase4aSafeSegment(item._id)) return false;
+      const snapshot = await getFirestoreSnapshot("complaint_email_alerts", item._id, accessToken);
+      const alert = snapshot?.data, nowMs = Date.now(), now = new Date(nowMs).toISOString();
+      if (!alert || alert.status !== "pending" ||
+          alert.leaseUntil && Date.parse(alert.leaseUntil) > nowMs ||
+          alert.nextAttemptAt && Date.parse(alert.nextAttemptAt) > nowMs) return false;
+      const update = (fields) => compareAndSetFirestoreDocument("complaint_email_alerts", item._id,
+        { ...fields, updatedAt: now }, snapshot.updateTime, accessToken);
+      const attempts = Number.isInteger(alert.attempts) && alert.attempts >= 0 ? alert.attempts : 0;
+      if (attempts >= 5 || alert.firstAttemptAt && nowMs - Date.parse(alert.firstAttemptAt) >= 23 * 60 * 60 * 1000)
+        return (await update({ status: "needs_review", lastErrorCode: "retry_window_exhausted", leaseUntil: null })).ok;
+      if (!env.EMAIL_API_KEY) {
+        return (await update({ lastErrorCode: "sender_unavailable", nextAttemptAt: new Date(nowMs + 10 * 60 * 1000).toISOString() })).ok;
+      }
+      let recipient = alert.recipient, subject = alert.subject, html = alert.html, from = alert.from;
+      if (!recipient) {
+        const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+        recipient = publicAppSettingsDto(settings).supportEmail;
+        if (!recipient) return (await update({ lastErrorCode: "recipient_unavailable", nextAttemptAt: new Date(nowMs + 10 * 60 * 1000).toISOString() })).ok;
+        if (typeof alert.complaintId !== "string" || !/^[A-Za-z0-9_-]{1,512}$/.test(alert.complaintId) || !phase4aSafeSegment(alert.orderId) ||
+            !["customer_complaint", "provider_complaint", "delivery_not_confirmed", "customer_rejected_receipt", "participant_safety", "order_chat_report", "cash_funding_issue"].includes(alert.category) ||
+            typeof alert.submittedAt !== "string" || !Number.isFinite(Date.parse(alert.submittedAt)))
+          return (await update({ status: "needs_review", lastErrorCode: "invalid_alert_record" })).ok;
+        from = env.EMAIL_FROM || "Tabbakheen <noreply@tabbakheen.com>";
+        ({ subject, html } = complaintEmailContent(alert));
+      } else if (publicAppSettingsDto({ supportEmail: recipient }).supportEmail !== recipient ||
+          typeof subject !== "string" || typeof html !== "string" || typeof from !== "string")
+        return (await update({ status: "needs_review", lastErrorCode: "invalid_frozen_alert" })).ok;
+      const leaseOwner = crypto.randomUUID(), leaseUntil = new Date(nowMs + 60 * 1000).toISOString();
+      const claimed = await update({ recipient, subject, html, from, firstAttemptAt: alert.firstAttemptAt || now,
+        attempts: attempts + 1, leaseOwner, leaseUntil, nextAttemptAt: null, lastErrorCode: null });
+      if (!claimed.ok) return false;
+      const result = await sendEmail(recipient, subject, html, env, undefined,
+        { from, idempotencyKey: "complaint-" + item._id, deadlineMs: 8e3 });
+      const finish = (fields) => compareAndSetFirestoreDocument("complaint_email_alerts", item._id,
+        { ...fields, leaseOwner: null, leaseUntil: null, updatedAt: new Date().toISOString() },
+        claimed.document.updateTime, accessToken);
+      if (result.sent) return (await finish({ status: "sent", sentAt: new Date().toISOString(),
+        providerMessageId: typeof result.id === "string" ? result.id.slice(0, 128) : null })).ok;
+      const permanent = result.httpStatus >= 400 && result.httpStatus < 500 && result.httpStatus !== 429;
+      const exhausted = attempts + 1 >= 5;
+      const retryMinutes = Math.min(5 * 2 ** attempts, 120);
+      return (await finish({ status: permanent || exhausted ? "needs_review" : "pending",
+        nextAttemptAt: permanent || exhausted ? null : new Date(Date.now() + retryMinutes * 60 * 1000).toISOString(),
+        lastErrorCode: result.code === "uncertain" ? "uncertain" : result.code === "missing_credentials" ? "sender_unavailable" :
+          result.httpStatus ? "provider_http_" + result.httpStatus : "provider_failure" })).ok;
+    }
     async function handleScheduledMaintenance(env) {
       const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
       return handleScheduledMaintenanceWithAccessToken(env, accessToken);
@@ -9279,6 +10310,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         // transports and their credentials are configured. Legacy Cron is
         // unchanged while this new feature remains DEFAULT OFF.
         try { await handleScheduledTracking(env, accessToken); } catch (error) { failure ||= error; }
+        try { await handleScheduledComplaintEmailAlert(env, accessToken); } catch (error) { failure ||= error; }
         if (failure) throw failure;
       };
       if (lane === "fast") return runFast();
@@ -9338,6 +10370,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         resumeAccountDeletionsWithAccessToken,
         cronQueueNext,
         handleScheduledOutbox,
+        complaintEmailContent,
+        handleScheduledComplaintEmailAlert,
         handleScheduledMaintenance,
         handleScheduledMaintenanceWithAccessToken,
         classifyPhoneIndexBackfill,
@@ -9347,6 +10381,15 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         classifyPublicProfileProjection,
         canRequestOrderContact,
         handleOrderContact,
+        handleOrderParticipantSummary,
+        handleSafetyReportResponse,
+        cashFundingAmounts,
+        cashFundingTermsVersion,
+        cashFundingV1Read,
+        cashFundingV1Accept,
+        cashFundingV1Record,
+        orderIsActive,
+        complaintSafetySummary,
         handleOrderPaymentInstructions,
         handlePublicRatings,
         syncPublicProfile,
@@ -9397,6 +10440,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
          readBoundedOfferJson,
          phase4aHasEnabledPublicLocation,
          publicAppSettingsDto,
+         parseClientVersionGatePolicy,
+         validClientGateStoreUrl,
          publicOfferDto,
          handlePublicOffers,
         orderChatInput,
@@ -9472,6 +10517,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof V2_ORDER_CREATION_ENABLED !== "undefined") env.V2_ORDER_CREATION_ENABLED = V2_ORDER_CREATION_ENABLED;
       } catch {
       }
+      try { if (typeof CASH_FUNDING_V1_ENABLED !== "undefined") env.CASH_FUNDING_V1_ENABLED = CASH_FUNDING_V1_ENABLED; } catch {}
       try { if (typeof ORDER_TRACKING_IOS_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_IOS_REMOTE_ENABLED = ORDER_TRACKING_IOS_REMOTE_ENABLED; } catch {}
       try { if (typeof ORDER_TRACKING_ANDROID_REMOTE_ENABLED !== "undefined") env.ORDER_TRACKING_ANDROID_REMOTE_ENABLED = ORDER_TRACKING_ANDROID_REMOTE_ENABLED; } catch {}
       try { if (typeof ORDER_TRACKING_LEASE_SECRET !== "undefined") env.ORDER_TRACKING_LEASE_SECRET = ORDER_TRACKING_LEASE_SECRET; } catch {}
@@ -9519,6 +10565,9 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         if (typeof FIREBASE_WEB_API_KEY !== "undefined") env.FIREBASE_WEB_API_KEY = FIREBASE_WEB_API_KEY;
       } catch {
       }
+      try { if (typeof OWNER_FIREBASE_UID !== "undefined") env.OWNER_FIREBASE_UID = OWNER_FIREBASE_UID; } catch {}
+      try { if (typeof ADMIN_OWNER_LOGIN_MODE !== "undefined") env.ADMIN_OWNER_LOGIN_MODE = ADMIN_OWNER_LOGIN_MODE; } catch {}
+      try { if (typeof CLIENT_VERSION_GATE_ACTIVATION_READY !== "undefined") env.CLIENT_VERSION_GATE_ACTIVATION_READY = CLIENT_VERSION_GATE_ACTIVATION_READY; } catch {}
       try {
         if (typeof PHONE_INDEX_BACKFILL_APPROVED !== "undefined") env.PHONE_INDEX_BACKFILL_APPROVED = PHONE_INDEX_BACKFILL_APPROVED;
       } catch {
@@ -9562,10 +10611,14 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       if (path === "/app-settings" && request.method === "GET") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
-          await getFirestoreDoc("app_settings", "main", accessToken);
-          return jsonResponse({ success: true, settings: {} });
+          const settings = await getFirestoreDoc("app_settings", "main", accessToken);
+          try {
+            return clientVersionGateResponse({ success: true, settings: { clientVersionGate: effectiveClientVersionGate(settings, env) } });
+          } catch {
+            return clientVersionGateResponse({ success: true, code: "CLIENT_VERSION_GATE_INVALID", settings: { clientVersionGate: structuredClone(DISABLED_CLIENT_VERSION_GATE) } });
+          }
         } catch {
-          return jsonResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
+          return clientVersionGateResponse({ success: false, code: "SERVICE_UNAVAILABLE", error: "Service unavailable" }, 503);
         }
       }
       if (path === "/app-settings/public" && request.method === "GET") {
@@ -9939,7 +10992,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const existing = await getFirestoreDoc(ratingCollection, ratingId, accessToken);
         if (existing) {
           const sameRating = existing.customerUid === rating.customerUid && existing.targetUid === rating.targetUid && existing.stars === rating.stars && existing.comment === rating.comment;
-          return sameRating ? jsonResponse({ success: true, idempotent: true, rating: existing }) : phase4aError("IDEMPOTENCY_CONFLICT", "Rating already exists", 409);
+          if (!sameRating) return phase4aError("IDEMPOTENCY_CONFLICT", "Rating already exists", 409);
+          // A prior response can be lost after the atomic rating commit but
+          // before the public projection sync. A safe retry repairs it.
+          await syncPublicProfileBestEffort(targetUid, accessToken);
+          return jsonResponse({ success: true, idempotent: true, rating: existing });
         }
         const targetSnap = await getFirestoreSnapshot("users", targetUid, accessToken);
         const targetDeletion = await getFirestoreSnapshot("account_deletion_requests", targetUid, accessToken);
@@ -9949,7 +11006,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const aggregateFields = { ratingCount: oldCount + 1, ratingAverage: (oldAverage * oldCount + body.stars) / (oldCount + 1) };
         const fields = body.type === "provider" ? { providerHasRating: true, ratingSubmitted: true, providerRatingStars: body.stars, providerRatingComment: rating.comment, updatedAt: new Date().toISOString() } : { driverHasRating: true, driverRatingSubmitted: true, driverRatingStars: body.stars, driverRatingComment: rating.comment, updatedAt: new Date().toISOString() };
         if (!(await phase4aCommit([{ update: phase4aDoc(ratingCollection, ratingId, rating), updateMask: { fieldPaths: Object.keys(rating) }, currentDocument: { exists: false } }, { update: phase4aDoc("orders", body.orderId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snap.updateTime } }, { update: phase4aDoc("users", targetUid, aggregateFields), updateMask: { fieldPaths: Object.keys(aggregateFields) }, currentDocument: { updateTime: targetSnap.updateTime } }, auth.deletionFence, phase4aDeletionFence(targetUid, targetDeletion)], accessToken))) return phase4aError("state_conflict", "Rating changed; retry", 409);
-         await syncPublicProfile(targetUid, { ...targetSnap.data, ...aggregateFields }, accessToken);
+        await syncPublicProfileBestEffort(targetUid, accessToken);
         return jsonResponse({ success: true, ratingId, rating });
       }
       // Canonical offer mutations for the new mobile client. The legacy POST
@@ -10069,7 +11126,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch (e) { console.error("[Phase4A] offer mutation error:", e); return phase4aError("internal_error", "Internal error", 500); }
       }
       if (path === "/admin" || path === "/admin/") {
-        return new Response(getAdminHTML(), {
+        return new Response(getAdminHTML(adminOwnerLoginMode(env)), {
           headers: htmlSecurityHeaders(adminContentSecurityPolicy())
         });
       }
@@ -10127,22 +11184,49 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         }
       }
       if (path === "/admin/api/login" && request.method === "POST") {
+        if (request.headers.get("Origin") && request.headers.get("Origin") !== url.origin)
+          return adminAuthResponse({ error: "Invalid request" }, 403);
+        if (adminOwnerLoginMode(env) === "owner_only" || adminOwnerLoginMode(env) === "invalid")
+          return adminAuthResponse({ error: "Invalid credentials" }, 401);
         try {
-          const body = await request.json();
-          if (!body.password) {
-            return jsonResponse({ error: "Password required" }, 401);
-          }
+          const body = await readBoundedOfferJson(request);
+          if (!body || typeof body.password !== "string" || !body.password || body.password.length > 1024)
+            return adminAuthResponse({ error: "Invalid credentials" }, 401);
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (adminOwnerLoginMode(env) === "dual" &&
+              (!env.ADMIN_TOKEN_SECRET || !await reserveAdminLoginAttempt(request, env, accessToken)))
+            return adminAuthResponse({ error: "Try again later" }, 429);
           const valid = await verifyAdminPassword(body.password, env, accessToken);
-          if (!valid) {
-            return jsonResponse({ error: "Invalid password" }, 401);
-          }
+          if (!valid) return adminAuthResponse({ error: "Invalid credentials" }, 401);
           const token = await createAdminToken(env);
-          console.log("[Admin] Login successful");
-          return jsonResponse({ success: true, token });
+          return adminAuthResponse({ success: true, token });
         } catch (e) {
-          console.error("[Admin] Login error:", e);
-          return jsonResponse({ error: "Login failed: " + e.message }, 500);
+          return adminAuthResponse({ error: "Login unavailable" }, 503);
+        }
+      }
+      if (path === "/admin/api/owner-login" && request.method === "POST") {
+        if (request.headers.get("Origin") && request.headers.get("Origin") !== url.origin)
+          return adminAuthResponse({ error: "Invalid request" }, 403);
+        if (adminOwnerLoginMode(env) === "legacy" || adminOwnerLoginMode(env) === "invalid")
+          return adminAuthResponse({ error: "Not found" }, 404);
+        if (!adminOwnerLoginConfigured(env)) return adminAuthResponse({ error: "Login unavailable" }, 503);
+        try {
+          const body = await readBoundedOfferJson(request);
+          if (!body || Object.keys(body).sort().join(",") !== "email,password" ||
+              typeof body.email !== "string" || body.email.length > 320 ||
+              typeof body.password !== "string" || !body.password || body.password.length > 1024)
+            return adminAuthResponse({ error: "Invalid credentials" }, 401);
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (!await reserveAdminLoginAttempt(request, env, accessToken))
+            return adminAuthResponse({ error: "Try again later" }, 429);
+          // The Firebase password exchange and RS256/project/UID verification
+          // remain server-side. Only the local Admin session reaches the browser.
+          const owner = await reauthenticateOwnerVersionGate(body, env);
+          if (!owner) return adminAuthResponse({ error: "Invalid credentials" }, 401);
+          const token = await createOwnerAdminToken(owner.uid, env, accessToken);
+          return token ? adminAuthResponse({ success: true, token }) : adminAuthResponse({ error: "Login unavailable" }, 503);
+        } catch {
+          return adminAuthResponse({ error: "Login unavailable" }, 503);
         }
       }
       if (path.startsWith("/admin/api/")) {
@@ -10154,6 +11238,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const adminIdentity = adminIdentityFromToken(token);
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (path === "/admin/api/logout" && request.method === "POST") {
+            if (!adminIdentity.startsWith("owner:")) return jsonResponse({ success: true, revoked: false });
+            const data = JSON.parse(atob(token.split(".")[0]));
+            const session = await getFirestoreSnapshot("admin_owner_sessions", data.sid, accessToken);
+            if (!session || session.data.ownerUid !== env.OWNER_FIREBASE_UID) return jsonResponse({ error: "Unauthorized" }, 401);
+            if (session.data.revoked === true) return jsonResponse({ success: true, revoked: true });
+            const revoked = await phase4aCommit([{ update: phase4aDoc("admin_owner_sessions", data.sid,
+              { revoked: true, revokedAt: new Date().toISOString() }), updateMask: { fieldPaths: ["revoked", "revokedAt"] },
+              currentDocument: { updateTime: session.updateTime } }], accessToken);
+            return revoked ? jsonResponse({ success: true, revoked: true }) : jsonResponse({ error: "Logout could not be confirmed" }, 409);
+          }
           if (path === "/admin/api/stats" && request.method === "GET") {
             const [users, orders, offers, versions] = await Promise.all([
               listAllUsers(accessToken),
@@ -10276,7 +11371,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           if (path === "/admin/api/complaints" && request.method === "GET") {
             const complaints = await listAllComplaints(accessToken);
-            const users = await listAllUsers(accessToken);
+            const [users, orderNumbers] = await Promise.all([listAllUsers(accessToken), complaintOrderNumbers(complaints, accessToken).catch(() => new Map())]);
             const userMap = {};
             for (const user of users) {
               if (user && user._id) userMap[user._id] = {
@@ -10290,19 +11385,45 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
               return {
                 ...complaint,
-                customer: person(complaint.customerUid),
-                provider: person(complaint.providerUid),
-                driver: person(complaint.driverUid),
+                displayOrderNumber: complaint.orderNumber && complaint.orderNumber !== complaint.orderId ? complaint.orderNumber : orderNumbers.get(complaint.orderId) || "",
+                customer: person(complaint.customerUid || (complaint.source === 'customer' ? complaint.reporterUid : complaint.target === 'customer' ? complaint.targetAccountUid : '')),
+                provider: person(complaint.providerUid || (complaint.source === 'provider' ? complaint.reporterUid : complaint.target === 'provider' ? complaint.targetAccountUid : '')),
+                driver: person(complaint.driverUid || (complaint.source === 'driver' ? complaint.reporterUid : complaint.target === 'driver' ? complaint.targetAccountUid : '')),
                 id: complaint._id || complaint.id
               };
             }).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
-            return jsonResponse({ success: true, complaints: enriched });
+            return jsonResponse({ success: true, complaints: enriched, safetySummary: complaintSafetySummary(complaints) });
+          }
+          const complaintReviewMatch = path.match(/^\/admin\/api\/complaints\/([^/]+)\/review$/);
+          if (complaintReviewMatch && request.method === 'POST') {
+            const complaintId = decodeURIComponent(complaintReviewMatch[1]);
+            if (!phase4aSafeSegment(complaintId)) return jsonResponse({ error: 'Invalid complaint' }, 400);
+            let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid review' }, 400); }
+            if (!phase4aKeysOnly(body, ['finding', 'reviewNote']) || !['pending', 'substantiated', 'unsubstantiated'].includes(body.finding) || typeof body.reviewNote !== 'string' || body.reviewNote.length > 2000 || body.finding !== 'pending' && body.reviewNote.trim().length < 10) return jsonResponse({ error: 'Invalid review' }, 400);
+            for (let attempt = 0; attempt < 3; attempt++) {
+              const snapshot = await getFirestoreSnapshot('delivery_complaints', complaintId, accessToken);
+              if (!snapshot || snapshot.data.type !== 'participant_safety') return jsonResponse({ error: 'Safety report not found' }, 404);
+              const previous = snapshot.data;
+              const reviewNote = body.reviewNote.trim();
+              if (previous.reviewFinding === body.finding && (previous.reviewNote || '') === reviewNote) return jsonResponse({ success: true, idempotent: true });
+              const now = new Date().toISOString();
+              const fields = { reviewFinding: body.finding, reviewNote, reviewedAt: now, updatedAt: now };
+              const auditId = 'complaint_review_' + crypto.randomUUID();
+              const audit = { action: 'complaint_safety_review', complaintId, priorFinding: previous.reviewFinding || 'pending', finding: body.finding, reviewNote, changedBy: adminIdentity, changedAt: now };
+              const committed = await phase4aCommit([
+                { update: phase4aDoc('delivery_complaints', complaintId, fields), updateMask: { fieldPaths: Object.keys(fields) }, currentDocument: { updateTime: snapshot.updateTime } },
+                { update: phase4aDoc('admin_audit_logs', auditId, audit), updateMask: { fieldPaths: Object.keys(audit) }, currentDocument: { exists: false } }
+              ], accessToken);
+              if (committed) return jsonResponse({ success: true, finding: body.finding });
+            }
+            return jsonResponse({ error: 'Report changed; retry' }, 409);
           }
           const complaintDetailMatch = path.match(/^\/admin\/api\/complaints\/([^/]+)$/);
           if (complaintDetailMatch && request.method === "GET") {
             const complaintId = decodeURIComponent(complaintDetailMatch[1]);
             const complaint = await getFirestoreDoc("delivery_complaints", complaintId, accessToken);
             if (!complaint) return jsonResponse({ error: "Complaint not found" }, 404);
+            const order = (!complaint.orderNumber || complaint.orderNumber === complaint.orderId) && phase4aSafeSegment(complaint.orderId) ? await getFirestoreDoc("orders", complaint.orderId, accessToken).catch(() => null) : null;
             const users = await listAllUsers(accessToken);
             const userMap = {};
             for (const user of users) {
@@ -10311,10 +11432,11 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
             const detail = {
               ...complaint,
+              displayOrderNumber: complaint.orderNumber && complaint.orderNumber !== complaint.orderId ? complaint.orderNumber : typeof order?.orderNumber === "string" && order.orderNumber.length <= 80 ? order.orderNumber : "",
               id: complaint._id || complaint.id || complaintId,
-              customer: person(complaint.customerUid),
-              provider: person(complaint.providerUid),
-              driver: person(complaint.driverUid)
+              customer: person(complaint.customerUid || (complaint.source === 'customer' ? complaint.reporterUid : complaint.target === 'customer' ? complaint.targetAccountUid : '')),
+              provider: person(complaint.providerUid || (complaint.source === 'provider' ? complaint.reporterUid : complaint.target === 'provider' ? complaint.targetAccountUid : '')),
+              driver: person(complaint.driverUid || (complaint.source === 'driver' ? complaint.reporterUid : complaint.target === 'driver' ? complaint.targetAccountUid : ''))
             };
             // Chat text is never an admin-wide browsing feed.  It is supplied
             // only when inspecting a specific authenticated chat-abuse report.
@@ -10496,6 +11618,60 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             };
             return jsonResponse({ success: true, settings: adminSettings, deliveryPricingPolicy: adminDeliveryPricingPolicy(settings) });
           }
+          if (path === "/admin/api/client-version-gate" && request.method === "GET") {
+            const snapshot = await getFirestoreSnapshot("app_settings", "main", accessToken);
+            try {
+              return clientVersionGateResponse({ success: true, clientVersionGate: clientVersionGateFromSettings(snapshot?.data), revision: snapshot?.updateTime || null,
+                ownerAuthorizationAvailable: !!(phase4aSafeSegment(env.OWNER_FIREBASE_UID) && env.FIREBASE_WEB_API_KEY),
+                activationReady: env.CLIENT_VERSION_GATE_ACTIVATION_READY === "true" });
+            } catch {
+              return clientVersionGateResponse({ success: false, code: "CLIENT_VERSION_GATE_INVALID", error: "Saved version policy is invalid", revision: snapshot?.updateTime || null,
+                ownerAuthorizationAvailable: !!(phase4aSafeSegment(env.OWNER_FIREBASE_UID) && env.FIREBASE_WEB_API_KEY),
+                activationReady: env.CLIENT_VERSION_GATE_ACTIVATION_READY === "true" }, 409);
+            }
+          }
+          if (path === "/admin/api/client-version-gate" && request.method === "POST") {
+            let body;
+            try { body = await readBoundedOfferJson(request); }
+            catch (error) { return clientVersionGateResponse({ success: false, error: error?.code === "REQUEST_TOO_LARGE" ? "Policy request is too large" : "Valid JSON required" }, error?.code === "REQUEST_TOO_LARGE" ? 413 : 400); }
+            const hasCredentials = body && Object.prototype.hasOwnProperty.call(body, "ownerCredentials");
+            const headerToken = request.headers.get("X-Owner-Firebase-Id-Token");
+            const owner = hasCredentials && !headerToken
+              ? await reauthenticateOwnerVersionGate(body.ownerCredentials, env)
+              : !hasCredentials ? await verifyOwnerVersionGateToken(headerToken, env) : null;
+            if (!owner) return clientVersionGateResponse({ success: false, code: "OWNER_AUTH_REQUIRED", error: "Recent verified owner authorization is required" }, 403);
+            if (!body || typeof body !== "object" || Array.isArray(body) ||
+                Object.keys(body).sort().join(",") !== (hasCredentials ? "baseUpdateTime,clientVersionGate,confirm,ownerCredentials" : "baseUpdateTime,clientVersionGate,confirm") ||
+                body.confirm !== true || !(body.baseUpdateTime === null || typeof body.baseUpdateTime === "string")) {
+              return clientVersionGateResponse({ success: false, error: "Explicit policy confirmation is required" }, 400);
+            }
+            const policy = parseClientVersionGatePolicy(body.clientVersionGate);
+            if (!policy) return clientVersionGateResponse({ success: false, error: "Invalid or incomplete version policy" }, 400);
+            const snapshot = await getFirestoreSnapshot("app_settings", "main", accessToken);
+            if (body.baseUpdateTime !== (snapshot?.updateTime || null)) return clientVersionGateResponse({ success: false, error: "Settings changed since review; reload before saving" }, 409);
+            let previous, previousInvalid = false;
+            try { previous = clientVersionGateFromSettings(snapshot?.data); }
+            catch { previousInvalid = true; previous = null; }
+            if (!previousInvalid && JSON.stringify(previous) === JSON.stringify(policy))
+              return clientVersionGateResponse({ success: true, changed: false, clientVersionGate: policy });
+            // Store availability is verified outside this Worker. This separate
+            // owner-approved deployment binding is absent by default. Disabling
+            // an active policy never depends on it.
+            if (policy.enabled && env.CLIENT_VERSION_GATE_ACTIVATION_READY !== "true")
+              return clientVersionGateResponse({ success: false, code: "RELEASE_NOT_VERIFIED", error: "Compatible releases must be verified in both stores before activation" }, 409);
+            const auditId = "client-version-gate-" + crypto.randomUUID();
+            const writes = [{
+              update: phase4aDoc("app_settings", "main", { clientVersionGate: policy }),
+              updateMask: { fieldPaths: ["clientVersionGate"] },
+              currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false }
+            }, {
+              update: phase4aDoc("admin_audit_logs", auditId, { action: "client_version_gate_changed", actorFirebaseUid: owner.uid,
+                oldValue: previousInvalid ? "INVALID_CONFIG_REPLACED" : previous, newValue: policy, changedAt: new Date().toISOString() }),
+              currentDocument: { exists: false }
+            }];
+            if (!await phase4aCommit(writes, accessToken)) return clientVersionGateResponse({ success: false, error: "Settings changed concurrently; retry" }, 409);
+            return clientVersionGateResponse({ success: true, changed: true, clientVersionGate: policy });
+          }
           if (path === "/admin/api/settings" && request.method === "POST") {
             const body = await request.json();
             if (!body || typeof body !== "object" || Array.isArray(body)) return jsonResponse({ error: "Settings must be an object" }, 400);
@@ -10504,6 +11680,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             if ("phonePasswordLoginEnabled" in body) return jsonResponse({ error: "phonePasswordLoginEnabled is currently disabled and read-only" }, 400);
             if ("clientVersionGate" in body) return jsonResponse({ error: "Unsupported settings field" }, 400);
             if ("deliveryPricingV2" in body || "deliveryPricingPolicy" in body) return jsonResponse({ error: "Delivery V2 pricing policy is read-only in Admin" }, 400);
+            if ("cashFundingV1" in body) return jsonResponse({ error: "Driver cash-advance maximum is retired" }, 400);
             if ("bannerWhatsapp" in body) {
               const normalizedBannerWhatsapp = normalizeInternationalWhatsApp(body.bannerWhatsapp);
               if (normalizedBannerWhatsapp === null) {
@@ -10623,6 +11800,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             }
           }
           if (path === "/admin/api/change-password" && request.method === "POST") {
+            if (adminIdentity.startsWith("owner:") || adminOwnerLoginMode(env) === "owner_only")
+              return jsonResponse({ error: "Firebase password is managed in Firebase Authentication" }, 403);
             try {
               const body = await request.json();
               if (!body.currentPassword || !body.newPassword) {
@@ -10971,6 +12150,54 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to retrieve order contact" }, 500);
         }
       }
+      const participantSummaryMatch = path.match(/^\/orders\/([^/]+)\/participant-summary$/);
+      if (participantSummaryMatch && request.method === 'GET') {
+        if (hasServiceKey) return phase4aError('forbidden', 'User authentication required', 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleOrderParticipantSummary(request, decodeURIComponent(participantSummaryMatch[1]), accessToken);
+        } catch {
+          console.error('[ParticipantSummary] Read failed');
+          return phase4aError('internal_error', 'Unable to load participant summary', 500);
+        }
+      }
+      const classificationMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/delivery-classification-v1$/);
+      if (classificationMatch && request.method === "GET") {
+        if (hasServiceKey) return phase4aError("forbidden", "User authentication required", 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await deliveryClassificationV1(request, classificationMatch[1], env, accessToken);
+        } catch {
+          console.error("[DeliveryClassificationV1] Read failed");
+          return phase4aError("internal_error", "Delivery classification unavailable", 500);
+        }
+      }
+      const cashFundingMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/cash-funding-v1(?:\/(accept|provider-receipt|collection-report|customer-ack|issue|release-no-advance|provider-no-receipt|convert-self-pickup|self-pickup-receipt))?$/);
+      if (cashFundingMatch && (request.method === "GET" && !cashFundingMatch[2] || request.method === "POST" && !!cashFundingMatch[2])) {
+        if (hasServiceKey) return phase4aError("forbidden", "User authentication required", 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return request.method === "GET" ? await cashFundingV1Read(request, cashFundingMatch[1], env, accessToken) :
+            cashFundingMatch[2] === "accept" ? await cashFundingV1Accept(request, cashFundingMatch[1], env, accessToken) :
+            ["release-no-advance", "provider-no-receipt", "convert-self-pickup", "self-pickup-receipt"].includes(cashFundingMatch[2]) ?
+              await cashFundingV1Recovery(request, cashFundingMatch[1], cashFundingMatch[2], accessToken) :
+              await cashFundingV1Record(request, cashFundingMatch[1], cashFundingMatch[2], accessToken);
+        } catch {
+          console.error("[CashFundingV1] Request failed");
+          return phase4aError("internal_error", "Cash funding unavailable", 500);
+        }
+      }
+      const receivedSafetyReportsMatch = path.match(/^\/orders\/([A-Za-z0-9_-]{1,128})\/complaints\/received$/);
+      if (receivedSafetyReportsMatch && request.method === 'GET') {
+        if (hasServiceKey) return phase4aError('forbidden', 'User authentication required', 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleReceivedSafetyReports(request, receivedSafetyReportsMatch[1], accessToken);
+        } catch {
+          console.error('[Complaints] Received read failed');
+          return phase4aError('internal_error', 'Unable to load safety reports', 500);
+        }
+      }
       if (path === "/order-payment-instructions" && request.method === "POST") {
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
@@ -11033,6 +12260,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch {
           console.error("[Complaints] Create failed");
           return jsonResponse({ success: false, code: "internal_error", error: "Unable to create complaint" }, 500);
+        }
+      }
+      const safetyResponseMatch = path.match(/^\/complaints\/([^/]+)\/respond$/);
+      if (safetyResponseMatch && request.method === 'POST') {
+        if (hasServiceKey) return phase4aError('forbidden', 'User authentication required', 403);
+        try {
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          return await handleSafetyReportResponse(request, decodeURIComponent(safetyResponseMatch[1]), accessToken);
+        } catch {
+          console.error('[Complaints] Response failed');
+          return phase4aError('internal_error', 'Unable to record response', 500);
         }
       }
       if (path === "/notifications/summary" && request.method === "GET") {
@@ -11321,6 +12559,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const order = orderSnapshot.data;
           if (order.customerUid !== auth.uid) return phase4aError("FORBIDDEN", "Forbidden", 403);
           if (deliveryFinalizationV2IsIdempotent(order, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(order, true));
+          if (order.cashFundingIntentVersion === CASH_FUNDING_V1 && (!cashFundingV1Enabled(env) || order.paymentMethod !== "CASH" || body.deliveryPaymentMethod !== "cod")) return phase4aError("CASH_FUNDING_INELIGIBLE", "Cash funding is unavailable for this delivery", 409);
           if (!quoteSnapshot || quoteSnapshot.data.customerUid !== auth.uid || quoteSnapshot.data.orderId !== body.orderId || quoteSnapshot.data.providerUid !== order.providerUid) return phase4aError("STALE_DELIVERY_QUOTE", "Quote does not belong to this order", 409);
           const quote = quoteSnapshot.data;
           if (quote.status === "used" || quote.usedAt) return phase4aError("DELIVERY_QUOTE_ALREADY_USED", "Delivery quote was already used", 409);
@@ -11336,6 +12575,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const nextVersion = Number.isFinite(order.deliveryStateVersion) ? order.deliveryStateVersion + 1 : 1;
           const subtotal = order.priceSnapshot;
           if (typeof subtotal !== "number" || !Number.isFinite(subtotal) || subtotal < 0 || subtotal > Number.MAX_SAFE_INTEGER - quote.deliveryFee) return phase4aError("ORDER_PRICE_INVALID", "Order subtotal cannot be combined safely with delivery fee", 409);
+          const fundingFoodCents = sarCents(subtotal), fundingFeeCents = sarCents(quote.deliveryFee);
+          if (order.cashFundingIntentVersion === CASH_FUNDING_V1 && (fundingFoodCents === null || fundingFoodCents <= 0 || fundingFeeCents === null || !Number.isSafeInteger(fundingFoodCents + fundingFeeCents))) return phase4aError("ORDER_PRICE_INVALID", "Cash-funding amount is invalid", 409);
           const fields = {
             deliveryMethod: "driver",
             dropoffCity: quote.city,
@@ -11343,7 +12584,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             dropoffConfirmedAt: now,
             deliveryDistanceKm: quote.deliveryDistanceKm,
             deliveryFee: quote.deliveryFee,
-            totalAmount: subtotal + quote.deliveryFee,
+            totalAmount: order.cashFundingIntentVersion === CASH_FUNDING_V1 ? (fundingFoodCents + fundingFeeCents) / 100 : subtotal + quote.deliveryFee,
             deliveryQuoteId: body.quoteId,
             deliveryPricingVersion: quote.pricingVersion,
             deliveryPaymentMethod: body.deliveryPaymentMethod,
@@ -11358,9 +12599,10 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           const privateDestination = { customerUid: auth.uid, providerUid: order.providerUid, lat: quote.dropoffLat, lng: quote.dropoffLng, addressLine: quote.addressLine, city: quote.city, district: quote.district, deliveryNotes: "" };
           const participants = await newActiveWorkDeletionFences([auth.uid, order.providerUid], accessToken, new Map([[auth.uid, auth.deletionSnapshot]]));
           if (participants.blocked) return phase4aError("ACCOUNT_DELETION_BLOCKED", "A participant has requested account deletion", 409);
-          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, body.deliveryPaymentMethod, accessToken, pricing);
+          const committed = await commitDeliveryFinalizationV2(body.orderId, orderSnapshot, body.quoteId, quoteSnapshot, privateSnapshot, body.deliveryPaymentMethod, accessToken, pricing, cashFundingV1Enabled(env));
           if (!committed.ok) {
             if (committed.uncertain) return phase4aError("STATE_UNCERTAIN", "Delivery finalization outcome is uncertain; check the order before retrying", 503);
+            if (committed.code === "CASH_FUNDING_INELIGIBLE" || committed.code === "ORDER_PRICE_INVALID") return phase4aError(committed.code, "Cash funding is unavailable or the amount is invalid", 409);
             const latest = await getFirestoreDoc("orders", body.orderId, accessToken);
             if (latest && deliveryFinalizationV2IsIdempotent(latest, body.quoteId, body.deliveryPaymentMethod)) return jsonResponse(deliveryFinalizationV2Response(latest, true));
             return phase4aError("STALE_DELIVERY_QUOTE", "Order or quote changed; request a new quote", 409);
@@ -11410,6 +12652,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           if (!snapshot) return jsonResponse({ success: false, code: "not_found", error: "Order not found" }, 404);
           const order = snapshot.data;
           if (order.customerUid !== uid) return jsonResponse({ success: false, code: "forbidden", error: "Forbidden" }, 403);
+          if (order.cashFundingIntentVersion === CASH_FUNDING_V1) return jsonResponse({ success: false, code: "cash_funding_ineligible", error: "Use the explicit V2 cash-delivery flow" }, 409);
           // A V2-created order has no legacy location snapshot. Self-pickup
           // remains valid, but driver delivery must use an explicit V2 quote.
           if (method === "driver" && isPrivateDestinationOrder(order)) return jsonResponse({ success: false, code: "explicit_destination_required", error: "Use an explicit V2 delivery quote" }, 409);
