@@ -516,6 +516,32 @@
     }
     __name(listAllComplaints, "listAllComplaints");
     __name2(listAllComplaints, "listAllComplaints");
+    async function complaintOrderNumbers(complaints, accessToken) {
+      const ids = [...new Set(complaints.filter((item) => (!item.orderNumber || item.orderNumber === item.orderId) && phase4aSafeSegment(item.orderId)).map((item) => item.orderId))];
+      const numbers = new Map();
+      // Read only the display-number field, in bounded batches. No order data is
+      // copied into complaints or exposed by this Admin-only presentation read.
+      for (let offset = 0; offset < ids.length; offset += 100) {
+        const batch = ids.slice(offset, offset + 100);
+        const response = await fetch(FIRESTORE_BASE + ":batchGet", {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+          body: JSON.stringify({ documents: batch.map((id) => FIRESTORE_BASE.slice(FIRESTORE_BASE.indexOf("projects/")) + "/orders/" + id), mask: { fieldPaths: ["orderNumber"] } })
+        });
+        if (!response.ok) { await response.text(); throw new Error("Complaint order reference lookup failed: " + response.status); }
+        const text = await response.text();
+        let entries;
+        try { const parsed = JSON.parse(text); entries = Array.isArray(parsed) ? parsed : [parsed]; }
+        catch { entries = text.split("\n").map((line) => line.trim().replace(/^,\s*|\s*,$/g, "")).filter((line) => line && line !== "[" && line !== "]").map((line) => JSON.parse(line)); }
+        for (const entry of entries) {
+          if (entry.error) throw new Error("Complaint order reference lookup returned an error");
+          const order = parseFirestoreDoc(entry.found);
+          if (order && batch.includes(order._id) && typeof order.orderNumber === "string" && order.orderNumber.trim().length <= 80)
+            numbers.set(order._id, order.orderNumber.trim());
+        }
+      }
+      return numbers;
+    }
     async function listAllVerificationRequests(accessToken) {
       const requests = [];
       let pageToken = null;
@@ -7069,6 +7095,12 @@ tr:hover td{background:#f8fafc}
 .user-info-row{display:flex;gap:8px;align-items:center;margin-bottom:4px}
 .user-info-row .name{font-weight:600;color:var(--text)}
 .user-info-row .email{color:var(--text2);font-size:12px}
+.complaint-order-cell{max-width:190px;min-width:0;overflow-wrap:anywhere}
+.complaint-order-ref{unicode-bidi:isolate;display:inline-block;max-width:100%;overflow-wrap:anywhere;text-align:start}
+.complaint-short-label{display:block;font-size:11px;color:var(--text2)}
+.complaint-order-full{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.complaint-order-full code{min-width:0;max-width:100%;overflow-wrap:anywhere;user-select:all}
+.modal h3 .complaint-order-ref{font-size:13px;color:var(--text2);vertical-align:middle}
 .toast{position:fixed;top:20px;z-index:999;padding:12px 20px;border-radius:8px;color:#fff;font-size:14px;font-weight:500;opacity:0;transform:translateY(-10px);transition:all .3s}
 html[dir="rtl"] .toast{left:20px}html[dir="ltr"] .toast{right:20px}
 .toast.show{opacity:1;transform:translateY(0)}
@@ -7167,7 +7199,7 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
 </style>
 </head>
 <body>
-<a class="skip-link" href="#page-content">تجاوز القائمة إلى المحتوى</a>
+<a class="skip-link" id="admin-skip-link" href="#page-content">تجاوز القائمة إلى المحتوى</a>
 
 <div id="login-view">
   <div class="login-card">
@@ -7178,7 +7210,7 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
     <form id="login-form" onsubmit="doLogin(event);return false;">
       <div id="login-error" class="err-msg" role="alert"></div>
       <div class="form-group" id="login-email-group" style="display:none">
-        <label for="login-email">البريد الإلكتروني للمالك</label>
+        <label id="login-email-label" for="login-email">البريد الإلكتروني للمالك</label>
         <input type="email" id="login-email" autocomplete="username" inputmode="email" dir="ltr" maxlength="320">
       </div>
       <div class="form-group">
@@ -7195,7 +7227,7 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
 <div id="main-view">
   <div class="layout">
     <div class="mobile-header" id="mobile-header">
-      <button class="hamburger" onclick="toggleSidebar()" aria-label="Menu">\u2630</button>
+      <button class="hamburger" id="admin-menu-button" onclick="toggleSidebar()" aria-label="Menu">\u2630</button>
       <span class="page-name" id="mobile-page-name"></span>
       <span class="logo-sm">Tabbakheen</span>
     </div>
@@ -7268,6 +7300,18 @@ function esc(s){return escapeHtml(s);}
 var T={ar:{adminDashboard:"\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646",adminPanel:"\u0644\u0648\u062D\u0629 \u0627\u0644\u0625\u062F\u0627\u0631\u0629",adminPassword:"\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",signIn:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644",invalidPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629",connectionError:"\u062E\u0637\u0623 \u0641\u064A \u0627\u0644\u0627\u062A\u0635\u0627\u0644",enterPassword:"\u0623\u062F\u062E\u0644 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",dashboard:"\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645",users:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",invoices:"\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",settings:"\u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",logout:"\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062E\u0631\u0648\u062C",totalUsers:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",customers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",providers:"\u0645\u0642\u062F\u0645\u064A \u0627\u0644\u062E\u062F\u0645\u0629",drivers:"\u0627\u0644\u0633\u0627\u0626\u0642\u064A\u0646",providersInTrial:"\u0645\u0642\u062F\u0645\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",driversInTrial:"\u0633\u0627\u0626\u0642\u064A\u0646 \u0641\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",suspended:"\u0645\u0648\u0642\u0648\u0641\u064A\u0646",activeSubs:"\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A \u0641\u0639\u0627\u0644\u0629",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",noData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A",name:"\u0627\u0644\u0627\u0633\u0645",email:"\u0627\u0644\u0628\u0631\u064A\u062F",phone:"\u0627\u0644\u062C\u0648\u0627\u0644",totalOrders:"\u0625\u062C\u0645\u0627\u0644\u064A \u0627\u0644\u0637\u0644\u0628\u0627\u062A",delivered:"\u0645\u0643\u062A\u0645\u0644",canceled:"\u0645\u0644\u063A\u064A",rating:"\u0627\u0644\u062A\u0642\u064A\u064A\u0645",images:"\u0627\u0644\u0635\u0648\u0631",allRoles:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0623\u062F\u0648\u0627\u0631",customer:"\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",driver:"\u0633\u0627\u0626\u0642",allStatus:"\u062C\u0645\u064A\u0639 \u0627\u0644\u062D\u0627\u0644\u0627\u062A",active:"\u0641\u0639\u0627\u0644",trial:"\u062A\u062C\u0631\u064A\u0628\u064A",disabled:"\u0645\u0639\u0637\u0644",allSubs:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643\u0627\u062A",trialing:"\u062A\u062C\u0631\u064A\u0628\u064A",expired:"\u0645\u0646\u062A\u0647\u064A",canceledSub:"\u0645\u0644\u063A\u064A",pastDue:"\u0645\u062A\u0623\u062E\u0631",searchPlaceholder:"\u0628\u062D\u062B \u0628\u0627\u0644\u0627\u0633\u0645\u060C \u0627\u0644\u0628\u0631\u064A\u062F\u060C \u0627\u0644\u062C\u0648\u0627\u0644...",edit:"\u062A\u0639\u062F\u064A\u0644",noUsersFound:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646",user:"\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",role:"\u0627\u0644\u062F\u0648\u0631",account:"\u0627\u0644\u062D\u0633\u0627\u0628",subscription:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",created:"\u0627\u0644\u0625\u0646\u0634\u0627\u0621",actions:"\u0625\u062C\u0631\u0627\u0621\u0627\u062A",subStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",editUser:"\u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",accountStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u062D\u0633\u0627\u0628",subscriptionStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",subscriptionPlan:"\u062E\u0637\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",trialEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A",subscriptionEndsAt:"\u0646\u0647\u0627\u064A\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",activatedByAdmin:"\u0645\u0641\u0639\u0644 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0645\u0633\u0624\u0648\u0644",disabledReason:"\u0633\u0628\u0628 \u0627\u0644\u062A\u0639\u0637\u064A\u0644",cancel:"\u0625\u0644\u063A\u0627\u0621",activate:"\u062A\u0641\u0639\u064A\u0644",suspend:"\u0625\u064A\u0642\u0627\u0641",save:"\u062D\u0641\u0638",userUpdated:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645",failedUpdate:"\u0641\u0634\u0644 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",noChanges:"\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u063A\u064A\u064A\u0631\u0627\u062A",notSet:"\u063A\u064A\u0631 \u0645\u062D\u062F\u062F",expiringIn:"\u064A\u0646\u062A\u0647\u064A \u062E\u0644\u0627\u0644",days:"\u064A\u0648\u0645",daysRemaining:"\u064A\u0648\u0645 \u0645\u062A\u0628\u0642\u064A",appSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0644\u062A\u0637\u0628\u064A\u0642",homeBanner:"\u0628\u0627\u0646\u0631 \u0627\u0644\u0631\u0626\u064A\u0633\u064A\u0629",upload:"\u0631\u0641\u0639",uploading:"\u062C\u0627\u0631\u064A \u0627\u0644\u0631\u0641\u0639...",uploadSuccess:"\u062A\u0645 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629 \u0628\u0646\u062C\u0627\u062D",uploadFailed:"\u0641\u0634\u0644 \u0631\u0641\u0639 \u0627\u0644\u0635\u0648\u0631\u0629",bannerUrl:"\u0631\u0627\u0628\u0637 \u0635\u0648\u0631\u0629 \u0627\u0644\u0628\u0627\u0646\u0631",bannerEnabled:"\u0627\u0644\u0628\u0627\u0646\u0631 \u0645\u0641\u0639\u0644",noBanner:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0628\u0627\u0646\u0631",supportContact:"\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u0639\u0645",supportEmail:"\u0628\u0631\u064A\u062F \u0627\u0644\u062F\u0639\u0645",supportWhatsapp:"\u0648\u0627\u062A\u0633\u0627\u0628 \u0627\u0644\u062F\u0639\u0645",deliveryPricing:"\u062A\u0633\u0639\u064A\u0631 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",baseFee:"\u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A (SAR)",perKmCity:"\u0633\u0639\u0631 \u0627\u0644\u0643\u064A\u0644\u0648\u0645\u062A\u0631 (SAR)",minFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 (SAR)",maxFee:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649 (SAR)",formulaPreview:"\u0645\u0639\u0627\u064A\u0646\u0629 \u0627\u0644\u0635\u064A\u063A\u0629",distance:"\u0627\u0644\u0645\u0633\u0627\u0641\u0629",estimatedFee:"\u0627\u0644\u0631\u0633\u0645 \u0627\u0644\u0645\u062A\u0648\u0642\u0639",pricingFormula:"\u0627\u0644\u0635\u064A\u063A\u0629: \u0631\u0633\u0645 \u0623\u0633\u0627\u0633\u064A + (\u0645\u0633\u0627\u0641\u0629 \xD7 \u0633\u0639\u0631/\u0643\u0645)",invalidMinMax:"\u0627\u0644\u062D\u062F \u0627\u0644\u0623\u062F\u0646\u0649 \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0623\u0642\u0644 \u0645\u0646 \u0627\u0644\u062D\u062F \u0627\u0644\u0623\u0642\u0635\u0649",noNegative:"\u0627\u0644\u0642\u064A\u0645 \u064A\u062C\u0628 \u0623\u0646 \u062A\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631",saveSettings:"\u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",settingsSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0625\u0639\u062F\u0627\u062F\u0627\u062A",failedSave:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0641\u0638",language:"\u0627\u0644\u0644\u063A\u0629",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"\u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",currentPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062D\u0627\u0644\u064A\u0629",newPassword:"\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0627\u0644\u062C\u062F\u064A\u062F\u0629",confirmNewPassword:"\u062A\u0623\u0643\u064A\u062F \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",changePasswordBtn:"\u062A\u063A\u064A\u064A\u0631",passwordChanged:"\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",passwordMismatch:"\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0645\u062A\u0637\u0627\u0628\u0642\u0629",passwordFailed:"\u0641\u0634\u0644 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631",adminNotifications:"\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644",notifyNewUser:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0639\u0645\u064A\u0644 \u062C\u062F\u064A\u062F",notifyNewProvider:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629 \u062C\u062F\u064A\u062F",notifyNewDriver:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0633\u062C\u064A\u0644 \u0633\u0627\u0626\u0642 \u062C\u062F\u064A\u062F",verification:"\u0627\u0644\u062A\u0648\u062B\u064A\u0642",crVerifications:"\u062A\u0648\u062B\u064A\u0642 \u0627\u0644\u0633\u062C\u0644 \u0627\u0644\u062A\u062C\u0627\u0631\u064A",freelanceRequests:"\u0637\u0644\u0628\u0627\u062A \u0634\u0647\u0627\u062F\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u062D\u0631",certNumber:"\u0631\u0642\u0645 \u0627\u0644\u0634\u0647\u0627\u062F\u0629",submittedAt:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u062A\u0642\u062F\u064A\u0645",reviewStatus:"\u062D\u0627\u0644\u0629 \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",approve:"\u0627\u0639\u062A\u0645\u0627\u062F",reject:"\u0631\u0641\u0636",pendingReview:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",verifiedStatus:"\u0645\u0648\u062B\u0651\u0642",unverifiedStatus:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",notVerified:"\u063A\u064A\u0631 \u0645\u0648\u062B\u0651\u0642",viewDocument:"\u062A\u062D\u0642\u0642 \u0645\u0646 \u0627\u0644\u0648\u062B\u064A\u0642\u0629",viewImage:"\u0639\u0631\u0636 \u0627\u0644\u0635\u0648\u0631\u0629",rejectReason:"\u0633\u0628\u0628 \u0627\u0644\u0631\u0641\u0636 (\u062F\u0627\u062E\u0644\u064A)",verificationApproved:"\u062A\u0645 \u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062A\u0648\u062B\u064A\u0642",verificationRejected:"\u062A\u0645 \u0631\u0641\u0636 \u0627\u0644\u062A\u0648\u062B\u064A\u0642",notifyCrVerification:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u062A\u0648\u062B\u064A\u0642 \u0633\u062C\u0644 \u062A\u062C\u0627\u0631\u064A \u062C\u062F\u064A\u062F",notifyFreelanceRequest:"\u0625\u0634\u0639\u0627\u0631 \u0639\u0646\u062F \u0637\u0644\u0628 \u0634\u0647\u0627\u062F\u0629 \u0639\u0645\u0644 \u062D\u0631 \u062C\u062F\u064A\u062F",noVerificationData:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u0648\u062B\u064A\u0642",source:"\u0627\u0644\u0645\u0635\u062F\u0631",subWarning:"\u062A\u0646\u0628\u064A\u0647 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",warningDays:"\u0623\u064A\u0627\u0645 \u0627\u0644\u062A\u0646\u0628\u064A\u0647 \u0642\u0628\u0644 \u0627\u0644\u0627\u0646\u062A\u0647\u0627\u0621",sendReminder:"\u0625\u0631\u0633\u0627\u0644 \u062A\u0630\u0643\u064A\u0631",reminderSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062A\u0630\u0643\u064A\u0631",addSubscription:"\u0625\u0636\u0627\u0641\u0629 \u0627\u0634\u062A\u0631\u0627\u0643",amount:"\u0627\u0644\u0645\u0628\u0644\u063A",startDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0628\u062F\u0627\u064A\u0629",endDate:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0646\u0647\u0627\u064A\u0629",paymentMethod:"\u0637\u0631\u064A\u0642\u0629 \u0627\u0644\u062F\u0641\u0639",planName:"\u0627\u0633\u0645 \u0627\u0644\u062E\u0637\u0629",notes:"\u0645\u0644\u0627\u062D\u0638\u0627\u062A",generateInvoice:"\u0625\u0646\u0634\u0627\u0621 \u0641\u0627\u062A\u0648\u0631\u0629",viewInvoice:"\u0639\u0631\u0636 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",downloadPdf:"\u062A\u062D\u0645\u064A\u0644 PDF",sendByEmail:"\u0625\u0631\u0633\u0627\u0644 \u0628\u0627\u0644\u0628\u0631\u064A\u062F",invoiceSaved:"\u062A\u0645 \u062D\u0641\u0638 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceSent:"\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",invoiceEmailFailed:"\u0641\u0634\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",noInvoices:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0641\u0648\u0627\u062A\u064A\u0631",invoiceNumber:"\u0631\u0642\u0645 \u0627\u0644\u0641\u0627\u062A\u0648\u0631\u0629",date:"\u0627\u0644\u062A\u0627\u0631\u064A\u062E",close:"\u0625\u063A\u0644\u0627\u0642",selectFile:"\u0627\u062E\u062A\u0631 \u0645\u0644\u0641",noName:"\u0628\u062F\u0648\u0646 \u0627\u0633\u0645",na:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",clickToExpand:"\u0627\u0636\u063A\u0637 \u0644\u0644\u062A\u0641\u0627\u0635\u064A\u0644",status:"\u0627\u0644\u062D\u0627\u0644\u0629",issued:"\u0635\u0627\u062F\u0631\u0629",allInvoices:"\u062C\u0645\u064A\u0639 \u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631",notifications:"\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastTitle:"\u0639\u0646\u0648\u0627\u0646 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastMessage:"\u0646\u0635 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastAudience:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u0633\u062A\u0647\u062F\u0641",audienceCustomers:"\u0627\u0644\u0639\u0645\u0644\u0627\u0621",audienceProviders:"\u0645\u0642\u062F\u0645\u0648 \u0627\u0644\u062E\u062F\u0645\u0629",audienceDrivers:"\u0645\u0646\u0627\u062F\u064A\u0628 \u0627\u0644\u062A\u0648\u0635\u064A\u0644",audienceAll:"\u0627\u0644\u0643\u0644",broadcastSend:"\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631",broadcastHistory:"\u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastConfirm:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastConfirmMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u062C\u0645\u064A\u0639 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645\u064A\u0646 \u0627\u0644\u0645\u062D\u062F\u062F\u064A\u0646.",broadcastResult:"\u0646\u062A\u064A\u062C\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastMatched:"\u0645\u0633\u062A\u062E\u062F\u0645\u0648\u0646 \u0645\u0637\u0627\u0628\u0642\u0648\u0646",broadcastTokens:"\u0631\u0645\u0648\u0632 \u0635\u0627\u0644\u062D\u0629",broadcastSentCount:"\u062A\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",broadcastFailed:"\u0641\u0634\u0644 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",noBroadcastHistory:"\u0644\u0627 \u064A\u0648\u062C\u062F \u0633\u062C\u0644 \u0625\u0634\u0639\u0627\u0631\u0627\u062A",broadcastAudienceLabel:"\u0627\u0644\u062C\u0645\u0647\u0648\u0631",deleteNotif:"\u062D\u0630\u0641",resendNotif:"\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResend:"\u062A\u0639\u062F\u064A\u0644 \u0648\u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644",editResendSend:"\u0625\u0631\u0633\u0627\u0644 \u0646\u0633\u062E\u0629 \u0645\u0639\u062F\u0644\u0629",confirmDelete:"\u062A\u0623\u0643\u064A\u062F \u0627\u0644\u062D\u0630\u0641",confirmDeleteMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u062D\u0630\u0641 \u0633\u062C\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0641\u0642\u0637 \u062F\u0648\u0646 \u0625\u0644\u063A\u0627\u0621 \u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A \u0627\u0644\u0645\u0631\u0633\u0644\u0629.",confirmResend:"\u062A\u0623\u0643\u064A\u062F \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",confirmResendMsg:"\u0647\u0644 \u0623\u0646\u062A \u0645\u062A\u0623\u0643\u062F\u061F \u0633\u064A\u062A\u0645 \u0625\u0639\u0627\u062F\u0629 \u0625\u0631\u0633\u0627\u0644 \u0647\u0630\u0627 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0644\u0644\u062C\u0645\u0647\u0648\u0631 \u0627\u0644\u0645\u062D\u062F\u062F.",notifDeleted:"\u062A\u0645 \u062D\u0630\u0641 \u0627\u0644\u0633\u062C\u0644",deleteFailed:"\u0641\u0634\u0644 \u0627\u0644\u062D\u0630\u0641",resendSuccess:"\u062A\u0645\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",resendFailed:"\u0641\u0634\u0644\u062A \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0625\u0631\u0633\u0627\u0644",providerSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0632\u0648\u062F \u0627\u0644\u062E\u062F\u0645\u0629",driverSubSettings:"\u0625\u0639\u062F\u0627\u062F\u0627\u062A \u0627\u0634\u062A\u0631\u0627\u0643 \u0627\u0644\u0633\u0627\u0626\u0642",subActive:"\u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 \u0645\u0641\u0639\u0651\u0644",subPrice:"\u0633\u0639\u0631 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643 (SAR)",subPeriod:"\u0641\u062A\u0631\u0629 \u0627\u0644\u0627\u0634\u062A\u0631\u0627\u0643",periodWeekly:"\u0623\u0633\u0628\u0648\u0639\u064A",periodMonthly:"\u0634\u0647\u0631\u064A",periodQuarterly:"\u0631\u0628\u0639 \u0633\u0646\u0648\u064A",periodYearly:"\u0633\u0646\u0648\u064A",freeTrialEnabledLabel:"\u0627\u0644\u062A\u062C\u0631\u0628\u0629 \u0627\u0644\u0645\u062C\u0627\u0646\u064A\u0629 \u0645\u0641\u0639\u0651\u0644\u0629",freeTrialTextArLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0639\u0631\u0628\u064A)",freeTrialTextEnLabel:"\u0646\u0635 \u0627\u0644\u062A\u062C\u0631\u0628\u0629 (\u0625\u0646\u062C\u0644\u064A\u0632\u064A)"},en:{adminDashboard:"Tabbakheen Admin",adminPanel:"Admin Panel",adminPassword:"Admin Password",signIn:"Sign In",invalidPassword:"Invalid password",connectionError:"Connection error",enterPassword:"Enter admin password",dashboard:"Dashboard",users:"Users",invoices:"Invoices",settings:"Settings",logout:"Logout",totalUsers:"Total Users",customers:"Customers",providers:"Providers",drivers:"Drivers",providersInTrial:"Providers in Trial",driversInTrial:"Drivers in Trial",suspended:"Suspended",activeSubs:"Active Subscriptions",loading:"Loading...",noData:"No data",name:"Name",email:"Email",phone:"Phone",totalOrders:"Total Orders",delivered:"Delivered",canceled:"Canceled",rating:"Rating",images:"Images",allRoles:"All Roles",customer:"Customer",provider:"Provider",driver:"Driver",allStatus:"All Status",active:"Active",trial:"Trial",disabled:"Disabled",allSubs:"All Subscriptions",trialing:"Trialing",expired:"Expired",canceledSub:"Canceled",pastDue:"Past Due",searchPlaceholder:"Search name, email, phone...",edit:"Edit",noUsersFound:"No users found",user:"User",role:"Role",account:"Account",subscription:"Subscription",created:"Created",actions:"Actions",subStatus:"Sub Status",editUser:"Edit User",accountStatus:"Account Status",subscriptionStatus:"Subscription Status",subscriptionPlan:"Subscription Plan",trialEndsAt:"Trial Ends At",subscriptionEndsAt:"Subscription Ends At",activatedByAdmin:"Activated by Admin",disabledReason:"Disabled Reason",cancel:"Cancel",activate:"Activate",suspend:"Suspend",save:"Save",userUpdated:"User updated",failedUpdate:"Failed to update",noChanges:"No changes",notSet:"Not Set",expiringIn:"Expiring in",days:"days",daysRemaining:"days remaining",appSettings:"App Settings",homeBanner:"Home Banner",upload:"Upload",uploading:"Uploading...",uploadSuccess:"Image uploaded successfully",uploadFailed:"Image upload failed",bannerUrl:"Banner Image URL",bannerEnabled:"Banner Enabled",noBanner:"No banner set",supportContact:"Support Contact",supportEmail:"Support Email",supportWhatsapp:"Support WhatsApp",deliveryPricing:"Delivery Pricing",baseFee:"Base Fee (SAR)",perKmCity:"Price per KM (SAR)",minFee:"Minimum Fee (SAR)",maxFee:"Maximum Fee (SAR)",formulaPreview:"Formula Preview",distance:"Distance",estimatedFee:"Estimated Fee",pricingFormula:"Formula: Base Fee + (Distance \xD7 Price/KM)",invalidMinMax:"Minimum fee must be less than maximum fee",noNegative:"Values must be greater than zero",saveSettings:"Save Settings",settingsSaved:"Settings saved",failedSave:"Failed to save",language:"Language",arabic:"\u0627\u0644\u0639\u0631\u0628\u064A\u0629",english:"English",changePassword:"Change Password",currentPassword:"Current Password",newPassword:"New Password",confirmNewPassword:"Confirm Password",changePasswordBtn:"Change",passwordChanged:"Password changed",passwordMismatch:"Passwords do not match",passwordFailed:"Password change failed",adminNotifications:"Admin Notifications",notifyNewUser:"Notify on new customer signup",notifyNewProvider:"Notify on new provider signup",notifyNewDriver:"Notify on new driver signup",verification:"Verification",crVerifications:"CR Verification",freelanceRequests:"Freelance Certificate Requests",certNumber:"Certificate #",submittedAt:"Submitted At",reviewStatus:"Review Status",approve:"Approve",reject:"Reject",pendingReview:"Pending Review",verifiedStatus:"Verified",unverifiedStatus:"Unverified",notVerified:"Not Verified",viewDocument:"Verify Document",viewImage:"View Image",rejectReason:"Reject reason (internal)",verificationApproved:"Verification approved",verificationRejected:"Verification rejected",notifyCrVerification:"Notify on new CR verification",notifyFreelanceRequest:"Notify on new freelance request",noVerificationData:"No verification data",source:"Source",subWarning:"Subscription Warning",warningDays:"Warning days before expiry",sendReminder:"Send Reminder",reminderSent:"Reminder sent",addSubscription:"Add Subscription",amount:"Amount",startDate:"Start Date",endDate:"End Date",paymentMethod:"Payment Method",planName:"Plan Name",notes:"Notes",generateInvoice:"Generate Invoice",viewInvoice:"View Invoice",downloadPdf:"Download PDF",sendByEmail:"Send by Email",invoiceSaved:"Invoice saved",invoiceSent:"Invoice sent by email",invoiceEmailFailed:"Failed to send invoice",noInvoices:"No invoices found",invoiceNumber:"Invoice #",date:"Date",close:"Close",selectFile:"Select file",noName:"No name",na:"N/A",clickToExpand:"Click to expand",status:"Status",issued:"Issued",allInvoices:"All Invoices",notifications:"Notifications",broadcastTitle:"Notification Title",broadcastMessage:"Message",broadcastAudience:"Target Audience",audienceCustomers:"Customers",audienceProviders:"Providers",audienceDrivers:"Drivers",audienceAll:"All",broadcastSend:"Send Notification",broadcastHistory:"Notification History",broadcastConfirm:"Confirm Send",broadcastConfirmMsg:"Are you sure? This notification will be sent to all targeted users.",broadcastResult:"Send Result",broadcastMatched:"Users Matched",broadcastTokens:"Valid Tokens",broadcastSentCount:"Sent",broadcastFailed:"Failed",noBroadcastHistory:"No notification history",broadcastAudienceLabel:"Audience",deleteNotif:"Delete",resendNotif:"Resend",editResend:"Edit & Resend",editResendSend:"Send Edited Copy",confirmDelete:"Confirm Delete",confirmDeleteMsg:"Are you sure? Only the history record will be deleted. Sent notifications are not recalled.",confirmResend:"Confirm Resend",confirmResendMsg:"Are you sure? This notification will be resent to the targeted audience.",notifDeleted:"Record deleted",deleteFailed:"Delete failed",resendSuccess:"Resend successful",resendFailed:"Resend failed",providerSubSettings:"Provider Subscription Settings",driverSubSettings:"Driver Subscription Settings",subActive:"Subscription Active",subPrice:"Subscription Price (SAR)",subPeriod:"Subscription Period",periodWeekly:"Weekly",periodMonthly:"Monthly",periodQuarterly:"Quarterly",periodYearly:"Yearly",freeTrialEnabledLabel:"Free Trial Enabled",freeTrialTextArLabel:"Free Trial Text (Arabic)",freeTrialTextEnLabel:"Free Trial Text (English)"}};
 var lang=localStorage.getItem("tbk_admin_lang")||"ar";
 function t(k){return(T[lang]&&T[lang][k])||T.en[k]||k;}
+var adminUiText={
+  ar:{signingIn:"جارٍ تسجيل الدخول...",loginRetry:"تعذّر تسجيل الدخول، حاول مرة أخرى",serverUnavailable:"تعذّر الاتصال بالخادم",liveNow:"الآن",liveTenSeconds:"منذ 10 ثوانٍ",autoRefresh:"تحديث تلقائي",lastRefresh:"آخر تحديث",newComplaints:"بلاغات جديدة",newVerifications:"طلبات توثيق جديدة",
+    releaseCurrent:"على 1.0.6 أو أحدث",releaseRequired:"يحتاج تحديث",releaseRequiredPlural:"يحتاجون تحديث",releaseUnknown:"لم يُبلّغ عن إصدار",releaseTest:"1.0.7 · جديد / تجريبي",releasePublic:"1.0.6 · الإصدار العام",releaseOlder:"إصدار أقدم",releaseOther:"إصدار آخر مُبلّغ عنه",releaseTotal:"إجمالي المستخدمين",releaseAdoption:"نسبة التحديث",releaseTestMetric:"1.0.7 · جديد / TestFlight / Internal Testing",releasePublicMetric:"1.0.6 · الإصدار العام الحالي",releaseOlderMetric:"أقل من 1.0.6",releaseOtherMetric:"إصدارات أخرى مُبلّغ عنها",releaseShare:"% من إجمالي الحسابات",releaseUsers:"مستخدم",releaseNoData:"لا توجد بيانات إصدارات بعد",releaseNoDataHint:"ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.",releaseVersionAll:"الإصدار: الكل",releaseCategoryAll:"فئة الإصدار: الكل",releaseStatusAll:"حالة الإصدار: الكل",releaseUpdated:"محدّث",releaseUnknownShort:"غير معروف",releaseTestShort:"1.0.7 · تجريبي",releasePublicShort:"1.0.6 · عام",releaseOlderShort:"أقدم من 1.0.6",releaseOtherShort:"إصدار آخر",releaseNotReported:"لم يُبلّغ",releaseAppVersion:"إصدار التطبيق",releaseStatus:"حالة الإصدار",releaseLastVersion:"آخر إصدار أبلغ عنه الحساب",releaseCategory:"فئة الإصدار",releaseTracking:"متابعة الإصدارات",releaseTitle:"إصدارات التطبيق",releaseIntro:"آخر إصدار أبلغ عنه كل حساب، وليس إصدار كل جهاز. الإصدار العام الحالي:",releaseTestDisclaimer:"1.0.7 إصدار تجريبي ولا يغيّر أهلية تذكير مستخدمي 1.0.6.",releaseDistribution:"توزيع الإصدارات",releaseDistributionHint:"عدد ونسبة الحسابات حسب آخر إصدار مُبلّغ عنه؛ غير المعروف لا يعني إصدارًا قديمًا.",releaseAccounts:"إصدارات الحسابات",releaseAccountsHint:"تصفية حسب الإصدار الدقيق والدور والحساب؛ البيانات تخص الحساب لا التثبيت الفعلي.",releaseRoleFilter:"تصفية الدور",releaseCategoryFilter:"تصفية فئة الإصدار",releaseVersionFilter:"تصفية الإصدار الدقيق",releaseAccountFilter:"تصفية الحساب بالاسم أو المعرّف",releaseAccountSearch:"ابحث باسم الحساب أو معرّفه",usersKicker:"إدارة المستخدمين",usersIntro:"إدارة الحسابات ومعرفة إصدار التطبيق المسجل لكل مستخدم.",bulkReminder:"إرسال تنبيه جماعي",singleReminder:"طلب تحديث",
+    gateTitle:"التحديث الإجباري للتطبيق",gateIntro:"إعداد منفصل عن تذكيرات الإصدارات. السياسة معطّلة افتراضيًا، ولا تُفعّل قبل توفر الإصدار العام المتوافق في المتجرين وموافقة المالك المستقلة.",gatePolicy:"سياسة التحديث الإجباري",gateLoading:"جارٍ تحميل السياسة…",gateLoadError:"تعذّر تحميل السياسة. أعد فتح الصفحة قبل التعديل.",gateInvalid:"الإعداد المخزن غير صالح؛ ستبقى سياسة المحمول معطّلة حتى يصححها المالك.",gateEnabled:"الحالة المحفوظة: مفعّل",gateDisabled:"الحالة المحفوظة: معطّل",gateReady:"بوابة موافقة النشر متاحة",gateNotReady:"بوابة موافقة النشر غير مفعّلة؛ لا يمكن تشغيل الحظر",gateToggle:"تفعيل التحديث الإجباري",gateIosVersion:"الحد الأدنى لإصدار iOS",gateAndroidVersion:"الحد الأدنى لإصدار Android",gateVersionHint:"إصدار عام ثابت، مثل 1.0.6",gateIosBuild:"الحد الأدنى لرقم بناء iOS",gateAndroidBuild:"الحد الأدنى لرقم بناء Android",gateBuildHint:"رقم البناء الأصلي المنشور",gateIosUrl:"رابط App Store الرسمي",gateAndroidUrl:"رابط Google Play الرسمي",gateStoreHint:"يجب أن يشير إلى تطبيق طباخين فقط",gateOwnerEmail:"بريد Firebase للمالك",gateOwnerHint:"يستخدم للتحقق عند الحفظ فقط",gateOwnerPassword:"كلمة مرور Firebase للمالك",gatePasswordHint:"لا تُحفظ في إعدادات التطبيق.",gateStoreConfirm:"تحققت من توفر الإصدار المطلوب في App Store وGoogle Play",gateSave:"حفظ السياسة",gateReadOnly:"للعرض فقط حتى تُضبط هوية مالك Firebase وإعدادات إعادة المصادقة.",gateOwnerRequired:"يلزم التحقق من هوية مالك Firebase",gateStoreRequired:"أكّد توفر الإصدار في المتجرين قبل التفعيل",gateConfirm:"هل تريد حفظ سياسة التحديث؟ لا تفعّل الحظر دون موافقة نشر مستقلة.",gateSaving:"جارٍ الحفظ…",gateSaved:"حُفظت سياسة التحديث",gateSaveError:"تعذّر حفظ السياسة؛ راجع الحقول وحالة موافقة النشر",gateConnectionError:"تعذّر الاتصال؛ أعد تحميل السياسة قبل المحاولة",
+    reminderConfirm:"تأكيد إرسال طلب تحديث",reminderMessage:"سيتم إرسال إشعار داخل التطبيق، وإشعار فوري، وبريد إلكتروني عند توفره إلى",reminderUser:"المستخدم",reminderSent:"تم إرسال طلب التحديث",reminderFailed:"تعذر إرسال طلب التحديث",remindersConfirm:"تأكيد إرسال تنبيهات التحديث",remindersMessage:"مستخدم يحتاج إلى تحديث التطبيق، مع تطبيق مهلة 72 ساعة لمنع التكرار.",remindersFailed:"تعذر إرسال التنبيهات",remindersStopped:"توقف الإرسال الآمن؛ أعد المحاولة لإكمال الباقي",remindersResult:"نتيجة تنبيهات التحديث",remindersTargeted:"المستهدفون",remindersSent:"تم الإرسال",remindersCooldown:"ضمن مهلة الانتظار",remindersUnsent:"تعذر الإرسال",done:"تم",send:"إرسال",campaigns:"الحملات",pushHealth:"فحص حالة الإشعارات",pushChecking:"جارٍ الفحص…",pushCheckFailed:"تعذر فحص حالة الإشعارات",pushUsers:"المستخدمون",pushCustomers:"عملاء",pushProviders:"مقدمو خدمة",pushDrivers:"سائقون",pushPrivateDevices:"الأجهزة الخاصة",pushEnabled:"مفعلة",pushValidTokens:"رموز صالحة",pushNoToken:"بدون رمز",pushLegacyTokens:"الرموز القديمة الصالحة",pushLastBroadcast:"آخر بث",pushProcessed:"تمت معالجة",pushOf:"من",pushCandidates:"مرشحون",pushValid:"صالحون",pushSent:"أرسل",pushFailed:"فشل"},
+  en:{signingIn:"Signing in...",loginRetry:"Could not sign in. Please try again.",serverUnavailable:"Could not connect to the server",liveNow:"Now",liveTenSeconds:"10 seconds ago",autoRefresh:"Auto-refresh",lastRefresh:"Last updated",newComplaints:"New complaints",newVerifications:"New verification requests",
+    releaseCurrent:"On 1.0.6 or newer",releaseRequired:"Update required",releaseRequiredPlural:"Update required",releaseUnknown:"No version reported",releaseTest:"1.0.7 · New / test",releasePublic:"1.0.6 · Public release",releaseOlder:"Older version",releaseOther:"Another reported version",releaseTotal:"Total users",releaseAdoption:"Update adoption",releaseTestMetric:"1.0.7 · New / TestFlight / Internal Testing",releasePublicMetric:"1.0.6 · Current public release",releaseOlderMetric:"Below 1.0.6",releaseOtherMetric:"Other reported versions",releaseShare:"% of accounts",releaseUsers:"users",releaseNoData:"No version data yet",releaseNoDataHint:"Versions appear when users open the app.",releaseVersionAll:"Version: all",releaseCategoryAll:"Release category: all",releaseStatusAll:"Release status: all",releaseUpdated:"Up to date",releaseUnknownShort:"Unknown",releaseTestShort:"1.0.7 · Test",releasePublicShort:"1.0.6 · Public",releaseOlderShort:"Older than 1.0.6",releaseOtherShort:"Other version",releaseNotReported:"Not reported",releaseAppVersion:"App version",releaseStatus:"Release status",releaseLastVersion:"Last reported app version",releaseCategory:"Release category",releaseTracking:"Release tracking",releaseTitle:"App releases",releaseIntro:"Last app version reported by each account, not each device. Current public release:",releaseTestDisclaimer:"1.0.7 is a test release and does not change reminder eligibility for 1.0.6 users.",releaseDistribution:"Version distribution",releaseDistributionHint:"Account counts and percentages by last reported version; unknown does not mean outdated.",releaseAccounts:"Account versions",releaseAccountsHint:"Filter by exact version, role and account; these are accounts, not individual installations.",releaseRoleFilter:"Filter by role",releaseCategoryFilter:"Filter by release category",releaseVersionFilter:"Filter by exact version",releaseAccountFilter:"Filter accounts by name or ID",releaseAccountSearch:"Search account name or ID",usersKicker:"User management",usersIntro:"Manage accounts and see each user's last reported app version.",bulkReminder:"Send bulk reminder",singleReminder:"Request update",
+    gateTitle:"Mandatory app update",gateIntro:"Separate from release reminders. Disabled by default; enable only after a compatible public version is available in both stores and the owner separately approves it.",gatePolicy:"Mandatory update policy",gateLoading:"Loading policy…",gateLoadError:"Could not load the policy. Reopen this page before editing.",gateInvalid:"Stored settings are invalid. The mobile policy stays disabled until the owner corrects them.",gateEnabled:"Saved state: enabled",gateDisabled:"Saved state: disabled",gateReady:"Release approval gate available",gateNotReady:"Release approval gate disabled; blocking cannot be enabled",gateToggle:"Enable mandatory update",gateIosVersion:"Minimum iOS version",gateAndroidVersion:"Minimum Android version",gateVersionHint:"Published public version, e.g. 1.0.6",gateIosBuild:"Minimum iOS build",gateAndroidBuild:"Minimum Android build",gateBuildHint:"Published native build number",gateIosUrl:"Official App Store URL",gateAndroidUrl:"Official Google Play URL",gateStoreHint:"Must link to Tabbakheen only",gateOwnerEmail:"Owner Firebase email",gateOwnerHint:"Used only to verify changes",gateOwnerPassword:"Owner Firebase password",gatePasswordHint:"Not stored in app settings.",gateStoreConfirm:"I verified the required release is available on App Store and Google Play",gateSave:"Save policy",gateReadOnly:"Read-only until Firebase owner identity and reauthentication settings are configured.",gateOwnerRequired:"Firebase owner verification is required",gateStoreRequired:"Confirm store availability before enabling",gateConfirm:"Save this policy? Do not enable blocking without separate release approval.",gateSaving:"Saving…",gateSaved:"Update policy saved",gateSaveError:"Could not save the policy; check the fields and release approval state",gateConnectionError:"Connection failed; reload the policy before retrying",
+    reminderConfirm:"Confirm update request",reminderMessage:"An in-app notification, push and email where available will be sent to",reminderUser:"the user",reminderSent:"Update request sent",reminderFailed:"Could not send update request",remindersConfirm:"Confirm update reminders",remindersMessage:"users need an app update; a 72-hour cooldown prevents duplicates.",remindersFailed:"Could not send reminders",remindersStopped:"Safe sending stopped; retry to finish the remainder",remindersResult:"Update reminder results",remindersTargeted:"Targeted",remindersSent:"Sent",remindersCooldown:"Within cooldown",remindersUnsent:"Failed",done:"Done",send:"Send",campaigns:"Campaigns",pushHealth:"Check notification health",pushChecking:"Checking…",pushCheckFailed:"Could not check notification health",pushUsers:"Users",pushCustomers:"customers",pushProviders:"providers",pushDrivers:"drivers",pushPrivateDevices:"Private devices",pushEnabled:"enabled",pushValidTokens:"valid tokens",pushNoToken:"without token",pushLegacyTokens:"Valid legacy tokens",pushLastBroadcast:"Last broadcast",pushProcessed:"Processed",pushOf:"of",pushCandidates:"candidates",pushValid:"valid",pushSent:"sent",pushFailed:"failed"}
+};
+function ui(k){return(adminUiText[lang]&&adminUiText[lang][k])||adminUiText.en[k]||k;}
+function adminError(data,fallback){return lang==="ar"?fallback:(data&&typeof data.error==="string"&&data.error?data.error:fallback);}
 function formatAdminDate(value,includeTime){
   if(!value)return "-";
   var date=new Date(value);
@@ -7277,8 +7321,24 @@ function formatAdminDate(value,includeTime){
   if(includeTime){options.hour="2-digit";options.minute="2-digit";}
   return new Intl.DateTimeFormat(locale,options).format(date);
 }
-function setLang(l){lang=l;localStorage.setItem("tbk_admin_lang",l);var d=l==="ar"?"rtl":"ltr";document.documentElement.dir=d;document.documentElement.lang=l;updateStaticLabels();renderPage();}
+async function setLang(l){
+  if(l!=="ar"&&l!=="en")return;
+  var form={};
+  document.querySelectorAll("#page-content input[id],#page-content select[id],#page-content textarea[id]").forEach(function(el){
+    if(el.type==="password"||el.type==="file")return;
+    form[el.id]=el.type==="checkbox"?{checked:el.checked}:{value:el.value};
+  });
+  lang=l;localStorage.setItem("tbk_admin_lang",l);
+  document.documentElement.dir=l==="ar"?"rtl":"ltr";document.documentElement.lang=l;
+  updateStaticLabels();refreshAdminLoginForm();updateMobilePageName();
+  await renderPage();
+  Object.keys(form).forEach(function(id){var el=document.getElementById(id);if(!el)return;if("checked" in form[id])el.checked=form[id].checked;else el.value=form[id].value;});
+  if(currentPage==="users"||currentPage==="releases")filterUsers();
+}
 function updateStaticLabels(){
+  document.getElementById("admin-skip-link").textContent=lang==="ar"?"تجاوز القائمة إلى المحتوى":"Skip navigation to content";
+  document.getElementById("login-email-label").textContent=lang==="ar"?"البريد الإلكتروني للمالك":"Owner email";
+  document.getElementById("admin-menu-button").setAttribute("aria-label",lang==="ar"?"القائمة":"Menu");
   document.getElementById("login-subtitle").textContent=t("adminDashboard");
   document.getElementById("login-pw-label").textContent=t("adminPassword");
   document.getElementById("login-password").placeholder=t("enterPassword");
@@ -7309,8 +7369,8 @@ function releaseDataSignature(data){
 function releaseLiveIndicator(){
   var el=document.getElementById("release-live-indicator");
   if(!el)return;
-  var text=releasePolling.lastUpdatedAt&&Date.now()-releasePolling.lastUpdatedAt>=10000?"منذ 10 ثوانٍ":"الآن";
-  el.innerHTML='<span class="release-live-dot" aria-hidden="true">●</span><span>تحديث تلقائي</span><span class="release-live-separator">·</span><span>آخر تحديث: '+text+'</span>';
+  var text=releasePolling.lastUpdatedAt&&Date.now()-releasePolling.lastUpdatedAt>=10000?ui("liveTenSeconds"):ui("liveNow");
+  el.innerHTML='<span class="release-live-dot" aria-hidden="true">●</span><span>'+ui("autoRefresh")+'</span><span class="release-live-separator">·</span><span>'+ui("lastRefresh")+': '+text+'</span>';
 }
 function stopReleasePolling(){
   releasePolling.epoch++;
@@ -7382,6 +7442,13 @@ var allInvoices=[];
 var appSettings={};
  var complaintLabels={ar:{nav:"\u0628\u0644\u0627\u063A\u0627\u062A",title:"\u0628\u0644\u0627\u063A\u0627\u062A \u0627\u0644\u0634\u0643\u0627\u0648\u0649",all:"\u0627\u0644\u0643\u0644",pending:"\u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629",resolved:"\u062A\u0645 \u0627\u0644\u062D\u0644",closed:"\u0645\u063A\u0644\u0642\u0629",customerComplaint:"\u0634\u0643\u0648\u0649 \u0639\u0645\u064A\u0644",providerComplaint:"\u0634\u0643\u0648\u0649 \u0645\u0642\u062F\u0645 \u062E\u062F\u0645\u0629",deliveryNotConfirmed:"\u0627\u0644\u062A\u0648\u0635\u064A\u0644 \u063A\u064A\u0631 \u0645\u0624\u0643\u062F",customerRejectedReceipt:"\u0631\u0641\u0636 \u0627\u0633\u062A\u0644\u0627\u0645 \u0627\u0644\u0625\u064A\u0635\u0627\u0644",customer:"\u0627\u0644\u0639\u0645\u064A\u0644",provider:"\u0645\u0642\u062F\u0645 \u0627\u0644\u062E\u062F\u0645\u0629",driver:"\u0627\u0644\u0633\u0627\u0626\u0642",order:"\u0627\u0644\u0637\u0644\u0628",orderNumber:"\u0631\u0642\u0645 \u0627\u0644\u0637\u0644\u0628",complaintType:"\u0646\u0648\u0639 \u0627\u0644\u0628\u0644\u0627\u063A",source:"\u0627\u0644\u0645\u0635\u062F\u0631",target:"\u0627\u0644\u0637\u0631\u0641 \u0627\u0644\u0645\u0639\u0646\u064A",note:"\u0646\u0635 \u0627\u0644\u0628\u0644\u0627\u063A",adminReply:"\u0631\u062F \u0627\u0644\u0625\u062F\u0627\u0631\u0629",created:"\u062A\u0627\u0631\u064A\u062E \u0627\u0644\u0625\u0646\u0634\u0627\u0621",updated:"\u0622\u062E\u0631 \u062A\u062D\u062F\u064A\u062B",status:"\u0627\u0644\u062D\u0627\u0644\u0629",details:"\u0627\u0644\u062A\u0641\u0627\u0635\u064A\u0644",save:"\u062D\u0641\u0638 \u0627\u0644\u062A\u062D\u062F\u064A\u062B",saved:"\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0628\u0644\u0627\u063A",saveFailed:"\u0641\u0634\u0644 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0628\u0644\u0627\u063A",noComplaints:"\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u0644\u0627\u063A\u0627\u062A",search:"\u0628\u062D\u062B \u0628\u0631\u0642\u0645 \u0627\u0644\u0637\u0644\u0628 \u0623\u0648 \u0627\u0644\u0646\u0635 \u0623\u0648 \u0627\u0644\u0627\u0633\u0645",loading:"\u062C\u0627\u0631\u064A \u0627\u0644\u062A\u062D\u0645\u064A\u0644...",unknown:"\u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631",noUser:"\u062D\u0633\u0627\u0628 \u0645\u062D\u0630\u0648\u0641 \u0623\u0648 \u063A\u064A\u0631 \u0645\u062A\u0648\u0641\u0631"},en:{nav:"Complaints",title:"Complaint Management",all:"All",pending:"Pending",resolved:"Resolved",closed:"Closed",customerComplaint:"Customer complaint",providerComplaint:"Provider complaint",deliveryNotConfirmed:"Delivery not confirmed",customerRejectedReceipt:"Receipt rejected",customer:"Customer",provider:"Provider",driver:"Driver",order:"Order",orderNumber:"Order number",complaintType:"Type",source:"Source",target:"Target",note:"Complaint",adminReply:"Admin reply",created:"Created",updated:"Updated",status:"Status",details:"Details",save:"Save update",saved:"Complaint updated",saveFailed:"Failed to update complaint",noComplaints:"No complaints found",search:"Search by order, text, or name",loading:"Loading...",unknown:"Unavailable",noUser:"Deleted or unavailable account"}};
  function ct(k){return(complaintLabels[lang]&&complaintLabels[lang][k])||complaintLabels.en[k]||k;}
+ var complaintUiText={
+   ar:{shortRef:"مرجع مختصر",fullOrderId:"معرّف الطلب الكامل",copyOrderId:"نسخ المعرّف",copiedOrderId:"نُسخ معرّف الطلب",copyFailed:"تعذّر النسخ؛ يمكنك تحديد المعرّف يدويًا",reportReason:"سبب البلاغ",reportedResponse:"رد الطرف المعني",privateFinding:"نتيجة المراجعة الخاصة بالإدارة",reviewRationale:"مبرر المراجعة",savePrivateReview:"حفظ المراجعة الخاصة",cashIssueReason:"نوع النزاع المالي",chatMessage:"الرسالة المُبلّغ عنها",noChatMessage:"لا توجد رسالة مرتبطة بهذا البلاغ",safetyReport:"بلاغ سلامة مشارك",chatReport:"بلاغ محادثة الطلب",cashIssue:"نزاع تمويل نقدي",safetySubstantiated:"بلاغ مثبت",safetyUnsubstantiated:"بلاغ غير مثبت",customer_received_unpaid:"العميل استلم الطلب دون دفع",customer_no_show:"العميل لم يحضر",assigned_driver_problem:"مشكلة مع السائق المعيّن",abuse_or_threats:"إساءة أو تهديد",suspected_fraud:"اشتباه في احتيال",other:"سبب آخر",provider_refusal:"رفض مقدم الخدمة",dispute:"نزاع مالي"},
+   en:{shortRef:"Short ref",fullOrderId:"Full order ID",copyOrderId:"Copy ID",copiedOrderId:"Order ID copied",copyFailed:"Could not copy; select the ID manually",reportReason:"Report reason",reportedResponse:"Reported participant response",privateFinding:"Private review finding",reviewRationale:"Review rationale",savePrivateReview:"Save private review",cashIssueReason:"Cash issue type",chatMessage:"Reported chat message",noChatMessage:"No message is attached to this report",safetyReport:"Participant safety report",chatReport:"Order chat report",cashIssue:"Cash funding issue",safetySubstantiated:"Substantiated",safetyUnsubstantiated:"Unsubstantiated",customer_received_unpaid:"Customer received order without paying",customer_no_show:"Customer did not show up",assigned_driver_problem:"Problem with assigned driver",abuse_or_threats:"Abuse or threats",suspected_fraud:"Suspected fraud",other:"Other reason",provider_refusal:"Provider refusal",dispute:"Financial dispute"}
+ };
+ function complaintUi(k){return(complaintUiText[lang]&&complaintUiText[lang][k])||complaintUiText.en[k]||ct("unknown");}
+ function complaintReasonLabel(code){return complaintUi(code);}
+ function complaintFindingLabel(code){return code==="pending"?ct("pending"):code==="substantiated"?complaintUi("safetySubstantiated"):code==="unsubstantiated"?complaintUi("safetyUnsubstantiated"):ct("unknown");}
 
 async function api(path,opts){
   opts=opts||{};
@@ -7424,8 +7491,8 @@ async function doLogin(event){
     if(adminLoginKind==="owner"&&!emailEl.value.trim())emailEl.focus();else if(pwEl)pwEl.focus();
     return false;
   }
-  if(btn){btn.disabled=true;btn.textContent="\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...";}
-  setLoginStatus("\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...","loading");
+  if(btn){btn.disabled=true;btn.textContent=ui("signingIn");}
+  setLoginStatus(ui("signingIn"),"loading");
   try{
     var owner=adminLoginKind==="owner";
     var res=await fetch(owner?"/admin/api/owner-login":"/admin/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(owner?{email:emailEl.value.trim(),password:pw}:{password:pw})});
@@ -7436,7 +7503,7 @@ async function doLogin(event){
       return false;
     }
     if(!res.ok||!data||!data.token){
-      setLoginStatus("\u062A\u0639\u0630\u0631 \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644\u060C \u062D\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062E\u0631\u0649","error");
+      setLoginStatus(ui("loginRetry"),"error");
       return false;
     }
     TOKEN=data.token;
@@ -7447,7 +7514,7 @@ async function doLogin(event){
     showMain();
     return true;
   }catch(e){
-    setLoginStatus("\u062A\u0639\u0630\u0631 \u0627\u0644\u0627\u062A\u0635\u0627\u0644 \u0628\u0627\u0644\u062E\u0627\u062F\u0645","error");
+    setLoginStatus(ui("serverUnavailable"),"error");
     return false;
   }finally{
     if(btn){btn.disabled=false;btn.textContent=t("signIn");}
@@ -7488,17 +7555,17 @@ document.addEventListener("keydown",function(event){if(event.key==="Escape"&&doc
 function roleBadge(role){
   var m={customer:"blue",provider:"orange",driver:"purple"};
   var l={customer:t("customer"),provider:t("provider"),driver:t("driver")};
-  return '<span class="badge badge-'+(m[role]||"gray")+'">'+esc(l[role]||role)+'</span>';
+  return '<span class="badge badge-'+(m[role]||"gray")+'">'+esc(l[role]||t("na"))+'</span>';
 }
 function statusBadge(status){
   var m={active:"green",trial:"yellow",suspended:"yellow",disabled:"red"};
   var l={active:t("active"),trial:t("trial"),suspended:t("suspend"),disabled:t("disabled")};
-  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||status||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||t("na"))+'</span>';
 }
 function subBadge(status){
   var m={active:"green",trialing:"blue",expired:"red",canceled:"gray",past_due:"yellow"};
   var l={active:t("active"),trialing:t("trialing"),expired:t("expired"),canceled:t("canceledSub"),past_due:t("pastDue")};
-  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||status||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[status]||"gray")+'">'+esc(l[status]||t("na"))+'</span>';
 }
 
 function getSubDaysRemaining(u){
@@ -7521,12 +7588,12 @@ function subStatusLabel(u){
 function verifBadge(s){
   var m={verified:"green",pending_review:"yellow",unverified:"red",none:"gray"};
   var l={verified:t("verifiedStatus"),pending_review:t("pendingReview"),unverified:t("unverifiedStatus"),none:t("notVerified")};
-  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||s||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||t("na"))+'</span>';
 }
 function flReviewBadge(s){
   var m={approved:"green",pending:"yellow",pending_review:"yellow",rejected:"red"};
   var l={approved:t("verifiedStatus"),pending:t("pendingReview"),pending_review:t("pendingReview"),rejected:t("unverifiedStatus")};
-  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||s||t("na"))+'</span>';
+  return '<span class="badge badge-'+(m[s]||"gray")+'">'+esc(l[s]||t("na"))+'</span>';
 }
 function complaintStatusBadge(status){
   var m={pending:"yellow",resolved:"green",closed:"gray"};
@@ -7534,9 +7601,9 @@ function complaintStatusBadge(status){
 }
 function complaintStatusLabel(status){return ct(status==="pending"?"pending":status==="resolved"?"resolved":status==="closed"?"closed":"unknown");}
 function complaintTypeLabel(type){
-  if(type==="order_chat_report")return lang==="ar"?"بلاغ محادثة الطلب":"Order chat report";
-  if(type==="participant_safety")return lang==="ar"?"بلاغ سلامة مشارك":"Participant safety report";
-  if(type==="cash_funding_issue")return lang==="ar"?"نزاع تمويل نقدي":"Cash funding issue";
+  if(type==="order_chat_report")return complaintUi("chatReport");
+  if(type==="participant_safety")return complaintUi("safetyReport");
+  if(type==="cash_funding_issue")return complaintUi("cashIssue");
   var m={customer_complaint:"customerComplaint",provider_complaint:"providerComplaint",delivery_not_confirmed:"deliveryNotConfirmed",customer_rejected_receipt:"customerRejectedReceipt"};
   return ct(m[type]||"unknown");
 }
@@ -7547,21 +7614,38 @@ function complaintDate(value){
 }
 function complaintPerson(item,role){
   var p=item&&item[role]||{};
-  return '<strong>'+esc(p.displayName||p.email||p.uid||ct("noUser"))+'</strong>'+(p.email&&p.displayName?'<div style="font-size:12px;color:var(--text2)">'+esc(p.email)+'</div>':"");
+  return '<strong>'+(p.displayName?esc(p.displayName):p.email||p.uid?'<bdi dir="ltr">'+esc(p.email||p.uid)+'</bdi>':ct("noUser"))+'</strong>'+(p.email&&p.displayName?'<div style="font-size:12px;color:var(--text2)"><bdi dir="ltr">'+esc(p.email)+'</bdi></div>':"");
 }
 var complaintFilter={status:"all",search:""};
 var allComplaints=[];
+var complaintOrderRefs=new Map();
+function compactComplaintOrderId(id,size){return id.length<=size*2+1?id:id.slice(0,size)+"…"+id.slice(-size);}
+function buildComplaintOrderRefs(items){
+  var ids=[...new Set(items.map(function(item){return item.orderId||"";}).filter(Boolean))];
+  var sizes=new Map(ids.map(function(id){return [id,6];})),refs=new Map();
+  for(var attempt=0;attempt<128;attempt++){
+    var groups=new Map();
+    ids.forEach(function(id){var ref=compactComplaintOrderId(id,sizes.get(id));refs.set(id,ref);if(!groups.has(ref))groups.set(ref,[]);groups.get(ref).push(id);});
+    var collisions=[...groups.values()].filter(function(group){return group.length>1;});
+    if(!collisions.length)break;
+    collisions.forEach(function(group){group.forEach(function(id){sizes.set(id,sizes.get(id)+1);});});
+  }
+  return refs;
+}
+function complaintOrderDisplay(x){return x.displayOrderNumber||(x.orderNumber!==x.orderId?x.orderNumber:"")||complaintOrderRefs.get(x.orderId)||x.orderId||"-";}
+function complaintHasOrderNumber(x){return !!(x.displayOrderNumber||(x.orderNumber!==x.orderId&&x.orderNumber));}
 async function renderComplaints(c){
   var data=await api("/complaints");
   if(!data)return;
   allComplaints=data.complaints||[];
+  complaintOrderRefs=buildComplaintOrderRefs(allComplaints);
   var counts={all:allComplaints.length,pending:0,resolved:0,closed:0};
   allComplaints.forEach(function(x){if(counts[x.complaintStatus]!==undefined)counts[x.complaintStatus]++;});
   var cards=["all","pending","resolved","closed"].map(function(s){
     return '<button class="stat-card '+(complaintFilter.status===s?"selected":"")+'" data-status="'+s+'" onclick="setComplaintStatusFilter(this.dataset.status)" style="text-align:inherit;cursor:pointer"><div class="stat-label">'+ct(s)+'</div><div class="stat-value">'+counts[s]+'</div></button>';
   }).join("");
   var safety=data.safetySummary||{};
-  var safetyLabels=lang==="ar"?["مثبتة","غير مثبتة","طلبات مختلفة","آخر 7 أيام","آخر 30 يومًا","حسابات للمراجعة اليدوية","بلاغات خطيرة قيد المراجعة"]:["Substantiated","Unsubstantiated","Distinct orders","Last 7 days","Last 30 days","Accounts for manual review","Serious reports for manual review"];
+  var safetyLabels=lang==="ar"?[complaintUi("safetySubstantiated"),complaintUi("safetyUnsubstantiated"),"طلبات مختلفة","آخر 7 أيام","آخر 30 يومًا","حسابات للمراجعة اليدوية","بلاغات خطيرة قيد المراجعة"]:[complaintUi("safetySubstantiated"),complaintUi("safetyUnsubstantiated"),"Distinct orders","Last 7 days","Last 30 days","Accounts for manual review","Serious reports for manual review"];
   var safetyValues=[safety.substantiated,safety.unsubstantiated,safety.distinctOrders,safety.last7Days,safety.last30Days,safety.repeatedSubstantiatedAccountsForManualReview,safety.seriousPendingForManualReview];
   var safetyCards=safetyLabels.map(function(label,i){return '<div class="stat-card"><div class="stat-label">'+esc(label)+'</div><div class="stat-value">'+esc(String(Number(safetyValues[i])||0))+'</div></div>';}).join("");
   c.innerHTML='<h1 class="page-title">'+ct("title")+'</h1>'+
@@ -7591,12 +7675,12 @@ function paintComplaintRows(){
   var items=allComplaints.filter(function(x){
     if(complaintFilter.status!=="all"&&x.complaintStatus!==complaintFilter.status)return false;
     if(!q)return true;
-    var text=[x.orderNumber,x.note,x.type,x.source,x.target,x.customer&&x.customer.displayName,x.provider&&x.provider.displayName,x.driver&&x.driver.displayName].join(" ").toLowerCase();
+    var text=[x.orderNumber,x.displayOrderNumber,x.orderId,complaintOrderRefs.get(x.orderId),x.note,x.type,x.reasonCode,x.source,x.target,x.customer&&x.customer.displayName,x.provider&&x.provider.displayName,x.driver&&x.driver.displayName].join(" ").toLowerCase();
     return text.indexOf(q)>=0;
   });
   body.innerHTML=items.map(function(x){
     var id=esc(x.id||"");
-    return '<tr><td><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong><div style="font-size:11px;color:var(--text2)">'+esc(x.orderId||"")+'</div></td>'+
+    return '<tr><td class="complaint-order-cell">'+(complaintHasOrderNumber(x)?'<strong class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</strong>':'<span class="complaint-short-label">'+complaintUi("shortRef")+':</span> <strong class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</strong>')+'</td>'+
       '<td>'+esc(complaintTypeLabel(x.type))+'</td>'+
       '<td>'+esc(complaintRoleLabel(x.source))+'</td>'+
       '<td>'+esc(complaintRoleLabel(x.target))+'</td>'+
@@ -7614,14 +7698,14 @@ function complaintRoleLabel(role){
 async function viewComplaint(id){
   openModal('<div class="loading">'+ct("loading")+'</div>');
   var data=await api("/complaints/"+encodeURIComponent(id));
-  if(!data||!data.complaint){closeModal();toast((data&&data.error)||ct("saveFailed"),"error");return;}
+  if(!data||!data.complaint){closeModal();toast(adminError(data,ct("saveFailed")),"error");return;}
   var x=data.complaint;
-  var chatContext=x.type==="order_chat_report"?'<div class="form-group"><label>'+(lang==="ar"?"الرسالة المُبلّغ عنها":"Reported chat message")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+((x.reportedChatContext||[]).map(function(m){return '<div><strong>'+esc(complaintRoleLabel(m.senderRole))+'</strong><div>'+esc(m.text||"")+'</div><small>'+complaintDate(m.createdAt)+'</small></div>';}).join("")||(lang==="ar"?"لا توجد رسالة مرتبطة بهذا البلاغ":"No message is attached to this report"))+'</div></div>':"";
-  var safetyReview=x.type==="participant_safety"?'<div class="form-group"><label>'+(lang==="ar"?"سبب البلاغ":"Report reason")+'</label><strong>'+esc(x.reasonCode||"")+'</strong></div><div class="form-group"><label>'+(lang==="ar"?"رد الطرف المعني":"Reported participant response")+'</label><div style="white-space:pre-wrap">'+esc(x.targetResponse||"-")+'</div></div><div class="form-group"><label for="safety-finding">'+(lang==="ar"?"نتيجة المراجعة الخاصة بالإدارة":"Private review finding")+'</label><select id="safety-finding" style="width:100%">'+["pending","substantiated","unsubstantiated"].map(function(s){return '<option value="'+s+'" '+(x.reviewFinding===s?"selected":"")+'>'+esc(s)+'</option>';}).join("")+'</select></div><div class="form-group"><label for="safety-review-note">'+(lang==="ar"?"مبرر المراجعة":"Review rationale")+'</label><textarea id="safety-review-note" rows="3" maxlength="2000" style="width:100%">'+esc(x.reviewNote||"")+'</textarea></div><button class="btn btn-secondary" data-id="'+esc(x.id)+'" onclick="saveSafetyReview(this.dataset.id)">'+(lang==="ar"?"حفظ المراجعة الخاصة":"Save private review")+'</button>':"";
-  var cashIssue=x.type==="cash_funding_issue"?'<div class="form-group"><label>'+(lang==="ar"?"نوع النزاع المالي":"Cash issue type")+'</label><strong>'+esc(x.reasonCode||"-")+'</strong></div>':"";
-  openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span style="font-size:13px;color:var(--text2)">#'+esc(x.orderNumber||x.orderId||x.id)+'</span></h3>'+
+  var chatContext=x.type==="order_chat_report"?'<div class="form-group"><label>'+complaintUi("chatMessage")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+((x.reportedChatContext||[]).map(function(m){return '<div><strong>'+esc(complaintRoleLabel(m.senderRole))+'</strong><div>'+esc(m.text||"")+'</div><small>'+complaintDate(m.createdAt)+'</small></div>';}).join("")||complaintUi("noChatMessage"))+'</div></div>':"";
+  var safetyReview=x.type==="participant_safety"?'<div class="form-group"><label>'+complaintUi("reportReason")+'</label><strong>'+esc(complaintReasonLabel(x.reasonCode))+'</strong></div><div class="form-group"><label>'+complaintUi("reportedResponse")+'</label><div style="white-space:pre-wrap">'+esc(x.targetResponse||"-")+'</div></div><div class="form-group"><label for="safety-finding">'+complaintUi("privateFinding")+'</label><select id="safety-finding" style="width:100%">'+["pending","substantiated","unsubstantiated"].map(function(s){return '<option value="'+s+'" '+(x.reviewFinding===s?"selected":"")+'>'+esc(complaintFindingLabel(s))+'</option>';}).join("")+'</select></div><div class="form-group"><label for="safety-review-note">'+complaintUi("reviewRationale")+'</label><textarea id="safety-review-note" rows="3" maxlength="2000" style="width:100%">'+esc(x.reviewNote||"")+'</textarea></div><button class="btn btn-secondary" data-id="'+esc(x.id)+'" onclick="saveSafetyReview(this.dataset.id)">'+complaintUi("savePrivateReview")+'</button>':"";
+  var cashIssue=x.type==="cash_funding_issue"?'<div class="form-group"><label>'+complaintUi("cashIssueReason")+'</label><strong>'+esc(complaintReasonLabel(x.reasonCode))+'</strong></div>':"";
+  openModal('<h3 style="margin-bottom:16px">'+ct("title")+' <span class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</span></h3>'+
     '<div class="detail-grid">'+
-    '<div><label>'+ct("orderNumber")+'</label><strong>'+esc(x.orderNumber||x.orderId||"-")+'</strong></div>'+
+    '<div><label>'+(complaintHasOrderNumber(x)?ct("orderNumber"):complaintUi("shortRef"))+'</label><strong class="complaint-order-ref" dir="ltr">'+esc(complaintOrderDisplay(x))+'</strong></div>'+
     '<div><label>'+ct("complaintType")+'</label><strong>'+esc(complaintTypeLabel(x.type))+'</strong></div>'+
     '<div><label>'+ct("source")+'</label><strong>'+esc(complaintRoleLabel(x.source))+'</strong></div>'+
     '<div><label>'+ct("target")+'</label><strong>'+esc(complaintRoleLabel(x.target))+'</strong></div>'+
@@ -7630,23 +7714,25 @@ async function viewComplaint(id){
     '<div><label>'+ct("driver")+'</label>'+complaintPerson(x,"driver")+'</div>'+
     '<div><label>'+ct("created")+'</label><strong>'+complaintDate(x.createdAt)+'</strong></div>'+
     '</div>'+
+    (x.orderId?'<div class="form-group"><label>'+complaintUi("fullOrderId")+'</label><div class="complaint-order-full"><code dir="ltr">'+esc(x.orderId)+'</code><button class="btn btn-secondary btn-sm" data-order-id="'+esc(x.orderId)+'" onclick="copyComplaintOrderId(this.dataset.orderId)">'+complaintUi("copyOrderId")+'</button></div></div>':"")+
     '<div class="form-group"><label>'+ct("note")+'</label><div style="padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap">'+esc(x.note||"-")+'</div></div>'+chatContext+cashIssue+safetyReview+
     '<div class="form-group"><label for="complaint-status">'+ct("status")+'</label><select id="complaint-status" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px">'+["pending","resolved","closed"].map(function(s){return'<option value="'+s+'" '+(x.complaintStatus===s?"selected":"")+'>'+ct(s)+'</option>';}).join("")+'</select></div>'+
     '<div class="form-group"><label for="complaint-admin-note">'+ct("adminReply")+'</label><textarea id="complaint-admin-note" rows="4" maxlength="4000" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;resize:vertical">'+esc(x.adminNote||"")+'</textarea></div>'+
     '<div style="font-size:12px;color:var(--text2);margin-bottom:12px">'+ct("updated")+': '+complaintDate(x.updatedAt)+'</div>'+
     '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-orange" data-id="'+esc(x.id)+'" onclick="saveComplaint(this.dataset.id)">'+ct("save")+'</button></div>');
 }
+async function copyComplaintOrderId(id){try{await navigator.clipboard.writeText(id);toast(complaintUi("copiedOrderId"));}catch(e){toast(complaintUi("copyFailed"),"error");}}
 async function saveSafetyReview(id){
   var finding=document.getElementById("safety-finding");
   var note=document.getElementById("safety-review-note");
   var data=await api("/complaints/"+encodeURIComponent(id)+"/review",{method:"POST",body:JSON.stringify({finding:finding?finding.value:"pending",reviewNote:note?note.value:""})});
-  if(data&&data.success){toast(ct("saved"));viewComplaint(id);}else toast((data&&data.error)||ct("saveFailed"),"error");
+  if(data&&data.success){toast(ct("saved"));viewComplaint(id);}else toast(adminError(data,ct("saveFailed")),"error");
 }
 async function saveComplaint(id){
   var statusEl=document.getElementById("complaint-status");
   var noteEl=document.getElementById("complaint-admin-note");
   var data=await api("/complaints/"+encodeURIComponent(id)+"/update",{method:"POST",body:JSON.stringify({complaintStatus:statusEl?statusEl.value:"pending",adminNote:noteEl?noteEl.value:""})});
-  if(data&&data.success){closeModal();toast(ct("saved"));renderPage();}else{toast((data&&data.error)||ct("saveFailed"),"error");}
+  if(data&&data.success){closeModal();toast(ct("saved"));renderPage();}else{toast(adminError(data,ct("saveFailed")),"error");}
 }
 async function renderVerification(c){
   var data=await api("/verification");
@@ -7683,7 +7769,7 @@ async function renderVerification(c){
 }
 async function approveFreelance(uid){
   var data=await api("/verification/freelance/"+uid+"/approve",{method:"POST",body:JSON.stringify({})});
-  if(data&&data.success){toast(t("verificationApproved"));renderPage();}else{toast((data&&data.error)||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("verificationApproved"));renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 function rejectFreelance(uid){
   openModal('<h3>'+t("reject")+'</h3><div class="form-group"><label>'+t("rejectReason")+'</label><textarea id="rej-note" rows="3" style="width:100%"></textarea></div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button> <button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="confirmRejectFreelance(this.dataset.userId)">'+t("reject")+'</button></div>');
@@ -7692,7 +7778,7 @@ async function confirmRejectFreelance(uid){
   var el=document.getElementById("rej-note");
   var note=el?el.value:"";
   var data=await api("/verification/freelance/"+uid+"/reject",{method:"POST",body:JSON.stringify({note:note})});
-  if(data&&data.success){toast(t("verificationRejected"));closeModal();renderPage();}else{toast((data&&data.error)||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("verificationRejected"));closeModal();renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 async function renderPage(){
   if(isMobile()){forceSidebarClosed();}else{closeSidebar();}
@@ -7710,7 +7796,7 @@ async function renderPage(){
     else if(currentPage==="notifications")await renderNotifications(c);
     c.focus({preventScroll:true});
     startAdminLivePolling();
-  }catch(e){c.innerHTML='<div class="inline-error"><strong>'+(lang==="ar"?"تعذر تحميل الصفحة":"Page failed to load")+'</strong><div>'+esc(e.message)+'</div><button class="btn btn-sm btn-secondary" style="margin-top:10px" onclick="renderPage()">'+(lang==="ar"?"إعادة المحاولة":"Retry")+'</button></div>';}
+  }catch(e){c.innerHTML='<div class="inline-error"><strong>'+(lang==="ar"?"تعذر تحميل الصفحة":"Page failed to load")+'</strong><div>'+esc(lang==="ar"?t("connectionError"):e.message)+'</div><button class="btn btn-sm btn-secondary" style="margin-top:10px" onclick="renderPage()">'+(lang==="ar"?"إعادة المحاولة":"Retry")+'</button></div>';}
 }
 
 async function renderDashboard(c){
@@ -7734,7 +7820,7 @@ async function renderDashboard(c){
     '<div id="live-stat-verifiedAccounts" class="stat-card blue"><div class="label">'+(lang==="ar"?"الحسابات الموثقة":"Verified accounts")+'</div><div class="value">'+(s.verifiedAccounts||0)+'</div></div>'+
     '</div>'+
     '<section class="surface-panel"><div class="surface-head"><div><h2>'+(lang==="ar"?"حالة إصدارات التطبيق":"App release health")+'</h2><p>'+(lang==="ar"?"ملخص المستخدمين حسب إصدار التطبيق المسجل لكل مستخدم.":"Users classified by their recorded app version.")+'</p></div><button class="btn btn-sm btn-secondary" onclick="navigate(\\'releases\\')">'+(lang==="ar"?"عرض التفاصيل":"View details")+'</button></div>'+
-    '<div class="release-grid"><div><div class="metric-label">على 1.0.6 أو أحدث</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">يحتاجون تحديث</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">غير معروف</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
+    '<div class="release-grid"><div><div class="metric-label">'+ui("releaseCurrent")+'</div><div id="live-release-CURRENT" class="metric-value">'+(rc.CURRENT||0)+'</div></div><div><div class="metric-label">'+ui("releaseRequiredPlural")+'</div><div id="live-release-UPDATE_REQUIRED" class="metric-value">'+(rc.UPDATE_REQUIRED||0)+'</div></div><div><div class="metric-label">'+ui("releaseUnknownShort")+'</div><div id="live-release-UNKNOWN" class="metric-value">'+(rc.UNKNOWN||0)+'</div></div></div></section>'+
     '<div id="drill-down"></div>';
 }
 
@@ -7794,42 +7880,42 @@ async function renderUsers(c){
   allUsers=data.users||[];
   setReleaseIntelligence(data);
   var versions=knownReleaseVersions();
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">إدارة المستخدمين</div><h1 class="page-title">'+t("users")+' <span id="users-count" class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">إدارة الحسابات ومعرفة إصدار التطبيق المسجل لكل مستخدم.</p></div></div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">'+ui("usersKicker")+'</div><h1 class="page-title">'+t("users")+' <span id="users-count" class="badge badge-gray">'+allUsers.length+'</span></h1><p class="page-subtitle">'+ui("usersIntro")+'</p></div></div>'+
     '<div class="filters">'+
     '<select id="f-role" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
     '<select id="f-status" onchange="filterUsers()"><option value="">'+t("allStatus")+'</option><option value="active">'+t("active")+'</option><option value="trial">'+t("trial")+'</option><option value="suspended">'+t("suspend")+'</option><option value="disabled">'+t("disabled")+'</option></select>'+
-    '<select id="f-release" onchange="filterUsers()"><option value="">حالة الإصدار: الكل</option><option value="CURRENT">محدّث</option><option value="UPDATE_REQUIRED">يحتاج تحديث</option><option value="UNKNOWN">غير معروف</option></select>'+
-    '<select id="f-version" onchange="filterUsers()"><option value="">الإصدار: الكل</option>'+versions.map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("")+'</select>'+
+    '<select id="f-release" onchange="filterUsers()"><option value="">'+ui("releaseStatusAll")+'</option><option value="CURRENT">'+ui("releaseUpdated")+'</option><option value="UPDATE_REQUIRED">'+ui("releaseRequired")+'</option><option value="UNKNOWN">'+ui("releaseUnknownShort")+'</option></select>'+
+    '<select id="f-version" onchange="filterUsers()"><option value="">'+ui("releaseVersionAll")+'</option>'+versions.map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("")+'</select>'+
     '<input type="text" id="f-search" placeholder="'+t("searchPlaceholder")+'" oninput="filterUsers()">'+
     '</div>'+
-    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>إصدار التطبيق</th><th>حالة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div>';
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>'+ui("releaseAppVersion")+'</th><th>'+ui("releaseStatus")+'</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div>';
   filterUsers();
   startReleasePolling();
 }
 
 function setReleaseIntelligence(data){releaseIntelligence={counts:data.counts||{},displayCounts:data.displayCounts||{},distribution:data.distribution||{},totalUsers:data.totalUsers||0,currentVersion:data.currentVersion||"1.0.6",testVersion:data.testVersion||"1.0.7",adoptionPercent:data.adoptionPercent||0};}
-function releaseStatusText(value){var labels={CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاج تحديث",TEST_RELEASE:"1.0.7 · جديد / تجريبي",PUBLIC_RELEASE:"1.0.6 · الإصدار العام",OLDER:"إصدار أقدم",OTHER_REPORTED:"إصدار آخر مُبلّغ عنه",UNKNOWN:"لم يُبلّغ عن إصدار"};return labels[value]||labels.UNKNOWN;}
+function releaseStatusText(value){var keys={CURRENT:"releaseCurrent",UPDATE_REQUIRED:"releaseRequired",TEST_RELEASE:"releaseTest",PUBLIC_RELEASE:"releasePublic",OLDER:"releaseOlder",OTHER_REPORTED:"releaseOther",UNKNOWN:"releaseUnknown"};return ui(keys[value]||"releaseUnknown");}
 function releaseStatusBadge(value){var cls=value==="CURRENT"||value==="PUBLIC_RELEASE"?"status-current":value==="TEST_RELEASE"?"status-supported":value==="UPDATE_REQUIRED"||value==="OLDER"?"status-required":"status-unknown";return '<span class="status-badge '+cls+'">'+releaseStatusText(value)+'</span>';}
-function releaseMetric(key,value,note){var labels={TOTAL:"إجمالي المستخدمين",CURRENT:"على 1.0.6 أو أحدث",UPDATE_REQUIRED:"يحتاجون تحديث",TEST_RELEASE:"1.0.7 · جديد / TestFlight / Internal Testing",PUBLIC_RELEASE:"1.0.6 · الإصدار العام الحالي",OLDER:"أقل من 1.0.6",OTHER_REPORTED:"إصدارات أخرى مُبلّغ عنها",UNKNOWN:"لم يُبلّغ عن إصدار",ADOPTION:"نسبة التحديث"};var cls=key==="CURRENT"||key==="PUBLIC_RELEASE"?"current":key==="TEST_RELEASE"?"supported":key==="UPDATE_REQUIRED"||key==="OLDER"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+labels[key]+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
+function releaseMetric(key,value,note){var labels={TOTAL:"releaseTotal",CURRENT:"releaseCurrent",UPDATE_REQUIRED:"releaseRequiredPlural",TEST_RELEASE:"releaseTestMetric",PUBLIC_RELEASE:"releasePublicMetric",OLDER:"releaseOlderMetric",OTHER_REPORTED:"releaseOtherMetric",UNKNOWN:"releaseUnknown",ADOPTION:"releaseAdoption"};var cls=key==="CURRENT"||key==="PUBLIC_RELEASE"?"current":key==="TEST_RELEASE"?"supported":key==="UPDATE_REQUIRED"||key==="OLDER"?"required":key==="UNKNOWN"?"unknown":"";return '<div class="release-metric '+cls+'"><div class="metric-label">'+ui(labels[key])+'</div><div class="metric-value">'+value+'</div>'+(note?'<div class="metric-note">'+note+'</div>':"")+'</div>';}
 function knownReleaseVersions(){var values={"1.0.7":true,"1.0.6":true};allUsers.forEach(function(u){var version=u.releaseIntelligence&&u.releaseIntelligence.appVersion;if(version)values[version]=true;});return Object.keys(values).sort(function(a,b){return b.localeCompare(a,undefined,{numeric:true});});}
-function refreshReleaseVersionFilter(){var select=document.getElementById("f-version");if(!select)return;var selected=select.value;select.innerHTML='<option value="">الإصدار: الكل</option>'+knownReleaseVersions().map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");select.value=selected;}
-function releaseCategoryMetric(key){var count=(releaseIntelligence.displayCounts||{})[key]||0,total=releaseIntelligence.totalUsers||0,pct=total?Math.round(count*1000/total)/10:0;return releaseMetric(key,count,pct+"% من إجمالي الحسابات");}
+function refreshReleaseVersionFilter(){var select=document.getElementById("f-version");if(!select)return;var selected=select.value;select.innerHTML='<option value="">'+ui("releaseVersionAll")+'</option>'+knownReleaseVersions().map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");select.value=selected;}
+function releaseCategoryMetric(key){var count=(releaseIntelligence.displayCounts||{})[key]||0,total=releaseIntelligence.totalUsers||0,pct=total?Math.round(count*1000/total)/10:0;return releaseMetric(key,count,pct+ui("releaseShare"));}
 
 async function renderReleaseIntelligence(c){
   var data=await api("/users");if(!data)return;allUsers=data.users||[];setReleaseIntelligence(data);
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">متابعة الإصدارات</div><h1 class="page-title">إصدارات التطبيق</h1><p class="page-subtitle">آخر إصدار أبلغ عنه كل حساب، وليس إصدار كل جهاز. الإصدار العام الحالي: <span id="release-current-version">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span> · 1.0.7 إصدار تجريبي ولا يغيّر أهلية تذكير مستخدمي 1.0.6.</p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">'+ui("releaseTracking")+'</div><h1 class="page-title">'+ui("releaseTitle")+'</h1><p class="page-subtitle">'+ui("releaseIntro")+' <span id="release-current-version" dir="ltr">'+esc(releaseIntelligence.currentVersion||"1.0.6")+'</span> · '+ui("releaseTestDisclaimer")+'</p></div><div class="page-actions"><span id="release-live-indicator" class="release-live-indicator" role="status" aria-live="polite"></span><span id="release-reminder-action"></span></div></div>'+
     '<div class="release-grid"><div id="release-metric-total">'+releaseMetric("TOTAL",releaseIntelligence.totalUsers||0)+'</div><div id="release-metric-test">'+releaseCategoryMetric("TEST_RELEASE")+'</div><div id="release-metric-public">'+releaseCategoryMetric("PUBLIC_RELEASE")+'</div><div id="release-metric-older">'+releaseCategoryMetric("OLDER")+'</div><div id="release-metric-unknown">'+releaseCategoryMetric("UNKNOWN")+'</div><div id="release-metric-other">'+releaseCategoryMetric("OTHER_REPORTED")+'</div></div>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>توزيع الإصدارات</h2><p>عدد ونسبة الحسابات حسب آخر إصدار مُبلّغ عنه؛ غير المعروف لا يعني إصدارًا قديمًا.</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>'+
-    '<section class="surface-panel"><div class="surface-head"><div><h2>إصدارات الحسابات</h2><p>تصفية حسب الإصدار الدقيق والدور والحساب؛ البيانات تخص الحساب لا التثبيت الفعلي.</p></div></div><div class="filters">'+
-    '<select id="f-role" aria-label="تصفية الدور" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
-    '<select id="f-release" aria-label="تصفية فئة الإصدار" onchange="filterUsers()"><option value="">فئة الإصدار: الكل</option><option value="TEST_RELEASE">1.0.7 · تجريبي</option><option value="PUBLIC_RELEASE">1.0.6 · عام</option><option value="OLDER">أقدم من 1.0.6</option><option value="UNKNOWN">لم يُبلّغ</option><option value="OTHER_REPORTED">إصدار آخر</option></select>'+
-    '<select id="f-version" aria-label="تصفية الإصدار الدقيق" onchange="filterUsers()"></select><input type="text" id="f-search" aria-label="تصفية الحساب بالاسم أو المعرّف" placeholder="ابحث باسم الحساب أو معرّفه" oninput="filterUsers()"></div>'+
-    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>آخر إصدار أبلغ عنه الحساب</th><th>فئة الإصدار</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>'+
-    '<section class="surface-panel" id="version-gate-panel" aria-label="سياسة التحديث الإجباري"><div class="surface-head"><div><h2>التحديث الإجباري للتطبيق</h2><p>إعداد منفصل عن تذكيرات الإصدارات. السياسة معطّلة افتراضيًا، ولا تُفعّل قبل توفر الإصدار العام المتوافق في المتجرين وموافقة المالك المستقلة.</p></div></div><div id="version-gate-content" role="status">جارٍ تحميل السياسة…</div></section>';
+    '<section class="surface-panel"><div class="surface-head"><div><h2>'+ui("releaseDistribution")+'</h2><p>'+ui("releaseDistributionHint")+'</p></div></div><div id="release-distribution">'+releaseDistributionHtml()+'</div></section>'+
+    '<section class="surface-panel"><div class="surface-head"><div><h2>'+ui("releaseAccounts")+'</h2><p>'+ui("releaseAccountsHint")+'</p></div></div><div class="filters">'+
+    '<select id="f-role" aria-label="'+ui("releaseRoleFilter")+'" onchange="filterUsers()"><option value="">'+t("allRoles")+'</option><option value="customer">'+t("customer")+'</option><option value="provider">'+t("provider")+'</option><option value="driver">'+t("driver")+'</option></select>'+
+    '<select id="f-release" aria-label="'+ui("releaseCategoryFilter")+'" onchange="filterUsers()"><option value="">'+ui("releaseCategoryAll")+'</option><option value="TEST_RELEASE">'+ui("releaseTestShort")+'</option><option value="PUBLIC_RELEASE">'+ui("releasePublicShort")+'</option><option value="OLDER">'+ui("releaseOlderShort")+'</option><option value="UNKNOWN">'+ui("releaseNotReported")+'</option><option value="OTHER_REPORTED">'+ui("releaseOtherShort")+'</option></select>'+
+    '<select id="f-version" aria-label="'+ui("releaseVersionFilter")+'" onchange="filterUsers()"></select><input type="text" id="f-search" aria-label="'+ui("releaseAccountFilter")+'" placeholder="'+ui("releaseAccountSearch")+'" oninput="filterUsers()"></div>'+
+    '<div class="table-wrap"><table class="release-users-table"><thead><tr><th>'+t("user")+'</th><th>'+t("role")+'</th><th>'+t("account")+'</th><th>'+ui("releaseLastVersion")+'</th><th>'+ui("releaseCategory")+'</th><th>'+t("actions")+'</th></tr></thead><tbody id="users-tbody"></tbody></table></div></section>'+
+    '<section class="surface-panel" id="version-gate-panel" aria-label="'+ui("gatePolicy")+'"><div class="surface-head"><div><h2>'+ui("gateTitle")+'</h2><p>'+ui("gateIntro")+'</p></div></div><div id="version-gate-content" role="status">'+ui("gateLoading")+'</div></section>';
   refreshReleaseVersionFilter();
   paintReleaseIntelligence();
   startReleasePolling();
-  loadClientVersionGatePanel();
+  await loadClientVersionGatePanel();
 }
 var clientVersionGateRevision=null;
 function clientVersionGateForm(){
@@ -7843,41 +7929,41 @@ async function loadClientVersionGatePanel(){
   var result;try{result=await api("/client-version-gate");}catch(e){}
   if(!target.isConnected)return;
   if(!result||(!result.success&&result.code!=="CLIENT_VERSION_GATE_INVALID")){
-    target.innerHTML='<p role="alert">تعذّر تحميل السياسة. أعد فتح الصفحة قبل التعديل.</p>';return;
+    target.innerHTML='<p role="alert">'+ui("gateLoadError")+'</p>';return;
   }
   clientVersionGateRevision=result.revision||null;
   var policy=result.clientVersionGate||{enabled:false,ios:{minimumVersion:"",minimumBuild:"",storeUrl:""},android:{minimumVersion:"",minimumBuild:"",storeUrl:""}};
   var editable=result.ownerAuthorizationAvailable===true;
   function field(id,label,value,hint){return '<div class="form-group"><label for="'+id+'">'+label+'</label><input id="'+id+'" type="'+(id==='vg-owner-email'?'email':'text')+'"'+(id==='vg-owner-email'?' autocomplete="username"':'')+' value="'+esc(value||"")+'"'+(editable?'':' readonly')+' aria-describedby="'+id+'-hint"><small id="'+id+'-hint">'+hint+'</small></div>';}
-  target.innerHTML=(result.code==="CLIENT_VERSION_GATE_INVALID"?'<p role="alert">الإعداد المخزن غير صالح؛ ستبقى سياسة المحمول معطّلة حتى يصححها المالك.</p>':'')+
-    '<p role="status">'+(policy.enabled?'الحالة المحفوظة: مفعّل':'الحالة المحفوظة: معطّل')+' · '+(result.activationReady?'بوابة موافقة النشر متاحة':'بوابة موافقة النشر غير مفعّلة؛ لا يمكن تشغيل الحظر')+'</p>'+
-    '<div class="form-group"><label class="toggle"><input type="checkbox" id="vg-enabled"'+(policy.enabled?' checked':'')+(editable?'':' disabled')+'> تفعيل التحديث الإجباري</label></div>'+
+  target.innerHTML=(result.code==="CLIENT_VERSION_GATE_INVALID"?'<p role="alert">'+ui("gateInvalid")+'</p>':'')+
+    '<p role="status">'+(policy.enabled?ui("gateEnabled"):ui("gateDisabled"))+' · '+(result.activationReady?ui("gateReady"):ui("gateNotReady"))+'</p>'+
+    '<div class="form-group"><label class="toggle"><input type="checkbox" id="vg-enabled"'+(policy.enabled?' checked':'')+(editable?'':' disabled')+'> '+ui("gateToggle")+'</label></div>'+
     '<div class="grid-2">'+
-    field('vg-ios-version','الحد الأدنى لإصدار iOS',policy.ios.minimumVersion,'إصدار عام ثابت، مثل 1.0.6')+
-    field('vg-ios-build','الحد الأدنى لرقم بناء iOS',policy.ios.minimumBuild,'رقم البناء الأصلي المنشور')+
-    field('vg-ios-url','رابط App Store الرسمي',policy.ios.storeUrl,'يجب أن يشير إلى تطبيق طباخين فقط')+
-    field('vg-android-version','الحد الأدنى لإصدار Android',policy.android.minimumVersion,'إصدار عام ثابت، مثل 1.0.6')+
-    field('vg-android-build','الحد الأدنى لرقم بناء Android',policy.android.minimumBuild,'رقم البناء الأصلي المنشور')+
-    field('vg-android-url','رابط Google Play الرسمي',policy.android.storeUrl,'يجب أن يشير إلى تطبيق طباخين فقط')+'</div>'+
-    (editable?'<div class="grid-2">'+field('vg-owner-email','بريد Firebase للمالك','','يستخدم للتحقق عند الحفظ فقط')+
-      '<div class="form-group"><label for="vg-owner-password">كلمة مرور Firebase للمالك</label><input id="vg-owner-password" type="password" autocomplete="current-password" aria-describedby="vg-password-hint"><small id="vg-password-hint">لا تُحفظ في إعدادات التطبيق.</small></div></div>'+
-      '<label class="toggle"><input type="checkbox" id="vg-store-confirm"> تحققت من توفر الإصدار المطلوب في App Store وGoogle Play</label><div class="page-actions"><button class="btn btn-primary" id="vg-save" onclick="saveClientVersionGate()">حفظ السياسة</button></div>':
-      '<p role="status">للعرض فقط حتى تُضبط هوية مالك Firebase وإعدادات إعادة المصادقة.</p>');
+    field('vg-ios-version',ui("gateIosVersion"),policy.ios.minimumVersion,ui("gateVersionHint"))+
+    field('vg-ios-build',ui("gateIosBuild"),policy.ios.minimumBuild,ui("gateBuildHint"))+
+    field('vg-ios-url',ui("gateIosUrl"),policy.ios.storeUrl,ui("gateStoreHint"))+
+    field('vg-android-version',ui("gateAndroidVersion"),policy.android.minimumVersion,ui("gateVersionHint"))+
+    field('vg-android-build',ui("gateAndroidBuild"),policy.android.minimumBuild,ui("gateBuildHint"))+
+    field('vg-android-url',ui("gateAndroidUrl"),policy.android.storeUrl,ui("gateStoreHint"))+'</div>'+
+    (editable?'<div class="grid-2">'+field('vg-owner-email',ui("gateOwnerEmail"),'',ui("gateOwnerHint"))+
+      '<div class="form-group"><label for="vg-owner-password">'+ui("gateOwnerPassword")+'</label><input id="vg-owner-password" type="password" autocomplete="current-password" aria-describedby="vg-password-hint"><small id="vg-password-hint">'+ui("gatePasswordHint")+'</small></div></div>'+
+      '<label class="toggle"><input type="checkbox" id="vg-store-confirm"> '+ui("gateStoreConfirm")+'</label><div class="page-actions"><button class="btn btn-primary" id="vg-save" onclick="saveClientVersionGate()">'+ui("gateSave")+'</button></div>':
+      '<p role="status">'+ui("gateReadOnly")+'</p>');
 }
 async function saveClientVersionGate(){
   var policy=clientVersionGateForm(),emailEl=document.getElementById('vg-owner-email'),passwordEl=document.getElementById('vg-owner-password');
   var email=emailEl?emailEl.value.trim():'',password=passwordEl?passwordEl.value:'';
   if(passwordEl)passwordEl.value='';
-  if(!email||!password){toast('يلزم التحقق من هوية مالك Firebase','error');return;}
-  if(policy.enabled&&!(document.getElementById('vg-store-confirm')||{}).checked){toast('أكّد توفر الإصدار في المتجرين قبل التفعيل','error');return;}
-  if(!confirm('هل تريد حفظ سياسة التحديث؟ لا تفعّل الحظر دون موافقة نشر مستقلة.'))return;
-  var button=document.getElementById('vg-save');if(button){button.disabled=true;button.textContent='جارٍ الحفظ…';}
+  if(!email||!password){toast(ui("gateOwnerRequired"),'error');return;}
+  if(policy.enabled&&!(document.getElementById('vg-store-confirm')||{}).checked){toast(ui("gateStoreRequired"),'error');return;}
+  if(!confirm(ui("gateConfirm")))return;
+  var button=document.getElementById('vg-save');if(button){button.disabled=true;button.textContent=ui("gateSaving");}
   try{
     var result=await api('/client-version-gate',{method:'POST',body:JSON.stringify({confirm:true,baseUpdateTime:clientVersionGateRevision,clientVersionGate:policy,ownerCredentials:{email:email,password:password}})});
-    if(result&&result.success){toast('حُفظت سياسة التحديث');await loadClientVersionGatePanel();}
-    else toast(result&&result.error||'تعذّر حفظ السياسة؛ راجع الحقول وحالة موافقة النشر','error');
-  }catch(e){toast('تعذّر الاتصال؛ أعد تحميل السياسة قبل المحاولة','error');}
-  finally{if(button&&button.isConnected){button.disabled=false;button.textContent='حفظ السياسة';}}
+    if(result&&result.success){toast(ui("gateSaved"));await loadClientVersionGatePanel();}
+    else toast(adminError(result,ui("gateSaveError")),'error');
+  }catch(e){toast(ui("gateConnectionError"),'error');}
+  finally{if(button&&button.isConnected){button.disabled=false;button.textContent=ui("gateSave");}}
 }
 function paintReleaseIntelligence(){
   var rc=releaseIntelligence.counts||{};
@@ -7890,7 +7976,7 @@ function paintReleaseIntelligence(){
   set("release-metric-unknown",releaseCategoryMetric("UNKNOWN"));
   set("release-metric-other",releaseCategoryMetric("OTHER_REPORTED"));
   var action=document.getElementById("release-reminder-action");
-  if(action)action.innerHTML=(rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">إرسال تنبيه جماعي</button>':"";
+  if(action)action.innerHTML=(rc.UPDATE_REQUIRED||0)>0?'<button class="btn btn-warning" onclick="confirmBulkReleaseReminder()">'+ui("bulkReminder")+'</button>':"";
   set("release-distribution",releaseDistributionHtml());
   refreshReleaseVersionFilter();
   filterUsers();
@@ -7925,9 +8011,9 @@ function paintAdminLiveSummary(data){
   if(currentPage==="verification")markAdminSectionSeen("verification");
   ["totalUsers","customers","providers","drivers","providersInTrial","driversInTrial","activeSubscriptions","verifiedAccounts"].forEach(function(key){var el=document.getElementById("live-stat-"+key);if(el){var value=el.querySelector(".value");if(value)value.textContent=String(s[key]||0);}});
   ["CURRENT","UPDATE_REQUIRED","UNKNOWN"].forEach(function(key){var el=document.getElementById("live-release-"+key);if(el)el.textContent=String(r[key]||0);});
-  setLiveBadge("nav-complaints",(attention.complaints||[]).length,"بلاغات جديدة");
-  setLiveBadge("nav-verification",(attention.verification||[]).length,"طلبات توثيق جديدة");
-  var indicator=document.getElementById("admin-live-indicator");if(indicator)indicator.textContent="● يتم التحديث تلقائيًا · آخر تحديث: الآن";
+  setLiveBadge("nav-complaints",(attention.complaints||[]).length,ui("newComplaints"));
+  setLiveBadge("nav-verification",(attention.verification||[]).length,ui("newVerifications"));
+  var indicator=document.getElementById("admin-live-indicator");if(indicator)indicator.textContent="● "+ui("autoRefresh")+" · "+ui("lastRefresh")+": "+ui("liveNow");
 }
 function scheduleAdminLivePolling(epoch){
   if(epoch!==adminLiveState.epoch||document.visibilityState!=="visible")return;
@@ -7948,7 +8034,7 @@ function startAdminLivePolling(){
   refreshAdminLive(true,adminLiveState.epoch);scheduleAdminLivePolling(adminLiveState.epoch);
 }
 
-function releaseDistributionHtml(){var distribution=Object.assign({"1.0.7":0,"1.0.6":0},releaseIntelligence.distribution||{}),grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' مستخدم</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(grand?rows:'<div class="empty-state"><strong>لا توجد بيانات إصدارات بعد</strong><span>ستظهر الإصدارات بعد فتح المستخدمين للتطبيق.</span></div>')+'</div>';}
+function releaseDistributionHtml(){var distribution=Object.assign({"1.0.7":0,"1.0.6":0},releaseIntelligence.distribution||{}),grand=releaseIntelligence.totalUsers||0;var rows=Object.keys(distribution).sort(function(a,b){if(a==="غير معروف")return 1;if(b==="غير معروف")return -1;return b.localeCompare(a,undefined,{numeric:true});}).map(function(version){var count=Number(distribution[version]||0),pct=grand?Math.round(count*1000/grand)/10:0;return '<div class="distribution-row"><span class="distribution-version">'+esc(version==="غير معروف"?ui("releaseUnknownShort"):version)+'</span><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><div class="progress-fill" style="width:'+pct+'%"></div></div><span class="distribution-count">'+count+' '+ui("releaseUsers")+'</span><span class="distribution-platforms">'+pct+'%</span></div>';}).join("");return '<div class="distribution-list">'+(grand?rows:'<div class="empty-state"><strong>'+ui("releaseNoData")+'</strong><span>'+ui("releaseNoDataHint")+'</span></div>')+'</div>';}
 
 function filterUsers(){
   var role=document.getElementById("f-role")?document.getElementById("f-role").value:"";
@@ -7970,33 +8056,33 @@ function filterUsers(){
   tbody.innerHTML=filtered.map(function(u){
     var r=u.releaseIntelligence||{classification:"UNKNOWN",appVersion:null};
     return "<tr>"+
-      "<td><div class=\\"contact-stack\\"><strong>"+esc(u.displayName||t("noName"))+"</strong><span>"+esc(u.email||"")+"</span><span>"+esc(u.phone||"")+"</span></div></td>"+
+      "<td><div class=\\"contact-stack\\"><strong>"+esc(u.displayName||t("noName"))+"</strong><span><bdi dir=\\"ltr\\">"+esc(u.email||"")+"</bdi></span><span><bdi dir=\\"ltr\\">"+esc(u.phone||"")+"</bdi></span></div></td>"+
       "<td>"+roleBadge(u.role)+"</td>"+
       "<td>"+statusBadge(u.accountStatus)+"</td>"+
       "<td><strong>"+esc(r.appVersion||"—")+"</strong></td>"+
       "<td>"+releaseStatusBadge(currentPage==="releases"?r.displayCategory:r.classification)+"</td>"+
-      "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(r.classification==="UPDATE_REQUIRED"?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">طلب تحديث</button>":"")+"</div></td>"+
+      "<td><div class=\\"row-actions\\"><button class=\\"btn btn-sm btn-secondary\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"editUser(this.dataset.userId)\\">"+t("edit")+"</button>"+(r.classification==="UPDATE_REQUIRED"?"<button class=\\"btn btn-sm btn-warning\\" data-user-id=\\""+esc(u._id||"")+"\\" onclick=\\"confirmReleaseReminder(this.dataset.userId)\\">"+ui("singleReminder")+"</button>":"")+"</div></td>"+
     "</tr>";
   }).join("");
 }
 
 function confirmReleaseReminder(uid){
   var u=allUsers.find(function(item){return item._id===uid;});if(!u)return;
-  openModal('<h3>تأكيد إرسال طلب تحديث</h3><p>سيتم إرسال إشعار داخل التطبيق، وإشعار فوري، وبريد إلكتروني عند توفره إلى '+esc(u.displayName||u.email||"المستخدم")+'.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="sendReleaseReminder(this.dataset.userId)">إرسال</button></div>');
+  openModal('<h3>'+ui("reminderConfirm")+'</h3><p>'+ui("reminderMessage")+' '+esc(u.displayName||u.email||ui("reminderUser"))+'.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button><button class="btn btn-warning" data-user-id="'+esc(uid)+'" onclick="sendReleaseReminder(this.dataset.userId)">'+ui("send")+'</button></div>');
 }
 async function sendReleaseReminder(uid){
   var data=await api("/release-intelligence/remind",{method:"POST",body:JSON.stringify({uid:uid})});
-  if(data&&data.success){toast("تم إرسال طلب التحديث");closeModal();renderPage();}else toast(data&&data.error||"تعذر إرسال طلب التحديث","error");
+  if(data&&data.success){toast(ui("reminderSent"));closeModal();renderPage();}else toast(lang==="ar"?ui("reminderFailed"):(data&&data.error||ui("reminderFailed")),"error");
 }
 function confirmBulkReleaseReminder(){
   var targets=allUsers.filter(function(u){return u.releaseIntelligence&&u.releaseIntelligence.classification==="UPDATE_REQUIRED";});
-  openModal('<h3>تأكيد إرسال تنبيهات التحديث</h3><p>سيتم إرسال تنبيه إلى <b>'+targets.length+'</b> مستخدم يحتاج إلى تحديث التطبيق، مع تطبيق مهلة 72 ساعة لمنع التكرار.</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">إلغاء</button><button class="btn btn-warning" onclick="runBulkReleaseReminder()">إرسال</button></div>');
+  openModal('<h3>'+ui("remindersConfirm")+'</h3><p><b>'+targets.length+'</b> '+ui("remindersMessage")+'</p><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("cancel")+'</button><button class="btn btn-warning" onclick="runBulkReleaseReminder()">'+ui("send")+'</button></div>');
 }
 async function runBulkReleaseReminder(){
   var total=0,sent=0,failed=0,skippedCooldown=0,hasMore=true,calls=0;
-  while(hasMore&&calls<50){var data=await api("/release-intelligence/remind-required",{method:"POST",body:"{}"});if(!data||!data.success){toast(data&&data.error||"تعذر إرسال التنبيهات","error");return;}if(calls===0)skippedCooldown=data.skippedCooldown||0;total+=data.processed||0;sent+=data.sent||0;failed+=data.failed||0;hasMore=data.hasMore===true;calls++;}
-  if(hasMore){toast("توقف الإرسال الآمن؛ أعد المحاولة لإكمال الباقي","error");return;}
-  openModal('<h3>نتيجة تنبيهات التحديث</h3><div class="release-grid"><div class="release-metric"><div class="metric-label">المستهدفون</div><div class="metric-value">'+total+'</div></div><div class="release-metric current"><div class="metric-label">تم الإرسال</div><div class="metric-value">'+sent+'</div></div><div class="release-metric supported"><div class="metric-label">ضمن مهلة الانتظار</div><div class="metric-value">'+skippedCooldown+'</div></div><div class="release-metric required"><div class="metric-label">تعذر الإرسال</div><div class="metric-value">'+failed+'</div></div></div><div class="modal-actions"><button class="btn btn-primary" onclick="closeModal();renderPage()">تم</button></div>');
+  while(hasMore&&calls<50){var data=await api("/release-intelligence/remind-required",{method:"POST",body:"{}"});if(!data||!data.success){toast(lang==="ar"?ui("remindersFailed"):(data&&data.error||ui("remindersFailed")),"error");return;}if(calls===0)skippedCooldown=data.skippedCooldown||0;total+=data.processed||0;sent+=data.sent||0;failed+=data.failed||0;hasMore=data.hasMore===true;calls++;}
+  if(hasMore){toast(ui("remindersStopped"),"error");return;}
+  openModal('<h3>'+ui("remindersResult")+'</h3><div class="release-grid"><div class="release-metric"><div class="metric-label">'+ui("remindersTargeted")+'</div><div class="metric-value">'+total+'</div></div><div class="release-metric current"><div class="metric-label">'+ui("remindersSent")+'</div><div class="metric-value">'+sent+'</div></div><div class="release-metric supported"><div class="metric-label">'+ui("remindersCooldown")+'</div><div class="metric-value">'+skippedCooldown+'</div></div><div class="release-metric required"><div class="metric-label">'+ui("remindersUnsent")+'</div><div class="metric-value">'+failed+'</div></div></div><div class="modal-actions"><button class="btn btn-primary" onclick="closeModal();renderPage()">'+ui("done")+'</button></div>');
 }
 
 function editUser(uid){
@@ -8015,7 +8101,7 @@ function editUser(uid){
   };
   openModal(
     '<h3>'+t("editUser")+": "+esc(u.displayName||u.email||uid)+'</h3>'+
-    '<div style="margin-bottom:12px;font-size:13px;color:var(--text2)">UID: '+esc(uid)+"<br>"+t("role")+": "+esc(u.role||"N/A")+" | "+t("email")+": "+esc(u.email||"")+"</div>"+
+    '<div style="margin-bottom:12px;font-size:13px;color:var(--text2)">UID: <bdi dir="ltr">'+esc(uid)+'</bdi><br>'+t("role")+': '+esc(u.role?t(u.role):t("na"))+' | '+t("email")+': <bdi dir="ltr">'+esc(u.email||"")+'</bdi></div>'+
     daysInfo+
     '<div class="form-group"><label>'+t("accountStatus")+"</label>"+sel("eu-accountStatus",u.accountStatus,[{v:"active",l:t("active")},{v:"trial",l:t("trial")},{v:"suspended",l:t("suspend")},{v:"disabled",l:t("disabled")}])+"</div>"+
     '<div class="form-group"><label>'+t("subscriptionStatus")+"</label>"+sel("eu-subscriptionStatus",u.subscriptionStatus,[{v:"trialing",l:t("trialing")},{v:"active",l:t("active")},{v:"expired",l:t("expired")},{v:"canceled",l:t("canceledSub")},{v:"past_due",l:t("pastDue")}])+"</div>"+
@@ -8052,7 +8138,7 @@ async function quickAction(uid,action){
   if(action==="activate")fields={accountStatus:"active",subscriptionStatus:"active",activatedByAdmin:true,disabledReason:""};
   else if(action==="suspend")fields={accountStatus:"suspended"};
   var data=await api("/users/"+uid+"/update",{method:"POST",body:JSON.stringify(fields)});
-  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(data&&data.error||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 
 async function saveUser(uid){
@@ -8084,7 +8170,7 @@ async function saveUser(uid){
   }
   if(Object.keys(fields).length===0){toast(t("noChanges"),"error");return;}
   var data=await api("/users/"+uid+"/update",{method:"POST",body:JSON.stringify(fields)});
-  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(data&&data.error||t("failedUpdate"),"error");}
+  if(data&&data.success){toast(t("userUpdated"));closeModal();renderPage();}else{toast(adminError(data,t("failedUpdate")),"error");}
 }
 
 async function generateInvoice(uid){
@@ -8102,8 +8188,8 @@ async function generateInvoice(uid){
     if(data&&data.success){
       toast(t("invoiceSaved"));
       showInvoiceActions(data.invoiceId,invoice);
-    }else{toast(data&&data.error||"Failed","error");}
-  }catch(e){toast(e.message,"error");}
+    }else{toast(adminError(data,t("failedUpdate")),"error");}
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 function showInvoiceActions(invoiceId,invoice){
@@ -8126,8 +8212,8 @@ async function viewInvoiceHTML(invoiceId){
     var data=await api("/invoices/"+invoiceId+"/token");
     if(data&&data.token){
       window.open("/admin/invoice/"+invoiceId+"?token="+encodeURIComponent(data.token)+"&lang="+lang,"_blank");
-    }else{toast("Failed to get access token","error");}
-  }catch(e){toast(e.message,"error");}
+    }else{toast(t("connectionError"),"error");}
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 async function downloadInvoicePdf(invoiceId){
@@ -8136,24 +8222,24 @@ async function downloadInvoicePdf(invoiceId){
     if(data&&data.token){
       var url="/admin/invoice/"+invoiceId+"/pdf?token="+encodeURIComponent(data.token)+"&lang="+lang;
       var a=document.createElement("a");a.href=url;a.download="invoice-"+invoiceId+".pdf";document.body.appendChild(a);a.click();document.body.removeChild(a);
-    }else{toast("Failed to get access token","error");}
-  }catch(e){toast(e.message,"error");}
+    }else{toast(t("connectionError"),"error");}
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 async function emailInvoice(invoiceId){
   try{
     var data=await api("/invoices/"+invoiceId+"/email",{method:"POST",body:JSON.stringify({lang:lang})});
     if(data&&data.success)toast(t("invoiceSent"));
-    else toast(data&&data.error||t("invoiceEmailFailed"),"error");
-  }catch(e){toast(e.message,"error");}
+    else toast(adminError(data,t("invoiceEmailFailed")),"error");
+  }catch(e){toast(lang==="ar"?t("invoiceEmailFailed"):e.message,"error");}
 }
 
 async function sendSubReminder(uid){
   try{
     var data=await api("/send-reminder",{method:"POST",body:JSON.stringify({uid:uid})});
     if(data&&data.success)toast(t("reminderSent"));
-    else toast(data&&data.error||"Failed","error");
-  }catch(e){toast(e.message,"error");}
+    else toast(lang==="ar"?t("failedUpdate"):(data&&data.error||t("failedUpdate")),"error");
+  }catch(e){toast(lang==="ar"?t("connectionError"):e.message,"error");}
 }
 
 async function renderInvoices(c){
@@ -8165,7 +8251,7 @@ async function renderInvoices(c){
   if(!allInvoices.length){c.innerHTML+='<div class="empty">'+t("noInvoices")+'</div>';return;}
   c.innerHTML+='<div class="table-wrap"><table><thead><tr><th>'+t("invoiceNumber")+'</th><th>'+t("name")+'</th><th>'+t("amount")+'</th><th>'+t("date")+'</th><th>'+t("status")+'</th><th>'+t("actions")+'</th></tr></thead><tbody>'+
   allInvoices.map(function(inv){
-    var dt=inv.createdAt?formatAdminDate(inv.createdAt,false):"N/A";
+    var dt=inv.createdAt?formatAdminDate(inv.createdAt,false):t("na");
     return "<tr>"+
       "<td><strong>"+esc(inv.invoiceNumber||inv._id)+"</strong></td>"+
       "<td>"+esc(inv.userName||"")+"</td>"+
@@ -8184,7 +8270,7 @@ async function renderInvoices(c){
 async function renderAdvertisements(c){
   var data=await api("/settings");if(!data)return;appSettings=data.settings||{};
   var bannerUrl=appSettings.bannerImageUrl||"",bannerEnabled=appSettings.bannerEnabled!==false;
-  c.innerHTML='<div class="page-header"><div><div class="page-kicker">Campaigns</div><h1 class="page-title">'+(lang==="ar"?"الإعلانات":"Advertisements")+'</h1><p class="page-subtitle">'+(lang==="ar"?"إدارة بانر الصفحة الرئيسية دون تغيير بقية إعدادات التطبيق.":"Manage the home banner without changing other app settings.")+'</p></div></div><section class="surface-panel"><div class="surface-head"><div><h2>'+t("homeBanner")+'</h2><p>'+(lang==="ar"?"معاينة وحالة الإعلان الحالي.":"Preview and status of the current campaign.")+'</p></div>'+('<span class="status-badge '+(bannerEnabled?"status-current":"status-unknown")+'">'+(bannerEnabled?(lang==="ar"?"مفعّل":"Enabled"):(lang==="ar"?"متوقف":"Disabled"))+'</span>')+'</div>'+
+  c.innerHTML='<div class="page-header"><div><div class="page-kicker">'+ui("campaigns")+'</div><h1 class="page-title">'+(lang==="ar"?"الإعلانات":"Advertisements")+'</h1><p class="page-subtitle">'+(lang==="ar"?"إدارة بانر الصفحة الرئيسية دون تغيير بقية إعدادات التطبيق.":"Manage the home banner without changing other app settings.")+'</p></div></div><section class="surface-panel"><div class="surface-head"><div><h2>'+t("homeBanner")+'</h2><p>'+(lang==="ar"?"معاينة وحالة الإعلان الحالي.":"Preview and status of the current campaign.")+'</p></div>'+('<span class="status-badge '+(bannerEnabled?"status-current":"status-unknown")+'">'+(bannerEnabled?(lang==="ar"?"مفعّل":"Enabled"):(lang==="ar"?"متوقف":"Disabled"))+'</span>')+'</div>'+
     (bannerUrl?'<img class="banner-preview" src="'+esc(bannerUrl)+'" alt="'+(lang==="ar"?"معاينة الإعلان":"Advertisement preview")+'">':'<div class="banner-preview empty-state">'+t("noBanner")+'</div>')+
     '<div class="upload-row"><input type="file" id="banner-file" accept="image/*" class="file-input"><button class="btn btn-sm btn-secondary" id="upload-btn" onclick="uploadBanner()">'+t("upload")+'</button></div>'+
     '<div class="form-group"><label for="s-bannerImageUrl">'+t("bannerUrl")+'</label><input id="s-bannerImageUrl" type="url" value="'+esc(bannerUrl)+'" placeholder="https://..."></div>'+
@@ -8193,7 +8279,7 @@ async function renderAdvertisements(c){
     '<button class="btn btn-primary" onclick="saveAdvertisementSettings()">'+t("saveSettings")+'</button></section>';
 }
 
-async function saveAdvertisementSettings(){var fields={bannerImageUrl:(document.getElementById("s-bannerImageUrl")||{}).value||"",bannerEnabled:!!(document.getElementById("s-bannerEnabled")||{}).checked,bannerWhatsapp:(document.getElementById("s-bannerWhatsapp")||{}).value||""};var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});if(data&&data.success)toast(t("settingsSaved"));else toast(data&&data.error||t("failedSave"),"error");}
+async function saveAdvertisementSettings(){var fields={bannerImageUrl:(document.getElementById("s-bannerImageUrl")||{}).value||"",bannerEnabled:!!(document.getElementById("s-bannerEnabled")||{}).checked,bannerWhatsapp:(document.getElementById("s-bannerWhatsapp")||{}).value||""};var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});if(data&&data.success)toast(t("settingsSaved"));else toast(adminError(data,t("failedSave")),"error");}
 
 async function renderSettings(c){
   var data=await api("/settings");
@@ -8309,13 +8395,13 @@ async function uploadBanner(){
           if(currentPage==="advertisements")await saveAdvertisementSettings();else await saveSettings();
           renderPage();
         }else{
-          toast(t("uploadFailed")+": "+(data.error||"Unknown"),"error");
+          toast(adminError(data,t("uploadFailed")),"error");
         }
-      }catch(e){toast(t("uploadFailed")+": "+e.message,"error");}
+      }catch(e){toast(lang==="ar"?t("uploadFailed"):e.message,"error");}
       finally{btn.disabled=false;btn.textContent=t("upload");}
     };
     reader.readAsDataURL(file);
-  }catch(e){toast(t("uploadFailed")+": "+e.message,"error");btn.disabled=false;btn.textContent=t("upload");}
+  }catch(e){toast(lang==="ar"?t("uploadFailed"):t("uploadFailed")+": "+e.message,"error");btn.disabled=false;btn.textContent=t("upload");}
 }
 
 async function saveSettings(){
@@ -8356,7 +8442,7 @@ async function saveSettings(){
   if(dp&&(dp.baseFee<0||dp.perKmInsideCity<0||dp.minFee<0||dp.maxFee<0)){toast(t("noNegative"),"error");return;}
   var data=await api("/settings",{method:"POST",body:JSON.stringify(fields)});
   if(data&&data.success){toast(t("settingsSaved"));await renderSettings(document.getElementById("page-content"));}
-  else toast(data&&data.error||t("failedSave"),"error");
+  else toast(adminError(data,t("failedSave")),"error");
 }
 
 async function changePassword(){
@@ -8371,8 +8457,8 @@ async function changePassword(){
     if(data&&data.success){
       msgEl.textContent=t("passwordChanged");msgEl.className="success-msg";msgEl.style.display="block";
       document.getElementById("s-curPw").value="";document.getElementById("s-newPw").value="";document.getElementById("s-confirmPw").value="";
-    }else{msgEl.textContent=data&&data.error||t("passwordFailed");msgEl.className="err-msg";msgEl.style.display="block";}
-  }catch(e){msgEl.textContent=e.message;msgEl.className="err-msg";msgEl.style.display="block";}
+    }else{msgEl.textContent=adminError(data,t("passwordFailed"));msgEl.className="err-msg";msgEl.style.display="block";}
+  }catch(e){msgEl.textContent=lang==="ar"?t("connectionError"):e.message;msgEl.className="err-msg";msgEl.style.display="block";}
 }
 
 function updatePricingPreview(){
@@ -8458,7 +8544,7 @@ async function renderNotifications(c){
     '<select id="bc-audience" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px"><option value="">-- '+t("broadcastAudience")+' --</option>'+optHtml+'</select></div>'+
     '<div id="bc-result" style="display:none;padding:12px;border-radius:8px;margin-bottom:12px"></div>'+
     '<button id="bc-send-btn" class="btn btn-orange" onclick="confirmBroadcast()">'+t("broadcastSend")+'</button>'+
-    ' <button id="push-health-btn" class="btn btn-secondary" onclick="diagnosePushHealth()">فحص حالة الإشعارات</button>'+
+    ' <button id="push-health-btn" class="btn btn-secondary" onclick="diagnosePushHealth()">'+ui("pushHealth")+'</button>'+
     '<div id="push-health-result" style="display:none;padding:12px;border-radius:8px;margin-top:12px"></div>'+
     '</div>'+
     '<div class="settings-section">'+
@@ -8482,7 +8568,7 @@ async function renderNotifications(c){
 }
 function broadcastStatusLabel(value){
   var labels={pending:lang==="ar"?"قيد الانتظار":"Pending",processing:lang==="ar"?"قيد المعالجة":"Processing",completed:lang==="ar"?"مكتمل":"Completed",accepted:lang==="ar"?"قُبل من خدمة Push":"Accepted by Push service",failed:lang==="ar"?"فشل الإرسال":"Send failed",not_attempted:lang==="ar"?"لم تتم المحاولة":"Not attempted",not_applicable:"-",complete:lang==="ar"?"اكتمل إيصال Push":"Push receipt complete",stale:lang==="ar"?"رمز قديم/ملغى":"Stale token",pending_receipt:lang==="ar"?"بانتظار إيصال Push":"Waiting for Push receipt",missing:lang==="ar"?"لا يوجد Push token":"No Push token",invalid:lang==="ar"?"Push token غير صالح":"Invalid Push token",valid:lang==="ar"?"Push token صالح":"Valid Push token"};
-  return labels[value]||value||"-";
+  return labels[value]||t("na");
 }
 function openBroadcastDetails(id){
   if(!id)return;
@@ -8497,11 +8583,11 @@ async function loadBroadcastDetailsPage(){
   try{
     var token=_bcDetailsTokens[_bcDetailsPageIndex]||"";
     var data=await api("/broadcast-notifications/"+encodeURIComponent(_bcDetailsId)+"/details?pageSize=10"+(token?"&pageToken="+encodeURIComponent(token):""));
-    if(!data||!data.success)throw new Error(data&&data.error||t("connectionError"));
+    if(!data||!data.success)throw new Error(adminError(data,t("connectionError")));
     _bcDetailsNextToken=data.nextPageToken||null;
     renderBroadcastDetails(data);
   }catch(e){
-    if(body)body.innerHTML='<div class="empty" style="color:var(--error)">'+esc(e.message|| (lang==="ar"?"تعذر تحميل التفاصيل":"Unable to load details"))+'</div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("close")+'</button></div>';
+    if(body)body.innerHTML='<div class="empty" style="color:var(--error)">'+esc(lang==="ar"?t("connectionError"):(e.message||"Unable to load details"))+'</div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">'+t("close")+'</button></div>';
   }
 }
 function renderBroadcastDetails(data){
@@ -8537,19 +8623,19 @@ function nextBroadcastDetailsPage(){if(!_bcDetailsNextToken)return;_bcDetailsPag
 function previousBroadcastDetailsPage(){if(_bcDetailsPageIndex<1)return;_bcDetailsPageIndex--;loadBroadcastDetailsPage();}
 async function diagnosePushHealth(){
   var el=document.getElementById("push-health-result"),btn=document.getElementById("push-health-btn");
-  if(el){el.style.display="block";el.style.background="#eff6ff";el.style.color="var(--info)";el.textContent="جاري الفحص…";}
+  if(el){el.style.display="block";el.style.background="#eff6ff";el.style.color="var(--info)";el.textContent=ui("pushChecking");}
   if(btn)btn.disabled=true;
   try{
     var data=await api("/push-health");
-    if(!data||!data.success)throw new Error((data&&data.error)||"تعذر فحص حالة الإشعارات");
+    if(!data||!data.success)throw new Error(lang==="ar"?ui("pushCheckFailed"):(data&&data.error||ui("pushCheckFailed")));
     var u=data.users||{},p=data.privateDevices||{},l=data.legacyUsers||{},b=data.latestBroadcast||{};
     if(el){el.style.background="#f8fafc";el.style.color="var(--text)";el.innerHTML=
-      '<strong>حالة الإشعارات</strong><br>'+
-      'المستخدمون: '+esc(String(u.total||0))+' (عملاء '+esc(String(u.customers||0))+', مقدمو خدمة '+esc(String(u.providers||0))+', سائقون '+esc(String(u.drivers||0))+')<br>'+
-      'الأجهزة الخاصة: '+esc(String(p.documents||0))+'، مفعلة '+esc(String(p.pushEnabled||0))+'، رموز صالحة '+esc(String(p.validExpoToken||0))+'، بدون رمز '+esc(String(p.nullToken||0))+'<br>'+
-      'الرموز القديمة الصالحة: '+esc(String(l.validExpoToken||0))+'<br>'+
-      'آخر Broadcast: '+esc(String(b.status||"-"))+'، تمت معالجة '+esc(String(b.processedCount||0))+' من '+esc(String(b.totalUsersMatched||0))+'، مرشحون '+esc(String(b.totalCandidateTokens||0))+'، صالحون '+esc(String(b.validTokensCount||0))+'، أرسل '+esc(String(b.sentCount||0))+'، فشل '+esc(String(b.failedCount||0));}
-  }catch(e){if(el){el.style.background="#fef2f2";el.style.color="var(--error)";el.textContent=e.message||"تعذر الفحص";}}
+      '<strong>'+ui("pushHealth")+'</strong><br>'+
+      ui("pushUsers")+': '+esc(String(u.total||0))+' ('+ui("pushCustomers")+' '+esc(String(u.customers||0))+', '+ui("pushProviders")+' '+esc(String(u.providers||0))+', '+ui("pushDrivers")+' '+esc(String(u.drivers||0))+')<br>'+
+      ui("pushPrivateDevices")+': '+esc(String(p.documents||0))+', '+ui("pushEnabled")+' '+esc(String(p.pushEnabled||0))+', '+ui("pushValidTokens")+' '+esc(String(p.validExpoToken||0))+', '+ui("pushNoToken")+' '+esc(String(p.nullToken||0))+'<br>'+
+      ui("pushLegacyTokens")+': '+esc(String(l.validExpoToken||0))+'<br>'+
+      ui("pushLastBroadcast")+': '+esc(broadcastStatusLabel(b.status))+', '+ui("pushProcessed")+' '+esc(String(b.processedCount||0))+' '+ui("pushOf")+' '+esc(String(b.totalUsersMatched||0))+', '+ui("pushCandidates")+' '+esc(String(b.totalCandidateTokens||0))+', '+ui("pushValid")+' '+esc(String(b.validTokensCount||0))+', '+ui("pushSent")+' '+esc(String(b.sentCount||0))+', '+ui("pushFailed")+' '+esc(String(b.failedCount||0));}
+  }catch(e){if(el){el.style.background="#fef2f2";el.style.color="var(--error)";el.textContent=e.message||ui("pushCheckFailed");}}
   finally{if(btn)btn.disabled=false;}
 }
 function confirmBroadcast(){
@@ -8589,7 +8675,7 @@ async function doSendBroadcast(){
   var data=await api("/broadcast-notifications/send",{method:"POST",body:JSON.stringify(payload)});
   if(!data||!data.success||!data.broadcastId){
     _bcSending=false; _bcSourceId=null; if(sendBtn)sendBtn.disabled=false;
-    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=(data&&data.error)||t("connectionError");}
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=adminError(data,t("connectionError"));}
     return;
   }
   var broadcastId=data.broadcastId, progressCalls=0, latest=data;
@@ -8611,9 +8697,9 @@ async function doSendBroadcast(){
     if(resultEl){
       resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";
       var resumeButton="<br><button class='btn btn-secondary' style='margin-top:8px' onclick='resumeBroadcast("+String.fromCharCode(34)+esc(broadcastId)+String.fromCharCode(34)+")'>"+(lang==="ar"?"استكمال الإرسال":"Resume")+"</button>";
-      resultEl.innerHTML=esc(e.message||t("broadcastFailed"))+resumeButton;
+      resultEl.innerHTML=esc(lang==="ar"?t("broadcastFailed"):(e.message||t("broadcastFailed")))+resumeButton;
     }
-    toast(e.message||t("broadcastFailed"),"error");
+    toast(lang==="ar"?t("broadcastFailed"):(e.message||t("broadcastFailed")),"error");
   }finally{
     _bcSending=false; _bcSourceId=null; if(sendBtn){sendBtn.disabled=false;sendBtn.textContent=t("broadcastSend");}
   }
@@ -8632,7 +8718,7 @@ async function resumeBroadcast(broadcastId){
     if(latest.hasMore===true)throw new Error(lang==="ar"?"تعذر استكمال الإرسال":"Broadcast continuation limit reached");
     if(resultEl){resultEl.style.background="#f0fdf4";resultEl.style.color="var(--success)";resultEl.textContent=t("broadcastResult");}
     if(typeof loadBroadcastHistory==="function")loadBroadcastHistory();
-  }catch(e){if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=e.message||t("broadcastFailed");}toast(e.message||t("broadcastFailed"),"error");}
+  }catch(e){var error=lang==="ar"?t("broadcastFailed"):(e.message||t("broadcastFailed"));if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=error;}toast(error,"error");}
   finally{_bcSending=false;}
 }
 function formatFailureReasons(reasons){
@@ -8666,7 +8752,7 @@ async function doDeleteNotification(){
   _bcActionId=null;
   if(!data){toast(t("connectionError"),"error");return;}
   if(data.success){toast(t("notifDeleted"));setTimeout(function(){navigate("notifications");},400);}
-  else{toast(data.error||t("deleteFailed"),"error");}
+  else{toast(adminError(data,t("deleteFailed")),"error");}
 }
 function resendNotification(id){
   if(_bcSending)return;
@@ -8715,8 +8801,8 @@ async function doResendNotification(){
     toast(t("resendSuccess"));
     setTimeout(function(){navigate("notifications");},600);
   }else{
-    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=data.error||t("resendFailed");}
-    toast(data.error||t("resendFailed"),"error");
+    if(resultEl){resultEl.style.background="#fef2f2";resultEl.style.color="var(--error)";resultEl.textContent=adminError(data,t("resendFailed"));}
+    toast(adminError(data,t("resendFailed")),"error");
   }
 }
 function editAndResend(id){
@@ -11285,7 +11371,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
           }
           if (path === "/admin/api/complaints" && request.method === "GET") {
             const complaints = await listAllComplaints(accessToken);
-            const users = await listAllUsers(accessToken);
+            const [users, orderNumbers] = await Promise.all([listAllUsers(accessToken), complaintOrderNumbers(complaints, accessToken).catch(() => new Map())]);
             const userMap = {};
             for (const user of users) {
               if (user && user._id) userMap[user._id] = {
@@ -11299,6 +11385,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
               const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
               return {
                 ...complaint,
+                displayOrderNumber: complaint.orderNumber && complaint.orderNumber !== complaint.orderId ? complaint.orderNumber : orderNumbers.get(complaint.orderId) || "",
                 customer: person(complaint.customerUid || (complaint.source === 'customer' ? complaint.reporterUid : complaint.target === 'customer' ? complaint.targetAccountUid : '')),
                 provider: person(complaint.providerUid || (complaint.source === 'provider' ? complaint.reporterUid : complaint.target === 'provider' ? complaint.targetAccountUid : '')),
                 driver: person(complaint.driverUid || (complaint.source === 'driver' ? complaint.reporterUid : complaint.target === 'driver' ? complaint.targetAccountUid : '')),
@@ -11336,6 +11423,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const complaintId = decodeURIComponent(complaintDetailMatch[1]);
             const complaint = await getFirestoreDoc("delivery_complaints", complaintId, accessToken);
             if (!complaint) return jsonResponse({ error: "Complaint not found" }, 404);
+            const order = (!complaint.orderNumber || complaint.orderNumber === complaint.orderId) && phase4aSafeSegment(complaint.orderId) ? await getFirestoreDoc("orders", complaint.orderId, accessToken).catch(() => null) : null;
             const users = await listAllUsers(accessToken);
             const userMap = {};
             for (const user of users) {
@@ -11344,6 +11432,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             const person = /* @__PURE__ */ __name((uid) => uid ? userMap[uid] || { uid, displayName: "", email: "", phone: "" } : { uid: "", displayName: "", email: "", phone: "" }, "person");
             const detail = {
               ...complaint,
+              displayOrderNumber: complaint.orderNumber && complaint.orderNumber !== complaint.orderId ? complaint.orderNumber : typeof order?.orderNumber === "string" && order.orderNumber.length <= 80 ? order.orderNumber : "",
               id: complaint._id || complaint.id || complaintId,
               customer: person(complaint.customerUid || (complaint.source === 'customer' ? complaint.reporterUid : complaint.target === 'customer' ? complaint.targetAccountUid : '')),
               provider: person(complaint.providerUid || (complaint.source === 'provider' ? complaint.reporterUid : complaint.target === 'provider' ? complaint.targetAccountUid : '')),
