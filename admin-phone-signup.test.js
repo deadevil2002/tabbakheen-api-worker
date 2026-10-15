@@ -99,7 +99,7 @@ const firebaseIdToken = (uid) => {
   return header + "." + payload + "." + sign("RSA-SHA256", Buffer.from(header + "." + payload), privateKey).toString("base64url");
 };
 const adminToken = async () => {
-  const payload = btoa(JSON.stringify({ exp: Date.now() + 60000, r: "test" }));
+  const payload = btoa(JSON.stringify({ exp: Date.now() + 60000, r: "test", a: "admin" }));
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(global.ADMIN_TOKEN_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
   return payload + "." + btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

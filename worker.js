@@ -6011,32 +6011,78 @@
     }
     __name(handleEvent, "handleEvent");
     __name2(handleEvent, "handleEvent");
+    function adminOwnerLoginMode(env) {
+      const configured = env.ADMIN_OWNER_LOGIN_MODE;
+      return configured === undefined || configured === null || configured === "" || configured === "legacy" ? "legacy" :
+        configured === "owner_only" || configured === "dual" ? configured : "invalid";
+    }
+    function adminOwnerLoginConfigured(env) {
+      return !!(phase4aSafeSegment(env.OWNER_FIREBASE_UID) && env.FIREBASE_WEB_API_KEY &&
+        env.ADMIN_TOKEN_SECRET && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY);
+    }
+    function adminAuthResponse(data, status = 200) {
+      return new Response(JSON.stringify(data), { status, headers: {
+        "Content-Type": "application/json", "Cache-Control": "no-store, max-age=0", "Referrer-Policy": "no-referrer"
+      } });
+    }
+    async function adminSignSession(payload, secret) {
+      const encoded = btoa(JSON.stringify(payload));
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
+        { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(encoded));
+      return encoded + "." + btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
     async function createAdminToken(env) {
       const exp = Date.now() + 24 * 60 * 60 * 1e3;
-      const payload = btoa(JSON.stringify({ exp, r: Math.random().toString(36).slice(2), a: "admin" }));
-      const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
-      const key = await crypto.subtle.importKey(
-        "raw",
-        new TextEncoder().encode(secret),
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-      );
-      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-      const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-      return payload + "." + sigB64;
+      return adminSignSession({ exp, r: crypto.randomUUID(), a: "admin" }, env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD);
     }
     __name(createAdminToken, "createAdminToken");
     __name2(createAdminToken, "createAdminToken");
+    async function createOwnerAdminToken(uid, env, accessToken) {
+      if (!adminOwnerLoginConfigured(env) || uid !== env.OWNER_FIREBASE_UID) return null;
+      const now = Date.now();
+      const sid = crypto.randomUUID();
+      const exp = now + 8 * 60 * 60 * 1e3;
+      const created = await phase4aCommit([{ update: phase4aDoc("admin_owner_sessions", sid,
+        { ownerUid: uid, createdAt: new Date(now).toISOString(), expiresAt: new Date(exp).toISOString(), revoked: false }),
+        currentDocument: { exists: false } }], accessToken);
+      if (!created) return null;
+      return adminSignSession({ a: "firebase_owner", v: 1, uid, sid, iat: now, exp }, env.ADMIN_TOKEN_SECRET + ":firebase-owner-v1");
+    }
+    async function reserveAdminLoginAttempt(request, env, accessToken) {
+      // Durable CAS limits attempts across isolates; all identifiers are keyed hashes.
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const key = await sha256Hex(env.ADMIN_TOKEN_SECRET + ":admin-login:" + ip);
+      const ids = ["global", "ip-" + key];
+      const snapshots = await Promise.all(ids.map((id) => getFirestoreSnapshot("admin_login_limits", id, accessToken)));
+      const now = Date.now();
+      const writes = ids.map((id, index) => {
+        const snapshot = snapshots[index];
+        const start = Date.parse(snapshot?.data?.windowStart || "");
+        const active = Number.isFinite(start) && start <= now && now - start < 15 * 60 * 1e3;
+        const count = active ? snapshot.data.count : 0;
+        if (!Number.isInteger(count) || count < 0 || count >= (index ? 6 : 30)) return null;
+        const fields = { count: count + 1, windowStart: active ? snapshot.data.windowStart : new Date(now).toISOString() };
+        return { update: phase4aDoc("admin_login_limits", id, fields),
+          currentDocument: snapshot ? { updateTime: snapshot.updateTime } : { exists: false } };
+      });
+      return writes.every(Boolean) && await phase4aCommit(writes, accessToken);
+    }
     async function verifyAdminToken(token, env) {
       try {
-        if (!token) return false;
+        if (!token || token.length > 4096) return false;
         const parts = token.split(".");
         if (parts.length !== 2) return false;
         const [payload, sigB64] = parts;
         const data = JSON.parse(atob(payload));
-        if (Date.now() > data.exp) return false;
-        const secret = env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
+        const mode = adminOwnerLoginMode(env);
+        if (mode === "invalid") return false;
+        const owner = data.a === "firebase_owner" && data.v === 1;
+        if (owner ? mode === "legacy" || !adminOwnerLoginConfigured(env) || data.uid !== env.OWNER_FIREBASE_UID ||
+            !phase4aSafeSegment(data.sid) || !Number.isSafeInteger(data.iat) || !Number.isSafeInteger(data.exp) ||
+            data.iat > Date.now() + 30000 || data.exp - data.iat > 8 * 60 * 60 * 1e3 || Date.now() >= data.exp
+          : mode === "owner_only" || data.a !== "admin" || !Number.isSafeInteger(data.exp) || Date.now() >= data.exp) return false;
+        const secret = owner ? env.ADMIN_TOKEN_SECRET + ":firebase-owner-v1" : env.ADMIN_TOKEN_SECRET || env.ADMIN_PASSWORD;
         const key = await crypto.subtle.importKey(
           "raw",
           new TextEncoder().encode(secret),
@@ -6047,9 +6093,13 @@
         const normalizedSig = sigB64.replace(/-/g, "+").replace(/_/g, "/");
         const padded = normalizedSig + "=".repeat((4 - normalizedSig.length % 4) % 4);
         const sig = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
-        return await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload));
+        if (!await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payload))) return false;
+        if (!owner) return true;
+        const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+        const session = await getFirestoreDoc("admin_owner_sessions", data.sid, accessToken);
+        return session?.ownerUid === data.uid && session?.revoked === false &&
+          Date.parse(session.expiresAt) === data.exp;
       } catch (e) {
-        console.error("[Admin] Token verify error:", e);
         return false;
       }
     }
@@ -6059,7 +6109,7 @@
       try {
         const payload = token && token.split(".")[0];
         const data = payload ? JSON.parse(atob(payload)) : null;
-        return data && typeof data.a === "string" && data.a ? data.a : "admin";
+        return data?.a === "firebase_owner" ? "owner:" + data.uid : "admin";
       } catch (e) {
         return "admin";
       }
@@ -6447,6 +6497,7 @@
     function htmlSecurityHeaders(contentSecurityPolicy) {
       return {
         "Content-Type": "text/html;charset=UTF-8",
+        "Cache-Control": "no-store, max-age=0",
         "Content-Security-Policy": contentSecurityPolicy,
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -6909,7 +6960,7 @@ ${notes ? '<div style="font-size:12px;color:#555;margin:8px 0"><strong>' + (isAr
     }
     __name(generateInvoiceEmailHTML, "generateInvoiceEmailHTML");
     __name2(generateInvoiceEmailHTML, "generateInvoiceEmailHTML");
-    function getAdminHTML() {
+    function getAdminHTML(loginMode = "legacy") {
       return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -7125,12 +7176,17 @@ html[dir="rtl"] .main{margin-right:252px}html[dir="ltr"] .main{margin-left:252px
        <p id="login-subtitle">\u0644\u0648\u062D\u0629 \u062A\u062D\u0643\u0645 \u0637\u0628\u0627\u062E\u064A\u0646</p>
     </div>
     <form id="login-form" onsubmit="doLogin(event);return false;">
-      <div id="login-error" class="err-msg"></div>
+      <div id="login-error" class="err-msg" role="alert"></div>
+      <div class="form-group" id="login-email-group" style="display:none">
+        <label for="login-email">البريد الإلكتروني للمالك</label>
+        <input type="email" id="login-email" autocomplete="username" inputmode="email" dir="ltr" maxlength="320">
+      </div>
       <div class="form-group">
-        <label id="login-pw-label">\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644</label>
-        <input type="password" id="login-password" autocomplete="current-password">
+        <label id="login-pw-label" for="login-password">\u0643\u0644\u0645\u0629 \u0645\u0631\u0648\u0631 \u0627\u0644\u0645\u0633\u0624\u0648\u0644</label>
+        <input type="password" id="login-password" autocomplete="current-password" maxlength="1024">
       </div>
       <button type="submit" class="btn btn-primary btn-block" id="login-btn">\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644</button>
+      <button type="button" id="login-switch" class="btn btn-block" style="display:none;margin-top:8px" onclick="switchAdminLogin()"></button>
       <div id="login-status" class="login-status" role="status" aria-live="polite"></div>
     </form>
   </div>
@@ -7240,6 +7296,8 @@ function updateStaticLabels(){
   var nnEl=document.getElementById("nav-notifications");if(nnEl)nnEl.textContent=t("notifications");
 }
 
+var ADMIN_LOGIN_MODE="${loginMode}";
+var adminLoginKind=ADMIN_LOGIN_MODE==="legacy"?"legacy":"owner";
 var TOKEN=sessionStorage.getItem("tbk_admin_token");
 var currentPage="dashboard";
 var allUsers=[];
@@ -7335,7 +7393,16 @@ async function api(path,opts){
   return res.json();
 }
 
-function showLogin(){document.getElementById("login-view").style.display="flex";document.getElementById("main-view").style.display="none";}
+function refreshAdminLoginForm(){
+  var owner=adminLoginKind==="owner";
+  document.getElementById("login-email-group").style.display=owner?"block":"none";
+  document.getElementById("login-pw-label").textContent=owner?(lang==="ar"?"كلمة مرور حساب Firebase":"Firebase account password"):t("adminPassword");
+  var switchEl=document.getElementById("login-switch");
+  switchEl.style.display=ADMIN_LOGIN_MODE==="dual"?"inline-flex":"none";
+  switchEl.textContent=owner?(lang==="ar"?"استخدام دخول الإدارة السابق مؤقتًا":"Use temporary legacy login"):(lang==="ar"?"الدخول بحساب المالك":"Sign in as owner");
+}
+function switchAdminLogin(){adminLoginKind=adminLoginKind==="owner"?"legacy":"owner";refreshAdminLoginForm();setLoginStatus("");}
+function showLogin(){document.getElementById("login-view").style.display="flex";document.getElementById("main-view").style.display="none";refreshAdminLoginForm();}
 function showMain(){document.getElementById("login-view").style.display="none";document.getElementById("main-view").style.display="block";if(isMobile()){forceSidebarClosed();}else{closeSidebar();}setTimeout(function(){navigate(location.hash==="#complaints"?"complaints":"dashboard");},0);}
 
 function setLoginStatus(message,type){
@@ -7347,23 +7414,25 @@ function setLoginStatus(message,type){
 async function doLogin(event){
   if(event&&event.preventDefault)event.preventDefault();
   var pwEl=document.getElementById("login-password");
+  var emailEl=document.getElementById("login-email");
   var btn=document.getElementById("login-btn");
   var errEl=document.getElementById("login-error");
   var pw=pwEl?pwEl.value:"";
   if(errEl){errEl.textContent="";errEl.style.display="none";}
-  if(!pw){
-    setLoginStatus(t("enterPassword"),"error");
-    if(pwEl)pwEl.focus();
+  if(!pw||(adminLoginKind==="owner"&&!emailEl.value.trim())){
+    setLoginStatus(lang==="ar"?"أدخل البريد الإلكتروني وكلمة المرور":"Enter your email and password","error");
+    if(adminLoginKind==="owner"&&!emailEl.value.trim())emailEl.focus();else if(pwEl)pwEl.focus();
     return false;
   }
   if(btn){btn.disabled=true;btn.textContent="\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...";}
   setLoginStatus("\u062C\u0627\u0631\u064A \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644...","loading");
   try{
-    var res=await fetch("/admin/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
+    var owner=adminLoginKind==="owner";
+    var res=await fetch(owner?"/admin/api/owner-login":"/admin/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(owner?{email:emailEl.value.trim(),password:pw}:{password:pw})});
     var data=null;
     try{data=await res.json();}catch(e){data=null;}
-    if(res.status===401){
-      setLoginStatus("\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629","error");
+    if(res.status===401||res.status===429){
+      setLoginStatus(res.status===429?(lang==="ar"?"محاولات كثيرة، حاول لاحقًا":"Too many attempts; try later"):(lang==="ar"?"تعذر التحقق من بيانات الدخول":"Unable to verify sign-in details"),"error");
       return false;
     }
     if(!res.ok||!data||!data.token){
@@ -7371,7 +7440,9 @@ async function doLogin(event){
       return false;
     }
     TOKEN=data.token;
+    pwEl.value="";
     sessionStorage.setItem("tbk_admin_token",TOKEN);
+    sessionStorage.setItem("tbk_admin_kind",owner?"owner":"legacy");
     setLoginStatus("","success");
     showMain();
     return true;
@@ -7383,7 +7454,13 @@ async function doLogin(event){
   }
 }
 
-function doLogout(){TOKEN=null;sessionStorage.removeItem("tbk_admin_token");showLogin();}
+async function doLogout(){
+  var token=TOKEN;
+  var revoked=true;
+  if(token){try{var response=await fetch("/admin/api/logout",{method:"POST",headers:{"Authorization":"Bearer "+token}});revoked=response.ok;}catch(e){revoked=false;}}
+  TOKEN=null;sessionStorage.removeItem("tbk_admin_token");sessionStorage.removeItem("tbk_admin_kind");showLogin();
+  if(!revoked)setLoginStatus(lang==="ar"?"انتهت الجلسة هنا، لكن تعذر تأكيد إبطالها على الخادم. حاول مرة أخرى بعد الاتصال.":"Signed out here, but server revocation could not be confirmed.","error");
+}
 
 function isMobile(){return window.innerWidth<=768;}
 function toggleSidebar(){var sb=document.getElementById("sidebar");var bd=document.getElementById("sidebar-backdrop");if(!sb||!bd)return;if(sb.classList.contains("open")){closeSidebar();}else{if(isMobile()){sb.style.visibility="";sb.style.pointerEvents="";}sb.classList.add("open");bd.classList.add("show");document.body.style.overflow="hidden";}}
@@ -8186,13 +8263,16 @@ async function renderSettings(c){
         :"Provider and driver purchases, renewals, and cancellations are managed only by App Store and Google Play. Admin does not edit prices, subscription plans, or store trial configuration.")+
     '</div>'+
     '</div>'+
-    '<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
+    ((typeof ADMIN_LOGIN_MODE!=="undefined"&&ADMIN_LOGIN_MODE==="owner_only")||
+      (typeof sessionStorage!=="undefined"&&sessionStorage.getItem("tbk_admin_kind")==="owner")
+      ?'<div class="settings-section">'+(lang==="ar"?"تُدار كلمة مرور المالك من Firebase Authentication، وليس من لوحة الإدارة.":"The owner password is managed by Firebase Authentication, not this panel.")+'</div>'
+      :'<div class="settings-section"><h3>'+t("changePassword")+'</h3>'+
     '<div id="pw-msg" class="success-msg"></div>'+
     '<div class="form-group"><label>'+t("currentPassword")+'</label><input type="password" id="s-curPw"></div>'+
     '<div class="form-group"><label>'+t("newPassword")+'</label><input type="password" id="s-newPw"></div>'+
     '<div class="form-group"><label>'+t("confirmNewPassword")+'</label><input type="password" id="s-confirmPw"></div>'+
     '<button class="btn btn-sm btn-warning" onclick="changePassword()">'+t("changePasswordBtn")+'</button>'+
-    '</div>'+
+    '</div>')+
     '<button class="btn btn-primary" onclick="saveSettings()">'+t("saveSettings")+'</button>';
   setTimeout(function(){updatePricingPreview();},50);
 }
@@ -10400,6 +10480,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
       } catch {
       }
       try { if (typeof OWNER_FIREBASE_UID !== "undefined") env.OWNER_FIREBASE_UID = OWNER_FIREBASE_UID; } catch {}
+      try { if (typeof ADMIN_OWNER_LOGIN_MODE !== "undefined") env.ADMIN_OWNER_LOGIN_MODE = ADMIN_OWNER_LOGIN_MODE; } catch {}
       try { if (typeof CLIENT_VERSION_GATE_ACTIVATION_READY !== "undefined") env.CLIENT_VERSION_GATE_ACTIVATION_READY = CLIENT_VERSION_GATE_ACTIVATION_READY; } catch {}
       try {
         if (typeof PHONE_INDEX_BACKFILL_APPROVED !== "undefined") env.PHONE_INDEX_BACKFILL_APPROVED = PHONE_INDEX_BACKFILL_APPROVED;
@@ -10959,7 +11040,7 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         } catch (e) { console.error("[Phase4A] offer mutation error:", e); return phase4aError("internal_error", "Internal error", 500); }
       }
       if (path === "/admin" || path === "/admin/") {
-        return new Response(getAdminHTML(), {
+        return new Response(getAdminHTML(adminOwnerLoginMode(env)), {
           headers: htmlSecurityHeaders(adminContentSecurityPolicy())
         });
       }
@@ -11017,22 +11098,49 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         }
       }
       if (path === "/admin/api/login" && request.method === "POST") {
+        if (request.headers.get("Origin") && request.headers.get("Origin") !== url.origin)
+          return adminAuthResponse({ error: "Invalid request" }, 403);
+        if (adminOwnerLoginMode(env) === "owner_only" || adminOwnerLoginMode(env) === "invalid")
+          return adminAuthResponse({ error: "Invalid credentials" }, 401);
         try {
-          const body = await request.json();
-          if (!body.password) {
-            return jsonResponse({ error: "Password required" }, 401);
-          }
+          const body = await readBoundedOfferJson(request);
+          if (!body || typeof body.password !== "string" || !body.password || body.password.length > 1024)
+            return adminAuthResponse({ error: "Invalid credentials" }, 401);
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (adminOwnerLoginMode(env) === "dual" &&
+              (!env.ADMIN_TOKEN_SECRET || !await reserveAdminLoginAttempt(request, env, accessToken)))
+            return adminAuthResponse({ error: "Try again later" }, 429);
           const valid = await verifyAdminPassword(body.password, env, accessToken);
-          if (!valid) {
-            return jsonResponse({ error: "Invalid password" }, 401);
-          }
+          if (!valid) return adminAuthResponse({ error: "Invalid credentials" }, 401);
           const token = await createAdminToken(env);
-          console.log("[Admin] Login successful");
-          return jsonResponse({ success: true, token });
+          return adminAuthResponse({ success: true, token });
         } catch (e) {
-          console.error("[Admin] Login error:", e);
-          return jsonResponse({ error: "Login failed: " + e.message }, 500);
+          return adminAuthResponse({ error: "Login unavailable" }, 503);
+        }
+      }
+      if (path === "/admin/api/owner-login" && request.method === "POST") {
+        if (request.headers.get("Origin") && request.headers.get("Origin") !== url.origin)
+          return adminAuthResponse({ error: "Invalid request" }, 403);
+        if (adminOwnerLoginMode(env) === "legacy" || adminOwnerLoginMode(env) === "invalid")
+          return adminAuthResponse({ error: "Not found" }, 404);
+        if (!adminOwnerLoginConfigured(env)) return adminAuthResponse({ error: "Login unavailable" }, 503);
+        try {
+          const body = await readBoundedOfferJson(request);
+          if (!body || Object.keys(body).sort().join(",") !== "email,password" ||
+              typeof body.email !== "string" || body.email.length > 320 ||
+              typeof body.password !== "string" || !body.password || body.password.length > 1024)
+            return adminAuthResponse({ error: "Invalid credentials" }, 401);
+          const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (!await reserveAdminLoginAttempt(request, env, accessToken))
+            return adminAuthResponse({ error: "Try again later" }, 429);
+          // The Firebase password exchange and RS256/project/UID verification
+          // remain server-side. Only the local Admin session reaches the browser.
+          const owner = await reauthenticateOwnerVersionGate(body, env);
+          if (!owner) return adminAuthResponse({ error: "Invalid credentials" }, 401);
+          const token = await createOwnerAdminToken(owner.uid, env, accessToken);
+          return token ? adminAuthResponse({ success: true, token }) : adminAuthResponse({ error: "Login unavailable" }, 503);
+        } catch {
+          return adminAuthResponse({ error: "Login unavailable" }, 503);
         }
       }
       if (path.startsWith("/admin/api/")) {
@@ -11044,6 +11152,17 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
         const adminIdentity = adminIdentityFromToken(token);
         try {
           const accessToken = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY);
+          if (path === "/admin/api/logout" && request.method === "POST") {
+            if (!adminIdentity.startsWith("owner:")) return jsonResponse({ success: true, revoked: false });
+            const data = JSON.parse(atob(token.split(".")[0]));
+            const session = await getFirestoreSnapshot("admin_owner_sessions", data.sid, accessToken);
+            if (!session || session.data.ownerUid !== env.OWNER_FIREBASE_UID) return jsonResponse({ error: "Unauthorized" }, 401);
+            if (session.data.revoked === true) return jsonResponse({ success: true, revoked: true });
+            const revoked = await phase4aCommit([{ update: phase4aDoc("admin_owner_sessions", data.sid,
+              { revoked: true, revokedAt: new Date().toISOString() }), updateMask: { fieldPaths: ["revoked", "revokedAt"] },
+              currentDocument: { updateTime: session.updateTime } }], accessToken);
+            return revoked ? jsonResponse({ success: true, revoked: true }) : jsonResponse({ error: "Logout could not be confirmed" }, 409);
+          }
           if (path === "/admin/api/stats" && request.method === "GET") {
             const [users, orders, offers, versions] = await Promise.all([
               listAllUsers(accessToken),
@@ -11592,6 +11711,8 @@ window.addEventListener("pageshow",function(){if(isMobile()){forceSidebarClosed(
             }
           }
           if (path === "/admin/api/change-password" && request.method === "POST") {
+            if (adminIdentity.startsWith("owner:") || adminOwnerLoginMode(env) === "owner_only")
+              return jsonResponse({ error: "Firebase password is managed in Firebase Authentication" }, 403);
             try {
               const body = await request.json();
               if (!body.currentPassword || !body.newPassword) {

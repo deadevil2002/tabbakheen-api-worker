@@ -1,0 +1,14 @@
+# Admin owner-login migration (source-only)
+
+`ADMIN_OWNER_LOGIN_MODE` is `legacy` when absent or explicitly set to `legacy`. Its other valid values are `dual` (Firebase owner and temporary legacy login) and `owner_only` (Firebase owner only). An unrecognized nonempty value fails closed for both login methods and existing sessions. This PR does not set any production binding or activate the mode.
+
+The Worker needs the existing `ADMIN_TOKEN_SECRET` and service-account bindings plus `FIREBASE_WEB_API_KEY` and the **exact** `OWNER_FIREBASE_UID` from the `tabbakheen-99883` Firebase Authentication user record. The UID must be checked in a trusted Firebase Console/Admin view before configuring it; email text alone is not authorization. Do not copy the password, API key, ID token, or session token into a ticket or log. The owner-specific session is HMAC-signed, eight-hour-limited and checked against a private, revocable Firestore session document on every Admin API request. Login attempts use CAS-protected fifteen-minute global/IP counters. The new `admin_owner_sessions` and `admin_login_limits` collections are denied to direct clients by the existing Final Rules catch-all and by the owner-supplied Bridge Rules catch-all; Worker service-account access is required.
+
+Controlled sequence, each step requiring separate owner approval for production changes:
+
+1. Deploy the compatible Worker with mode absent (`legacy`), verify the existing Admin login and mandatory-update gate still OFF. Do not cut over if required bindings are absent.
+2. Set the verified UID and Web API key through existing secret-management controls, then set mode `dual`. The owner personally tests real Firebase Email/Password login, an Admin read, owner reauthentication for the mandatory-update control, logout/revocation and a second login. Confirm a non-owner Firebase account is denied. Do not enter owner credentials into agent chat.
+3. After successful owner verification, set mode `owner_only`. Confirm `/admin/api/login` and a pre-existing legacy Admin session return 401, the owner session still works, and the old password-change form/API is unavailable. Keep mandatory updates and Cash Funding OFF.
+4. Preserve this owner-login-capable Worker as the compatible recovery target. **Do not roll back to the current password-only Worker after owner-only cutover**: it would reaccept legacy sessions. If Firebase sign-in fails before cutover, remain in `dual` while repairing it. After cutover, any temporary legacy reactivation or signing-secret rotation requires a separate explicit owner security decision, not an automatic rollback.
+
+Offline tests use synthetic Firebase ID tokens and Firestore responses; they do not verify the real owner's UID, actual password/provider configuration, production bindings, or a live owner login. No production authentication or setting was changed by this source patch.
